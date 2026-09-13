@@ -1,25 +1,25 @@
 @echo off
 setlocal
-cd /d "%~dp0"
+CD /d "%~dp0"
 
-echo ============================================================
-echo Nexus 1.10.3 - 11 m / DX Cluster - Windows installer
-echo ============================================================
+echo =======================================================
+echo Nexus 1.10.3 - 11m / DX Cluster - Windows Installer
+echo =======================================================
 echo.
 echo This launcher uses the project's official Windows build script.
 echo It builds the full radio version and creates the Setup EXE.
 echo.
 
 where powershell.exe >nul 2>nul || (
-  echo ERREUR : PowerShell est introuvable.
-  pause
-  exit /b 1
+    echo ERROR : PowerShell is missing.
+    pause
+    exit /b1
 )
 
 if not exist "scripts\build-windows.ps1" (
-  echo ERREUR : scripts\build-windows.ps1 est introuvable.
-  pause
-  exit /b 1
+    echo ERROR : scripts\build-windows.ps1 is missing.
+    pause
+    exit /b1
 )
 
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\build-windows.ps1"
@@ -27,22 +27,22 @@ set "RC=%ERRORLEVEL%"
 
 echo.
 if not "%RC%"=="0" (
-  echo ============================================================
-  echo ECHEC DE LA COMPILATION.
-  echo Lis le dernier message affiche dans la fenetre.
-  echo ============================================================
-  pause
-  exit /b %RC%
+    echo =======================================================
+    echo BUILD FAILED.
+    echo Read the last message displayed in the window.
+    echo =======================================================
+    pause
+    exit /b %RC%
 )
 
-echo ============================================================
-echo COMPILATION TERMINEE
- echo.
-echo L'installateur Setup EXE doit se trouver dans :
+echo =======================================================
+echo BUILD COMPLETED
+echo.
+echo The Setup installer should be located in :
 echo   src-tauri\target\release\bundle\nsis\
 echo.
-echo Le programme EXE se trouve dans :
+echo The standalone EXE is located in :
 echo   src-tauri\target\release\
-echo ============================================================
+echo =======================================================
 pause
-exit /b 0 
+exit /b0
