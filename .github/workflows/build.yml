@@ -1,0 +1,19 @@
+name: Build Windows App
+
+on: [push]
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Run Windows Build Script
+      run: |
+        if (Test-Path "BUILD-WINDOWS-11M.bat") {
+            cmd.exe /c "BUILD-WINDOWS-11M.bat"
+        } else {
+            Write-Error "Le script de compilation est introuvable."
+        }
