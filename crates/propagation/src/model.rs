@@ -251,6 +251,7 @@ pub fn band_digital_mhz(band: Band) -> f64 {
         Band::B17 => 18.100,
         Band::B15 => 21.074,
         Band::B12 => 24.915,
+        Band::B11 => 27.555,
         Band::B10 => 28.074,
         Band::B6 => 50.313,
         Band::B4 => 70.154,
