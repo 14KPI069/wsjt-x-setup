@@ -1,0 +1,83 @@
+# cargo-deny — supply-chain + license gate (CI: EmbarkStudios/cargo-deny-action).
+# Allow-list enumerated from the real dependency tree (default + `live` features,
+# 146 packages); copyleft (LGPL/BSL) appears only inside OR expressions so it is
+# intentionally NOT allowed.
+
+[graph]
+# Check the whole graph including optional features (e.g. propagation `live`).
+all-features = true
+
+[advisories]
+version = 2
+# RustSec advisories are denied by default in v2; add IDs here only with a reason.
+ignore = [
+    # ---- UNMAINTAINED-class only below: no vulnerability, no fix available. ----
+    # tauri v2's LINUX backend rides the archived gtk3-rs bindings (wry/tao/muda →
+    # gtk 0.18) — every tauri v2 app carries these ten; the fix is upstream tauri
+    # moving to gtk4/verso. Ships only in the Pi/Linux builds (the Windows build
+    # never compiles them). Revisit on a tauri major.
+    "RUSTSEC-2024-0411", # gdkwayland-sys
+    "RUSTSEC-2024-0412", # gdk
+    "RUSTSEC-2024-0413", # atk
+    "RUSTSEC-2024-0414", # gdkx11-sys
+    "RUSTSEC-2024-0415", # gtk
+    "RUSTSEC-2024-0416", # atk-sys
+    "RUSTSEC-2024-0417", # gdkx11
+    "RUSTSEC-2024-0418", # gdk-sys
+    "RUSTSEC-2024-0419", # gtk3-macros
+    "RUSTSEC-2024-0420", # gtk-sys
+    # glib 0.18 UNSOUND advisory (VariantStrIter UB) — same archived gtk-rs
+    # family. cargo-deny v2 does not surface unsound-class advisories, so this
+    # entry is the pre-adjudication: known, Linux/Pi-only, upstream-blocked.
+    "RUSTSEC-2024-0429", # glib
+    # proc-macro-error: archived; compile-time only, in the same gtk3 macro chain.
+    "RUSTSEC-2024-0370",
+    # unic-* family: archived; Unicode TABLE data used by urlpattern → tauri-utils
+    # at config/build time. No untrusted input path; goes when tauri-utils does.
+    "RUSTSEC-2025-0075", # unic-char-range
+    "RUSTSEC-2025-0080", # unic-common
+    "RUSTSEC-2025-0081", # unic-char-property
+    "RUSTSEC-2025-0098", # unic-ucd-version
+    "RUSTSEC-2025-0100", # unic-ucd-ident
+]
+
+[licenses]
+version = 2
+confidence-threshold = 0.9
+allow = [
+    "GPL-3.0-only",          # this project (v3-only: links the vendored WSJT-X, which grants no or-later)
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "CDLA-Permissive-2.0",
+    "Unlicense",
+    # serialport (the CAT/serial layer). Weak FILE-level copyleft: MPL-2.0 is
+    # explicitly GPL-compatible (MPL §13/GPL-compat clause) and imposes nothing
+    # on this GPLv3 app beyond sharing changes to serialport's own files.
+    "MPL-2.0",
+]
+
+# unescaper declares the DEPRECATED slash expression "GPL-3.0/MIT", which the
+# SPDX parser rejects outright. Clarified to the modern equivalent; MIT (an
+# allowed branch of the OR) satisfies the policy.
+[[licenses.clarify]]
+crate = "unescaper"
+expression = "GPL-3.0-only OR MIT"
+license-files = []
+
+[bans]
+# Duplicate transitive versions are common and noisy — surface, don't fail (yet).
+multiple-versions = "warn"
+wildcards = "deny"
+# In-workspace `{ path = ... }` deps carry no version by design — they are not
+# the supply-chain wildcard this gate exists to catch.
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

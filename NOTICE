@@ -1,0 +1,727 @@
+# Nexus — Attribution and License Heritage
+
+Nexus
+Copyright (C) 2026 KD9TAW <kd9taw@protonmail.com>
+https://sourceforge.net/projects/nexus-ham-radio/
+
+Nexus is free software: you can redistribute it and/or modify it under the
+terms of the **GNU General Public License, version 3** (SPDX: `GPL-3.0-only`).
+The full license text is in the file `COPYING` at the repository root.
+
+Because Nexus incorporates and links GPLv3 code (most significantly the
+WSJT-X-derived modem internals it reuses), Nexus *as a whole* is licensed
+under GPLv3 (v3-only: the WSJT-X-derived sources carry no "or any later
+version" grant, so the combined work cannot offer one). This NOTICE documents
+the upstream lineage and the
+third-party components that Nexus bundles, links, depends on, or queries at
+runtime, along with their licenses and what is used from each. Where a license
+cannot be confirmed from this repository, this file says so rather than
+asserting it.
+
+---
+
+## Upstream lineage
+
+### WSJT-X — Joe Taylor (K1JT) and the WSJT Development Group
+License: **GNU GPL, version 3** (GPLv3).
+
+Nexus's modem library, `libtempo/`, is derived from WSJT-X. The WSJT-X-derived
+sources are **vendored in this repository** at `libtempo/vendor/wsjtx/` — the
+complete corresponding source (GPL §6) for the modem compiled into the Nexus
+binary: a ~70-file subset of WSJT-X's `lib/` (no Qt/GUI code), with KD9TAW's
+modifications marked and the full provenance documented in
+`libtempo/vendor/wsjtx/README.md`. From WSJT-X, `libtempo` reuses:
+
+- the **77-bit message packing/unpacking** (`packjt77`, used via `unpack77`
+  in `libtempo/tempofast_cabi.f90`), so Chat / QSO / Field Day forms carry the same
+  77-bit payloads on either tier;
+- the **LDPC(174,91) codec** — `encode174_91` and the `bpdecode174_91`
+  soft-decision belief-propagation decoder;
+- the **CRC-14** message check (`chkcrc14a.f90` plus `crc14.cpp`);
+- the **`four2a` FFT** routine and surrounding DSP infrastructure that
+  `libtempo` reuses (alongside FFTW3, below).
+
+WSJT-X is the work of Joe Taylor (K1JT) and the WSJT Development Group,
+including Steve Franke (K9AN), Bill Somerville (G4WJS), Nico Palermo (IV3NWV),
+Uwe Risse (DG2YCB), Brian Moran (N9ADG), and others. See the upstream project
+for the authoritative copyright and contributor list:
+https://sourceforge.net/projects/wsjt/
+
+### Reed-Solomon codec — Phil Karn (KA9Q)
+License: **GNU General Public License**, version unspecified, © 2002.
+
+The (63,12) Reed-Solomon codec behind **JT65**, vendored at
+`libtempo/vendor/wsjtx/lib/ftrsd/` (`decode_rs.c`, `encode_rs.c`, `init_rs.c`
+and the headers `rs2.h`, `int.h`), copied byte-identical from upstream. Each
+carries the notice "Copyright 2002, Phil Karn, KA9Q / May be used under the terms
+of the GNU General Public License (GPL)".
+
+⚠️ THE GRANT NAMES NO VERSION, and that is deliberate to record rather than
+paper over. GPL-3 §14 covers exactly this wording: "If the Program does not
+specify a version number of the GNU General Public License, you may choose any
+version ever published by the Free Software Foundation." Nexus chooses version 3,
+which is what makes these files compatible with a GPL-3.0-only combined work. The
+choice is the recipient's to make under the license itself; it is not an
+assumption about the author's intent.
+
+Phil Karn is a SEPARATE COPYRIGHT HOLDER from the WSJT Development Group and is
+credited separately for that reason, the same way qracodes is below. The
+soft-decision wrapper around this codec, `ftrsd/ftrsdap.c`, is by Steve Franke
+(K9AN) and Joe Taylor (K1JT) and is covered by the WSJT-X project grant above.
+
+ftrsd REPLACES KVASD, the non-free Reed-Solomon decoder JT65 historically shelled
+out to. Nexus does not ship, link, or invoke KVASD, and the vendored tree contains
+no copy of it.
+
+### Convolutional decoders — Phil Karn (KA9Q) and Steve Franke (K9AN)
+License: **GNU GPL, version 3**, by the WSJT-X project-wide grant. ⚠️ See below.
+
+The K=32 r=1/2 convolutional decoders behind **WSPR**, vendored at
+`libtempo/vendor/wsjtx/lib/wsprd/` — `fano.c` (Fano sequential decoder,
+"Copyright 1994, Phil Karn, KA9Q / Minor modifications by Joe Taylor, K1JT") and
+`jelinek.c` (stack-bucket sequential decoder, written by Steve Franke K9AN for
+WSJT-X in 2015, reusing Karn's ENCODE macro).
+
+⚠️ THESE TWO CARRY NO LICENSE GRANT OF THEIR OWN. Unlike the Reed-Solomon codec
+above — whose files each state "May be used under the terms of the GNU General
+Public License (GPL)" — `fano.c` and `jelinek.c` have only a copyright line and a
+description. There is no per-file grant to read.
+
+They are vendored on the basis of the WSJT-X PROJECT-WIDE license: they sit
+inside a work whose `COPYING` is verbatim GPL-3, they are listed in that
+project's own build (its `CMakeLists.txt` wsprd_CSRCS), and upstream has
+distributed them as part of a GPL-3 work for two decades. That is an inference
+from the surrounding project, NOT a per-file determination, and it is recorded
+here as such — a deliberate operator decision (KD9TAW, 2026-07-27) rather than a
+conclusion this file can support from the sources alone.
+
+It is a weaker footing than every other component documented here, and it is the
+only one resting on implied rather than stated terms. If Karn's intent were ever
+shown to be narrower, the remedy is to drop WSPR, not to re-argue the inference:
+`fano.c` is the decoder WSPR fundamentally depends on. A cleaner path exists and
+was not taken here — Karn's own `libfec` distributes a `fano.c` under stated LGPL
+terms, and if it is the same code, vendoring THAT copy would replace this
+inference with an explicit grant.
+
+Project: <https://www.ka9q.net/>
+
+### qracodes — Nico Palermo (IV3NWV), Microtelecom Srl
+License: **GNU GPL, version 3 or later** (GPL-3.0-or-later), © 2016.
+
+The Q-ary Repeat-Accumulate LDPC codec behind **Q65**, vendored at
+`libtempo/vendor/wsjtx/lib/qra/` (11 C sources + headers, copied byte-identical
+from upstream with their per-file GPL-3-or-later headers retained verbatim).
+Nexus is GPL-3.0-only; the "or later" grant is compatible one-way inbound, so
+these files keep their own more permissive terms while the combined work stays
+v3-only.
+
+Two of the eleven — `qra/q65/fadengauss.c` and `qra/q65/fadenlorentz.c`, the
+Gaussian and Lorentzian energy-fading coefficient tables — carry no license
+header of their own upstream, only a one-line descriptive comment. They are
+covered by the same package grant as the rest of qracodes and are vendored
+unmodified rather than having a header added, which is this tree's convention for
+vendored sources. They are not optional extras: `q65.c` `#include`s both directly
+(q65.c:273-274), so the codec does not compile without them.
+
+qracodes reaches Nexus through WSJT-X, which vendors the same sources, but it is a
+SEPARATE COPYRIGHT from the WSJT Development Group's and is credited separately for
+that reason. Nico Palermo is also listed among the WSJT-X contributors above; that
+is a different role from holding copyright in this codec.
+
+⚠️ Per-file terms differ WITHIN this author's work, which is why the integration
+checklist requires a per-FILE determination rather than a per-author one:
+`lib/superfox/qpc/qpc_n127k50q128.c` — the SuperFox (127,50) polar-code parameter
+tables, by the same author — states it is **NOT free software** and is "licensed
+only for use with WSJT-X". Nexus does **not** vendor that file, does not link it,
+and must not port, transliterate or table-extract it. Verified absent from Q65's
+dependency closure before Q65 was vendored.
+
+Project: <https://github.com/IV3NWV/qracodes>
+
+Nexus treats WSJT-X as the reference standard for FT8/FT4 on-air behavior. It
+is an independent application and is **not affiliated with or endorsed by** the
+WSJT project.
+
+### TempoFast waveform — KD9TAW
+License: **GPL-3.0** (part of Nexus / `libtempo`; upstream WSJT-X is GPLv3 and
+its `lib/` sources carry no "or later" boilerplate, so no later-version grant
+can be claimed for the derived work).
+
+The TempoFast waveform (the 4-CPM coherent turbo modem with IR-HARQ used by the
+"Fast" tier) is original work by KD9TAW. The TempoDeep mode (`libtempo/tempodeep/` — the
+non-coherent 8-FSK + soft LDPC(174,91) "Robust" tier) is likewise authored by
+KD9TAW. Both are GPLv3 by virtue of the shared WSJT-X-derived code they build
+on.
+
+> Validation status: **FT8/FT4** is the production digital core — operational
+> parity with stock WSJT-X behavior, wire formats pinned, field-verified.
+> **TempoFast and TempoDeep** are the new native waveforms and are **simulation-validated
+> only** (AWGN, with a fading penalty modeled); they have **not** yet been
+> validated on the air. Published Windows binaries are cross-compiled beta
+> builds.
+
+### Decodium FT2 — IU8LMC (ARI Caserta), on WSJT-X
+License: **GNU GPL, version 3** (GPLv3), inherited from WSJT-X.
+<https://github.com/iu8lmc/decodium3-build>
+
+The FT2 mode's modem sources at `libtempo/vendor/wsjtx/lib/ft2/` are vendored
+from **Decodium 3** (IU8LMC's fork of WSJT-X 3.0.0-rc1) — Decodium's FT2, the
+protocol with an on-air population, not the abandoned upstream experiment of
+the same name. The files carry no per-file headers (matching upstream WSJT-X
+`lib/` practice); the repository-level GPLv3 applies. Provenance, established
+by diff against upstream at vendor time (2026-08-16):
+
+- **K1JT / WSJT Development Group** — `genft2.f90`, `gen_ft2wave.f90`,
+  `ft2_downsample.f90`, `getcandidates2.f90`, `ft2_baseline.f90` are WSJT-X's
+  FT4 files mechanically renamed (halved symbol time via `ft2_params.f90`),
+  and `sync2d.f90` is WSJT-X's `sync4d` with one IU8LMC change (best-3-of-4
+  Costas scoring). `gfsk_pulse.f90` is upstream's, unmodified.
+- **IU8LMC** — `ft2_triggered_decode.f90` (the two-phase triggered decoder
+  and its AP ladder), `decode174_91_ft2.f90` (a layered/self-corrected
+  rewrite of K1JT's LDPC decoder), `get_ft2_bitmetrics.f90` (log-sum-exp
+  demapper + MMSE metric), `ft2_channel_est.f90` (Wiener channel estimation),
+  and the redesigned `ft2_params.f90`.
+
+Shared dependencies (the LDPC(174,91) codec, CRC-14, OSD, 77-bit packing,
+`four2a` and support routines) are the WSJT-X copies already vendored and
+credited above; Decodium's copies were verified byte-identical at vendor time
+and not re-vendored. Decodium's `normalizebmet` was deliberately not vendored
+— see `libtempo/CMakeLists.txt` for the duplicate-symbol rationale.
+
+### AetherSDR — waterfall history + 3D stacked-spectrum
+License: **GNU GPL, version 3** (GPLv3). <https://github.com/aethersdr/AetherSDR>
+
+Two of Nexus's waterfall components are **ported from AetherSDR** (a GPLv3 Qt6/C++
+FlexRadio workstation) and reimplemented for Nexus's normalized history rows:
+
+- **`ui/src/dss.ts`** — the 3D stacked-spectrum ("3DSS") *alternate waterfall*
+  renderer, ported from AetherSDR's `src/gui/DssRenderer.cpp` (a perspective
+  back-to-front stacked-trace surface). Reimplemented on HTML canvas-2D; the
+  deliberate differences from the C++ original are documented in the file header.
+- **`ui/src/waterfallHistory.ts`** — the retained-history ring buffer behind the
+  pause/scrollback and instant-palette-recolor waterfall, a reimplementation of
+  AetherSDR's `WaterfallHistoryBuffer`.
+
+Both files carry header-level attribution to their AetherSDR origin. AetherSDR is
+GPLv3 and Nexus is GPLv3-only, so the ported code combines cleanly into the GPLv3
+whole. Additionally, Nexus's native FlexRadio DAX / VITA-49 code
+(`crates/tempo-net/src/flexvita.rs`, `crates/tempo-audio/src/flexdax.rs`) used
+AetherSDR's `PanadapterStream` as a **reference for the public wire-format layout**
+(VITA-49 packet-class codes and DAX audio framing — protocol facts); the
+implementation itself is original (see the FlexRadio SmartSDR note below). AetherSDR
+is an independent project; Nexus is not affiliated with it.
+
+### fldigi — RTTY demodulator
+License: **GNU GPL, version 3 or later** (GPL-3.0-or-later). <http://www.w1hkj.com/> ·
+<https://sourceforge.net/p/fldigi/fldigi/>
+
+Nexus's RTTY receive path (`crates/tempo-core/src/rtty/demod.rs`) is **ported
+from fldigi**: `src/cw_rtty/rtty.cxx` (Copyright (C) 2012 Dave Freese, W1HKJ,
+and Stefan Fendt, DL1SMF; descended from Tomi Manninen, OH2BNS's gmfsk modem,
+also GPL) and `src/filters/fftfilt.cxx` (Copyright (C) 2006-2008 Dave Freese,
+W1HKJ). The ported design comprises the mark/space baseband mixers, the
+overlap-add FFT filters with the Feher raised-cosine "enhanced Nyquist"
+response (K = 1.4), the envelope/noise-follower time constants, the
+SNR-optimized Automatic Threshold Correction (ATC) slicer — a design published
+by Kok Chen, W7AY (<http://www.w7ay.net/site/Technical/ATC/>), followed here as
+fldigi implements it — the straddle-point bit-clock recovery, and the async
+character state machine. The Baudot tables in
+`crates/tempo-core/src/rtty/baudot.rs` are the US-TTY tables fldigi uses on the
+air. The file header carries the same attribution, and the deliberate
+differences are documented there: 12 kHz sample rate (vs fldigi's 8 kHz), a
+per-character soft-confidence output (fldigi discards the slicer's continuous
+value), an acquire-then-freeze AFC (fldigi's is free-running), and a
+matched-filter-based signal-presence squelch. fldigi is GPL-3.0-or-later and
+Nexus is GPLv3-only; the ported code is incorporated by electing version 3
+(see "License compatibility" below). fldigi is an independent project; Nexus
+is not affiliated with or endorsed by it.
+
+> The Nexus RTTY **transmitter** (`crates/tempo-audio/src/rtty_afsk.rs`) is
+> **not** derived from fldigi. Its shaped two-oscillator AFSK generator is an
+> independent implementation of the published FSK-generation analysis by Kok
+> Chen, W7AY (<http://www.w7ay.net/site/Technical/RTTY%20Sidebands/sidebands.html>) —
+> a paper, not source code. No W7AY or fldigi transmit code is used.
+
+### slowrx — SSTV receiver (via the `slowrx.rs` Rust port)
+License: **ISC** (the original C) and **MIT** (the Rust port).
+<https://github.com/windytan/slowrx> ·
+<https://github.com/jasonherald/slowrx.rs>
+
+Nexus's SSTV **receiver** (`crates/tempo-sstv/`) is vendored third-party code,
+and its lineage runs two steps:
+
+- **slowrx** — the C SSTV decoder by **Oona Räisänen (OH2EIQ)**, © 2007-2013,
+  **ISC License** (upstream `COPYING`). VIS detection, the mode-specification
+  tables, the frequency→pixel mappings, the sync/slant correlation, and the FSK
+  callsign-ID decode (`fsk.c`) originate here.
+- **`slowrx.rs`** — the pure-Rust port of that decoder by **Jason Herald**
+  (© 2026, **MIT**; crates.io `slowrx` v0.5.3, commit `aa384b4`). This is the
+  form Nexus vendored.
+
+Per-file headers under `crates/tempo-sstv/src/` name the slowrx C file each
+module translates (for example `src/fsk.rs` ← `fsk.c`, `src/mode_scottie.rs` ←
+`video.c`), and the crate keeps its own `crates/tempo-sstv/NOTICE.md` (slowrx's
+full ISC permission notice) and `crates/tempo-sstv/LICENSE` (the MIT text of the
+Rust port), which is why its manifest declares `license = "MIT"` rather than the
+workspace GPL-3.0-only. Nexus's own additions are the PD50/90/160/290 mode-table
+entries, a single-bin Goertzel FSK-ID slicer in place of slowrx's 2048-point FFT
+(same framing constants), and the **entire transmitter** (`src/encode*.rs`,
+original Nexus code covering all 15 modes). ISC and MIT are both permissive and
+GPL-compatible, so the vendored receiver redistributes cleanly inside the GPLv3
+whole. slowrx is an independent project, unmaintained upstream; Nexus is not
+affiliated with or endorsed by it.
+
+---
+
+## Bundled components (shipped in the Windows installer)
+
+### Hamlib (rigctld) — <https://hamlib.github.io/>
+Hamlib **4.7.1**, bundled as a runtime on **every** shipped platform: Windows,
+Linux (.deb, AppImage, and both Raspberry Pi bases) and macOS.
+
+License, checked **per file** rather than taken from the repository-level claim
+(2026-08-24): the Hamlib **library** is **LGPL-2.1-or-later** and the
+**tools** — `rigctld`, `rigctl`, `rotctld`, `rotctl`, which are what Nexus
+launches — are **GPL-2.0-or-later**. Verified two independent ways: upstream
+SPDX headers in the 4.7.1 source (5 × `GPL-2.0-or-later`, 14 ×
+`LGPL-2.1-or-later`, and **zero** `GPL-2.0-only` files), and Debian's own audit
+of the same package (`License: LGPL-2.1+ and GPL-2+`). Both are *or-later*, so
+both may be used under GPL-3, which is what Nexus is (GPL-3.0-only). Had any
+part been GPL-2-**only** it could not have shipped here at all.
+
+Nexus does not link Hamlib. It launches `rigctld` as a **separate process** and
+speaks the rigctld TCP protocol to it; `rigctl` backs the baud-ladder probe and
+the model list, and `rotctld` drives rotators.
+
+Staging is reproducible and the binaries are **not committed to this
+repository**: `scripts/fetch-hamlib.sh` unpacks the official Windows release
+(SHA-256 pinned) and `scripts/fetch-hamlib-unix.sh` builds Linux/macOS from the
+official source tarball (SHA-256 pinned). Both place the binaries and Hamlib's
+own license texts under `src-tauri/resources/hamlib/`, which the Tauri bundle
+includes (`tauri.conf.json` → `bundle.resources`). The license files travel with
+every installer; refer to them and to the Hamlib project for exact terms.
+
+Before 2026-08-24 only Windows carried the bundle. Linux relied on the .deb's
+`libhamlib-utils` dependency — which left **AppImage** users, who install
+nothing by design, with no CAT until they found out unaided that they needed a
+Hamlib package; macOS relied on `brew install hamlib` the same way.
+
+### DXCC country file (cty.dat) — Jim Reisert, AD1C
+`crates/propagation/data/cty.dat` is the AD1C "Country Files" (the big-CTY
+`cty.dat` database) by Jim Reisert, **AD1C** (<https://www.country-files.com/>),
+embedded verbatim (via `include_str!`, see `crates/propagation/src/dxcc.rs`).
+It resolves callsigns to DXCC entities and CQ/ITU zones and underpins the
+DXCC / WAS / WAZ awards engine, map spot labels, and Needed-board hints. It is
+distributed under the **MIT License**. © 1994– Jim Reisert AD1C. See
+`crates/propagation/data/cty.dat_copyright.txt`.
+
+### ITU-R / CCIR propagation coefficient data
+The HF path-prediction engine embeds the CCIR ionospheric numerical-map
+coefficients (foF2, M(3000)F2, foE, sporadic-E) and the Recommendation
+ITU-R P.372 atmospheric-noise coefficient arrays, plus the P.1239-3
+day-to-day variability deciles, copied verbatim from the ITU-R Study Group 3
+reference implementation of Recommendation ITU-R P.533
+(<https://github.com/ITU-R-Study-Group-3/ITU-R-HF>). These are the
+long-published ITU-R/CCIR data that accompany every P.533/VOACAP
+implementation. Files + full provenance note:
+`crates/propagation/data/itu/` (see `itu_copyright.txt`). The P.533 engine
+itself (`crates/propagation/src/p533/`) is an original Rust implementation of
+the published Recommendation methods; no ITU code is included.
+
+### Natural Earth geography (grid-rarity table)
+`crates/propagation/data/grid_rarity.bin` (8.1 KB) is derived from the
+Natural Earth 1:10m land polygons (via the `world-atlas` package), which are
+**public domain**. Regenerate with `scripts/gen-grid-rarity.mjs`.
+
+### Natural Earth geography (Field Day spectator globe)
+The `LAND_RAW` coastline blob inside
+`crates/tempo-app/assets/fd_scoreboard.html` (8,812 bytes: 88 rings, 1,360
+points) is derived from the Natural Earth 1:110m land polygons (via the
+`world-atlas` package), which are **public domain**. It is Douglas-Peucker
+simplified at 0.6°, quantised to 0.1° and delta-coded, then embedded in the
+page rather than fetched — the Field Day spectator board is served on a site
+LAN with no internet, and the page makes no external request of any kind.
+Regenerate with `python3 scripts/gen-fd-globe-land.py` (deterministic: the
+same input reproduces the shipped blob byte for byte).
+
+### WAS grid-square → US-state table (grid_state.bin)
+`crates/propagation/data/grid_state.bin` (32,400 bytes, embedded via
+`include_bytes!`) maps each 4-character Maidenhead grid to a US state for the
+Worked-All-States "New State" need hint. It is generated
+(`scripts/gen-grid-state.mjs`) by point-in-polygon sampling of the
+**`us-atlas`** `states-10m` TopoJSON
+(<https://github.com/topojson/us-atlas>, ISC-licensed package), whose geometry
+derives from **US Census Bureau** cartographic boundary files (a work of the
+US government, **public domain**). Regenerate with
+`node scripts/gen-grid-state.mjs`.
+
+### Map / globe textures
+`ui/src/assets/earth-relief.webp` (the flat map's shaded-relief basemap) derives from
+**Natural Earth I** raster (Tom Patterson / Natural Earth), **public domain**.
+`ui/src/assets/earth-night.webp` (the 3-D globe's dimmed city-lights layer) is a
+downscaled **NASA "Black Marble" / Earth at Night** composite (NASA Earth Observatory),
+a work of the US government — **public domain**. Neither is a map-tile service; both are
+bundled offline.
+
+### CQ zone boundaries
+`ui/src/data/cqzones.geojson` is from HB9HIL's hamradio-zones-geojson
+(<https://github.com/HB9HIL/hamradio-zones-geojson>), **MIT** (© 2024 HB9HIL);
+the license text ships beside it (`cqzones.LICENSE.txt`).
+
+### World Magnetic Model coefficients (WMM2025)
+`crates/propagation/data/WMM_2025.COF` is the official WMM2025 coefficient
+file produced by NOAA/NCEI and the British Geological Survey. As a work of
+the US government it is **public domain**; the model is valid 2025.0–2030.0.
+The declination evaluator (`crates/propagation/src/wmm.rs`) is an original
+implementation validated against the official WMM2025 test-value table.
+
+---
+
+## Linked native libraries
+
+### FFTW (FFTW3, single precision)
+License: **GPL-2.0-or-later** (the version Nexus builds and links —
+`libfftw3f`). See the FFTW upstream project for terms. Used by `libtempo` for the
+FFT routines (`four2a` and related DSP). On the Linux/WSL2 cross build it is
+statically linked from a MinGW-built `libfftw3f.a`; on native MSYS2 builds it
+is located via `pkg-config`.
+
+### Boost (header-only CRC)
+License: **Boost Software License 1.0** (SPDX: `BSL-1.0`). Only the
+**header-only** `<boost/crc.hpp>` is used, by `libtempo`'s `crc14.cpp`. No
+compiled Boost library is linked.
+
+---
+
+## Rig-control protocol interoperability (no vendor code bundled)
+
+Nexus controls transceivers over their manufacturers' **published** control
+protocols. Each implementation is **independent, original code** written from the
+public protocol documentation to interoperate with hardware the operator owns — a
+long-standing, widely-practiced form of interoperability (Hamlib, WSJT-X, N1MM, and
+many others control the same radios the same way). **No manufacturer SDK, library,
+or source code is copied or bundled.**
+
+### Icom CI-V
+The native Icom CI-V transport (`crates/tempo-audio/src/civ/`) is an original
+implementation of the CI-V command set (frequency, mode, PTT, levels/meters, and the
+`0x27` scope-waveform stream), written from **Icom's published CI-V reference** (the
+command tables in Icom's operating manuals — e.g. the IC-7300 §19 command list).
+Command opcodes and byte layouts are functional facts of the wire protocol; no Icom
+software or manual text is reproduced.
+
+### FlexRadio SmartSDR
+The FlexRadio panadapter path (`crates/tempo-net/src/flex{cat,vita,disc}.rs` and
+`crates/tempo-audio/src/flexspectrum.rs`) is an original implementation of a SmartSDR
+Ethernet-API client, written from FlexRadio's **publicly-documented API**
+(<https://github.com/flexradio/smartsdr-api-docs>) and the **open VITA-49 Radio
+Transport standard** (VITA), and validated against synthetic frames. The FFT-packet
+field layout is cross-checked against the open-source **FlexLib** reference as a wire-
+format fact, not a code copy. **FlexRadio's proprietary FlexLib .NET library is NOT
+included or redistributed** — it is redistributable with third-party apps and requires
+a license only for *commercial* products, and Nexus neither bundles it nor is a
+commercial product. FlexRadio publishes this API expressly for third-party developers,
+and an ecosystem of independent open-source clients exists (e.g. K3TZR's xLib6000,
+flexlib-go, and the GPLv3 AetherSDR).
+
+### Trademarks
+**Icom** and IC-model names, and **FlexRadio**, **SmartSDR**, and FLEX-model names,
+are trademarks of Icom Inc. and FlexRadio Systems respectively. Nexus uses them only
+**nominatively** — to state which radios it is compatible with. Nexus is an
+independent project and is **not affiliated with, sponsored by, or endorsed by** Icom
+or FlexRadio.
+
+---
+
+## Rust dependencies
+
+Nexus's Rust workspace — 17 crates under `crates/`: `deepcw`, `fst4`, `ft4`, `ft8`, `jt65`,
+`modes`, `msk144`, `propagation`, `q65`, `tempo-app`, `tempo-audio`, `tempo-core`,
+`tempo-fast`, `tempo-fast-sys`, `tempo-net`, `tempo-sstv`, `wspr` — and the standalone Tauri
+shell (`src-tauri/`, which is NOT a workspace member) depend on the crates below.
+`Cargo.lock` plus `deny.toml` are the authoritative, machine-checked license set: CI runs
+cargo-deny over the whole graph with `all-features = true`, and its `licenses.allow` list is
+the gate that actually fails a build. This section is the human-readable summary of the
+principal third-party components, not a substitute for that gate:
+
+- **Tauri** (v2 desktop shell) — MIT OR Apache-2.0.
+- **tauri-plugin-updater** (signed self-update: verifies a minisign signature over each
+  installer before applying it) — MIT OR Apache-2.0.
+- **tauri-plugin-opener** (open a URL / file in the system handler) — MIT OR Apache-2.0.
+- **tauri-plugin-notification** (Pounce's rare-DX alert via the platform notification
+  center — the web Notification API does not exist in WKWebView) — Apache-2.0 OR MIT.
+  Its desktop backends **notify-rust** (Linux) — MIT OR Apache-2.0,
+  **mac-notification-sys** (macOS) — MIT/Apache-2.0, and **tauri-winrt-notification**
+  (Windows) — MIT OR Apache-2.0, arrive with it.
+- **cpal** (sound-card audio transport) — MIT OR Apache-2.0.
+- **alsa** (Linux only: reading ALSA's PCM device hints, so the audio picker can show the
+  card description the operator's own system shows — cpal keeps only the raw PCM name) —
+  Apache-2.0 OR MIT. Already present as cpal's own dependency at the same version.
+- **gdk** (Linux only: reading the display's physical size at first launch, so the UI can
+  seed its own scale on a high-DPI panel instead of rendering half-size until the operator
+  finds the zoom control) — MIT. Not a new crate: already in the tree at the same version as a
+  dependency of gtk, gdkx11 and webkit2gtk, which the Linux webview pulls in regardless.
+- **io-kit-sys**, **core-foundation-sys**, **coreaudio-sys** (macOS only: reading USB
+  topology from the IO registry, so the pickers can say WHICH RADIO a serial port or a sound
+  card belongs to — two rigs with the same bridge and codec chips are otherwise identical
+  strings) — MIT / Apache-2.0, MIT OR Apache-2.0, and MIT respectively (coreaudio-sys is MIT
+  only, not dual). io-kit-sys and core-foundation-sys were already in the tree at these
+  versions via serialport and cpal.
+  ⚠️ coreaudio-sys is a GENUINELY NEW crate as of the cpal 0.15 -> 0.18 upgrade, which
+  replaced it with the objc2-core-audio family and dropped it from the tree. The PR that
+  brought this code was written when cpal still pulled it in and said so; that stopped being
+  true underneath it. It is carried deliberately: the alternative was asking the contributor
+  to rewrite working IOKit/CoreAudio interop against a different binding for no
+  operator-visible difference. macOS builds only.
+- **serialport** (serial CAT / RTS-DTR keying) — MPL-2.0.
+- **sgp4** (SGP4/SDP4 orbital propagation for satellite geometry) — MIT.
+- **keyring** (OS-native credential vault for LoTW / QRZ / ClubLog / eQSL
+  secrets) — MIT OR Apache-2.0.
+- **reqwest** / **quick-xml** (live-feed HTTP + XML/RSS parsing) —
+  MIT OR Apache-2.0 / MIT.
+- **hound** (voice-keyer WAV read/write) — Apache-2.0 OR MIT OR Zlib.
+- **socket2** (shared-UDP socket options for radio sharing) — MIT OR Apache-2.0.
+- **serde** / **serde_json** (serialization) — MIT OR Apache-2.0.
+- **tract-onnx** and its `tract-core` / `tract-hir` / `tract-linalg` / `tract-data` /
+  `tract-nnef` companions (the pure-Rust neural-network inference engine that runs the DeepCW
+  model — see the DeepCW section at the end of this file for the model's own, different,
+  AGPL-3.0-only terms) — MIT OR Apache-2.0.
+- **rustfft** (the FFT behind the SSTV receiver: VIS decode, sync, per-line demodulation and
+  SNR) — MIT OR Apache-2.0.
+- **microfft** (fixed-size in-place FFTs on the hot decode paths — the waterfall spectrum, the
+  RTTY demodulator, and DeepCW's front end) — MIT.
+- **thiserror** (error types in `crates/tempo-sstv`) — MIT OR Apache-2.0.
+- **windows-sys** (Windows only: the Win32 job-object / process calls that make a crashed or
+  killed Nexus take its child `rigctld` with it instead of orphaning the serial port) —
+  MIT OR Apache-2.0.
+- **windows** (Windows only: COM and `IDispatch`, for driving VE3NEA's OmniRig rig-control
+  server as a CAT backend — `crates/tempo-audio/src/omnirig/com.rs`) — MIT OR Apache-2.0.
+  OmniRig itself is a separate program the operator installs; Nexus only calls its published
+  COM interface and ships none of it.
+
+`crates/tempo-net` (the WSJT-X-compatible UDP API and PSK Reporter spotting) is otherwise
+pure `std` Rust: **socket2** is its only third-party crate, and only because `std` exposes no
+way to set `SO_REUSEADDR` — which Flex discovery needs in order to share UDP 4992 with a
+co-hosted SmartSDR.
+
+## JavaScript / UI dependencies
+
+The web UI (`ui/`, Vite + React + TypeScript) depends on:
+
+- **React** / **react-dom** — MIT.
+- **TypeScript** — **Apache-2.0**.
+- **Vite**, **@vitejs/plugin-react**, and React type definitions (dev
+  dependencies) — MIT. See each package for its terms.
+- **d3-geo** (map projection + point-in-polygon `geoContains`) and
+  **topojson-client** (TopoJSON decoding) — **ISC**, © Mike Bostock / the D3
+  authors.
+- **world-atlas** (offline basemap package; ISC) — its `countries-50m` /
+  `countries-110m` geometry derives from **Natural Earth** (**public domain**).
+  No map tiles or network map services are used.
+- **us-atlas** (ISC) — the `states-10m` TopoJSON is bundled in the UI to draw the
+  Connect map's US state borders, and is also the build-time source for
+  `grid_state.bin`. Its geometry derives from **US Census Bureau** cartographic
+  boundary files (**public domain**); see the WAS grid-state note above.
+- **three.js** and **react-globe.gl** / **globe.gl** — **MIT** (© Mikola Lysenko /
+  Vasco Asturiano / three.js authors). The optional 3-D WebGL Connect globe (lazy-loaded
+  only when the operator turns it on); the 2-D Canvas map remains the default.
+- **Lucide** icons via `lucide-react` — **ISC** (© Lucide contributors; based
+  on Feather Icons, MIT).
+- **Radix UI** primitives `@radix-ui/react-dialog`, `-dropdown-menu`, `-toast`,
+  and `-tooltip` — **MIT** (© WorkOS / Radix).
+- **@tanstack/react-virtual** — **MIT** (© Tanner Linsley). Row virtualisation for the
+  logbook table, so a log of tens of thousands of QSOs scrolls without mounting every row.
+
+Test-only tooling (**vitest**, **jsdom**, **@testing-library/react** and `/dom`, all MIT) is
+a dev dependency and is **not** part of any shipped bundle. As on the Rust side, the
+authoritative machine-checked set is the lockfile — `ui/package-lock.json` — not this list.
+
+---
+
+## Runtime data services (courtesy)
+
+When the relevant features are enabled, Nexus queries the external services
+below at runtime. Except where a service is named below as redistributed,
+**none of their data is redistributed with the app**, and each is used under
+its own terms of service. These acknowledgments are given as a courtesy to the
+operators and communities who provide them:
+
+- **SatNOGS DB** (<https://db.satnogs.org>) — which amateur satellites and
+  transponders are active, for the Satellites feature. SatNOGS DB data is
+  provided by the SatNOGS / Libre Space Foundation community under
+  **CC BY-SA 4.0**. Data courtesy of the SatNOGS project and its contributors.
+  **SatNOGS material IS redistributed**, in four places — see *Redistributed
+  SatNOGS material* below.
+- **CelesTrak** (<https://celestrak.org>, T.S. Kelso) — amateur-satellite
+  TLE / GP orbital elements. Redistributed as part of the satellite catalog
+  mirror described below, and in the seed snapshot of it that the installer
+  bundles.
+- **wspr.live** (the community mirror of wsprnet.org) — WSPR beacon reception
+  evidence for the "getting out" check; free non-commercial terms. Data
+  courtesy of wspr.live / wsprnet.org contributors.
+- **PSK Reporter** (Philip Gladstone) — reception-report retrieval and
+  outbound spotting.
+- **Reverse Beacon Network** — CW/digital skimmer spots.
+- **NOAA SWPC** (services.swpc.noaa.gov) — solar flux, K-index, X-ray/proton
+  flux, aurora, solar-wind, and alert feeds (US government, **public domain**).
+- **prop.kc2g.com** (Andrew Rodland, KC2G) — real-time MUF map.
+- **WA7BNM Contest Calendar** (<https://www.contestcalendar.com/>, Bruce Horn
+  WA7BNM) — the upcoming-contests pane.
+- **NG3K Announced DX Operations** (Bill Feidt, NG3K) — DXpedition calendar.
+- **Parks on the Air (POTA)** and **Summits on the Air (SOTA)** — activator
+  spot APIs.
+- **HamQTH** (<https://www.hamqth.com/>, Petr Hlozek OK2CQR) — callsign lookup
+  and QSO auto-fill fallback.
+- **ARRL Logbook of the World (LoTW)**, **ClubLog** (Michael Wells, G7VJR),
+  **QRZ.com**, **eQSL.cc**, and **HRDLog** — callsign lookup and QSL / log
+  synchronization for the connectors the operator opts into.
+
+---
+
+## License compatibility
+
+The bundled and linked components combine into the GPLv3 whole:
+
+- GPLv3 / LGPL / GPLv2-or-later (WSJT-X, Hamlib, FFTW, fldigi) combine into the
+  GPLv3 whole (FFTW's v2-or-later and fldigi's v3-or-later are satisfied by
+  electing v3).
+- Permissive licenses (BSL-1.0 for Boost; MIT / Apache-2.0 for Tauri, cpal,
+  sgp4, keyring, reqwest, hound, socket2, serde, React, TypeScript, Vite,
+  Radix; ISC for d3-geo, topojson-client, world-atlas, us-atlas, lucide-react;
+  ISC for slowrx and MIT for the `slowrx.rs` port of it vendored at
+  `crates/tempo-sstv/`; MIT for cty.dat and the CQ-zone data; public domain for
+  the WMM, Natural Earth, and Census-derived data) are compatible with
+  redistribution under GPLv3.
+- MPL-2.0 (serialport) is GPL-compatible; its source-disclosure obligations
+  apply per-file to that component.
+
+Runtime data services (the "Runtime data services" section above) are **not
+bundled or linked** — the app merely queries them over the network — so their
+terms do not affect the license of the distributed binary; they are
+acknowledged as a courtesy. The one share-alike source that IS redistributed is
+SatNOGS data, CC BY-SA 4.0. None of it is part of any shipped binary: it lives
+in test fixtures, in a data file the project publishes and every install
+downloads at runtime, and — since the seed snapshot — as a standalone copy of
+that same data file inside the installer, carrying its own attribution; see
+*Redistributed SatNOGS material* below.
+
+## Redistributed SatNOGS material
+
+SatNOGS data (**CC BY-SA 4.0**, <https://creativecommons.org/licenses/by-sa/4.0/>,
+© the SatNOGS / Libre Space Foundation community) is redistributed by this
+project in four places. None is compiled into a binary; the licence and its
+attribution travel inside each artifact so that they survive it being copied
+out of this tree. Creative Commons designates GPL-3.0 a **BY-SA Compatible
+License**, so adapted BY-SA 4.0 material may be redistributed under GPLv3 with
+attribution preserved.
+
+### 1. The amateur satellite catalog + TLE mirror (published, downloaded by every install)
+
+`scripts/gen-tles.mjs` runs in CI every six hours and publishes `tles.json` /
+`tles.txt` as a GitHub Release asset that <https://hamradiotools.io/nexus/> 302s
+to, and that every Nexus install refreshes from and caches to disk. Its content
+is derived from:
+
+- the **SatNOGS DB** (<https://db.satnogs.org>) — the satellite population,
+  names, statuses and transmitter records, **CC BY-SA 4.0**;
+- the **SatNOGS TLE API** — orbital elements, same terms; and
+- **CelesTrak** (<https://celestrak.org>, Dr. T.S. Kelso) — orbital elements
+  from the `amateur` and `satnogs` GP groups, used under CelesTrak's terms.
+
+Because the population and status data are BY-SA, the published catalog is an
+adaptation of BY-SA material and is offered under **CC BY-SA 4.0**. The
+manifest carries that statement in its own `attribution` field, and the
+Release notes carry it too. Our thanks to the SatNOGS community, whose
+curation is what makes a list of *amateur* satellites possible at all — no
+element source alone can say which birds carry a working amateur transmitter.
+
+### 2. The bundled seed snapshot (committed here, shipped inside the installer)
+
+`src-tauri/resources/tles/tles.json` is that same manifest, committed into this
+tree and bundled into every installer as an app resource (`resources/tles/`).
+It is there so a fresh install has the amateur satellite catalog on first
+launch — complete, and with no network — instead of a near-empty list until its
+first successful fetch; the app then refreshes from the published mirror
+exactly as it always has. `scripts/release-prep` re-runs the generator and
+re-cuts this file at release time, so a shipped snapshot is as current as the
+release that carries it.
+
+Being the same payload, it is an adaptation of the same three sources:
+
+- the **SatNOGS DB** (<https://db.satnogs.org>) — the satellite population,
+  names, statuses and transmitter records, **CC BY-SA 4.0**;
+- the **SatNOGS TLE API** — orbital elements, same terms; and
+- **CelesTrak** (<https://celestrak.org>, Dr. T.S. Kelso) — orbital elements
+  from the `amateur` and `satnogs` GP groups, used under CelesTrak's terms.
+
+Of the four, this is the copy that reaches an operator most directly: every
+installer carries one. It is therefore the clearest case for this section's
+rule — it is **not** compiled into the executable, and that is deliberate. It
+ships as a standalone JSON file carrying its own `attribution` object, written
+by `scripts/gen-tles.mjs`: `"license": "CC-BY-SA-4.0"` plus a `"text"` that
+credits the SatNOGS DB and its contributors, CelesTrak and Dr. T.S. Kelso, and
+the SatNOGS TLE API, and states that the derived catalog is offered under
+CC BY-SA 4.0. That field is present in the committed file and in every
+regeneration of it, so the licence and the credit travel with the data if the
+file is ever copied out of the installer. The adapted catalog is offered under
+**CC BY-SA 4.0**, as above.
+
+### 3. Mirror-generator test fixtures
+
+`scripts/fixtures/tles/satnogs-satellites.json`,
+`satnogs-transmitters.json` and `satnogs-tle.json` are small hand-picked
+excerpts of the SatNOGS DB and TLE APIs (plus a few synthetic records), kept so
+the generator's derivation and sanity gates are tested without touching the
+network. **CC BY-SA 4.0**, as above.
+
+### 4. SatNOGS Network observations (Doppler validation)
+
+See *Test fixtures* below.
+
+## Test fixtures
+
+Not shipped in any binary. Listed because they are redistributed in this
+repository and carry their own terms.
+
+### SatNOGS Network observations (Doppler validation)
+`crates/propagation/tests/fixtures/sat_doppler_real/observed.json` (140 KB)
+holds carrier-frequency-versus-time tracks measured during eight real satellite
+passes, recovered from the calibrated waterfall products of the **SatNOGS
+Network** (<https://network.satnogs.org>), a project of the **Libre Space
+Foundation**. SatNOGS Network data is licensed **CC BY-SA 4.0**
+(<https://creativecommons.org/licenses/by-sa/4.0/>).
+
+Creative Commons designates GPL-3.0 a **BY-SA Compatible License**, so adapted
+BY-SA 4.0 material may be redistributed under GPLv3 with attribution preserved,
+which is what this file does — the licence and attribution also travel inside
+the JSON itself, so they survive the file being copied out of this tree. (The
+same rule is applied to the two other redistributed SatNOGS artifacts; see
+*Redistributed SatNOGS material* above.)
+
+Observed by SatNOGS ground stations **1696, 4803, 5049 and 5062** — our thanks
+to their operators and to the SatNOGS community, whose recordings let Nexus's
+Doppler prediction be checked against signals that actually arrived at an
+antenna rather than only against another implementation of the same theory.
+Regenerate with `crates/propagation/tests/fixtures/sat_doppler_real/generate.py`
+(requires network access; the committed fixture needs none).
+
+For the complete and authoritative GPL terms, see **`COPYING`**. For any
+component whose exact license is not stated above, consult the upstream
+project's own license files (for Hamlib, those ship under
+`resources/hamlib/`).
+
+## DeepCW model (the AI CW decoder)
+Nexus's PRIMARY CW decoder is powered by the DeepCW neural-network model,
+created by **e04** (https://github.com/e04/deepcw-engine), licensed
+**AGPL-3.0-only** — our thanks for an outstanding piece of weak-signal
+engineering. The model ships as an app resource (resources/deepcw/); its
+source form (the ONNX weights + metadata) is available from the upstream
+repository, and Nexus's modification (constant-folding the graph at the fixed
+15 s decode window) is documented in src-tauri/resources/deepcw/README.md.
+Per GPLv3 §13/AGPLv3 §13 the combination is conveyed under both licenses'
+terms; the classic decoder remains as the automatic fallback if the model is
+absent. The inference and stitching code around the model is original Nexus
+code (GPL-3.0). The **full AGPL-3.0 license text ships with the model** at
+`resources/deepcw/LICENSE.AGPL-3.0.txt` (bundled in the installer), so the
+model's license travels with the binary as AGPLv3 §4 requires; the model's
+corresponding source is the upstream e04/deepcw-engine repository above.
