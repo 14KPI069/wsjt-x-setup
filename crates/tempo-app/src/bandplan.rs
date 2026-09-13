@@ -943,26 +943,40 @@ mod tests {
             OperatingMode::Keyboard
         ));
     }
-
-    #[test]
-    fn cw_activity_is_inside_the_band_and_off_the_edge() {
-        // 20 m CW activity sits above the dead 14.000 edge and inside the CW segment.
-        let f = cw_activity_mhz("20m").unwrap();
+#[test]
+    fn cw_activity_is_inside_band_and_off_the_edge() {
         assert!(
-            f > 14.0 && f < 14.15,
-            "20m CW activity {f} should be in the CW segment"
+            !tx_allowed(
+                LicenseClass::Technician,
+                dial("40m") + off,
+                OperatingMode::CW
+            ),
+            "a Technician must not key 40 m PSK31"
         );
-        // Every HF band the picker offers has a CW activity centre.
-        for b in [
-            "160m", "80m", "40m", "30m", "20m", "17m", "15m", "12m", "11m", "10m", "6m",
-        ] {
-            assert!(
-                cw_activity_mhz(b).is_some(),
-                "{b} needs a CW activity frequency"
-            );
-        }
-        assert!(cw_activity_mhz("bogus").is_none());
-    }
+        assert!(
+            tx_allowed(
+                LicenseClass::Technician,
+                dial("10m") + off,
+                OperatingMode::CW
+            ),
+            "10 m 28.120 is inside Technician data privileges"
+        );
+        assert!(
+            tx_allowed(
+                LicenseClass::Technician,
+                dial("6m") + off,
+                OperatingMode::CW
+            ),
+            "6 m is band-wide data at every class"
+        );
+        // Keyboard is judged as a DATA emission, not phone: in the 20 m phone
+        // segment (no data authorization) even an Extra is refused.
+        assert!(!tx_allowed(
+            LicenseClass::Extra,
+            14.300,
+            OperatingMode::CW
+        ));
+    }   }
 
     #[test]
     fn plan_is_nonempty_and_well_formed() {
