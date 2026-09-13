@@ -969,14 +969,12 @@ mod tests {
             ),
             "6 m is band-wide data at every class"
         );
-        // Keyboard is judged as a DATA emission, not phone: in the 20 m phone
-        // segment (no data authorization) even an Extra is refused.
         assert!(!tx_allowed(
             LicenseClass::Extra,
             14.300,
             OperatingMode::CW
         ));
-    }   }
+    }
 
     #[test]
     fn plan_is_nonempty_and_well_formed() {
