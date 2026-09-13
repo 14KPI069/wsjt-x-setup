@@ -45,4 +45,4 @@ echo Le programme EXE se trouve dans :
 echo   src-tauri\target\release\
 echo ============================================================
 pause
-exit /b 0
+exit /b 0 
