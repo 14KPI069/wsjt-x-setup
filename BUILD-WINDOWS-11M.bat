@@ -1,6 +1,6 @@
 @echo off
 setlocal
-CD /d "%~dp0"
+cd /d "%~dp0"
 
 echo =======================================================
 echo Nexus 1.10.3 - 11m / DX Cluster - Windows Installer
@@ -13,13 +13,13 @@ echo.
 where powershell.exe >nul 2>nul || (
     echo ERROR : PowerShell is missing.
     pause
-    exit /b1
+    exit /b 1
 )
 
 if not exist "scripts\build-windows.ps1" (
     echo ERROR : scripts\build-windows.ps1 is missing.
     pause
-    exit /b1
+    exit /b 1
 )
 
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\build-windows.ps1"
@@ -45,4 +45,4 @@ echo The standalone EXE is located in :
 echo   src-tauri\target\release\
 echo =======================================================
 pause
-exit /b0
+exit /b 0
