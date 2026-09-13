@@ -1285,4 +1285,4 @@ mod wsjtx_parity_tests {
             }
         }
     }
-
+}
