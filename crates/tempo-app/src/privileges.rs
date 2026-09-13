@@ -1,0 +1,513 @@
+//! US (FCC Part 97, ITU Region 2 / contiguous US) amateur transmit privileges by license
+//! class — the data + logic behind the transmit lockout and the "jump to the start of my
+//! licensed segment" band dropdown. Pure (no IO); heavily tested because it's a legal guard.
+//!
+//! Verified 2026-06-09 against the ARRL frequency-allocations table + 47 CFR §97.301/§97.305
+//! (incl. the 60 m subband effective 2026-02-13). Conventions:
+//! - CW (A1A) is allowed across the class's whole authorized span on a band.
+//! - DATA/RTTY (FT8/FT4 etc.) is allowed only in the no-phone lower segments on HF, but
+//!   band-wide above 50 MHz (and on 30 m, all-data).
+//! - PHONE/image is allowed only in the phone segments.
+//!
+//! `Open` = no restrictions (non-US operators); `tx_allowed` short-circuits to true. Its rows
+//! are therefore a PARKING table, not a privilege one — which is why `Open` alone also carries
+//! [`REGION1`], the 4 m band the US table has no way to describe.
+
+use crate::settings::{LicenseClass, OperatingMode};
+
+/// One contiguous frequency segment and which emission types a class may use in it.
+#[derive(Debug, Clone, Copy)]
+struct Seg {
+    lo: f64, // MHz, inclusive
+    hi: f64, // MHz, exclusive
+    cw: bool,
+    data: bool,
+    phone: bool,
+}
+
+const fn s(lo: f64, hi: f64, cw: bool, data: bool, phone: bool) -> Seg {
+    Seg {
+        lo,
+        hi,
+        cw,
+        data,
+        phone,
+    }
+}
+
+// VHF/UHF privileges are identical for Technician and above; share them.
+//
+// ⚠️ EXTEND-ONLY against 47 CFR 97.301(a) — this table is the license-privilege TX
+// gate, a load-bearing transmit-path invariant. The microwave rows (Batch 3, the
+// QO-100 report) follow the regulation, not the band table: ADIF's "13cm" LABEL spans
+// 2300–2450 MHz, but US amateurs hold only 2300–2310 and 2390–2450 — the 2310–2390 gap
+// is not amateur spectrum, so the label is one band and the privilege is two segments.
+// 9 cm (3300–3500) has NO row at all: the US amateur secondary allocation there was
+// removed, so a US class must read TX LOCKED on it even though the band is labelled
+// (labels serve tuning and honest logging; the Open class short-circuits above this
+// table and is unaffected — QO-100's actual audience).
+const VHF: &[Seg] = &[
+    s(50.0, 50.1, true, false, false),       // 6 m CW only
+    s(50.1, 54.0, true, true, true),         // 6 m all-mode
+    s(144.0, 144.1, true, false, false),     // 2 m CW only
+    s(144.1, 148.0, true, true, true),       // 2 m all-mode
+    s(222.0, 225.0, true, true, true),       // 1.25 m all-mode
+    s(420.0, 450.0, true, true, true),       // 70 cm all-mode
+    s(902.0, 928.0, true, true, true),       // 33 cm all-mode
+    s(1240.0, 1300.0, true, true, true),     // 23 cm all-mode (IC-9700's third band)
+    s(2300.0, 2310.0, true, true, true),     // 13 cm lower segment (2310–2390 is NOT amateur)
+    s(2390.0, 2450.0, true, true, true),     // 13 cm upper segment (QO-100 uplink territory)
+    s(5650.0, 5925.0, true, true, true),     // 6 cm all-mode
+    s(10_000.0, 10_500.0, true, true, true), // 3 cm all-mode (QO-100 downlink territory)
+    s(24_000.0, 24_250.0, true, true, true), // 1.25 cm all-mode
+];
+
+// IARU Region 1's 4 m band (69.9–70.5 MHz on a CEPT secondary basis, footnote ECA9), shaped
+// like the 6 m and 2 m rows above: a narrowband bottom slice — beacons, and WSPR at 70.091 —
+// under the all-mode segment.
+//
+// ⚠️ FOR `Open` ONLY, AND IT IS A PARKING TABLE, NOT A PRIVILEGE CLAIM. The US has no 4 m
+// allocation at any class, so this must never be folded into `extra()`: `Open` borrows
+// Extra's rows, and a Seg there would assert a US privilege that does not exist and turn
+// `bandplan::no_us_license_class_may_key_a_4m_channel` red. `tx_allowed` short-circuits
+// `Open` before it ever reads this list, so all these rows decide is where a band pick parks
+// the dial — 70.100 for phone, and CW lifts to the 70.200 SSB/CW calling frequency through
+// `bandplan::cw_activity_mhz`. National 4 m edges vary by tens of kHz inside this span (DL is
+// 70.150–70.210); the band-plan notes carry that warning to the operator, this table cannot.
+const REGION1: &[Seg] = &[
+    s(70.0, 70.1, true, true, false), // 4 m beacons / narrowband bottom (no phone)
+    s(70.1, 70.5, true, true, true),  // 4 m all-mode; SSB/CW calling 70.200
+];
+
+// 60 m (General/Extra): the 5.3515–5.3665 subband + 4 retained legacy channel centers
+// (±1.4 kHz = 2.8 kHz BW), all-mode. 60 m is channelized — excluded from the band dropdown
+// but enforced by the lockout.
+const SIXTY: &[Seg] = &[
+    s(5.3515, 5.3665, true, true, true),
+    s(5.3306, 5.3334, true, true, true), // ch 5.3320
+    s(5.3466, 5.3494, true, true, true), // ch 5.3480
+    s(5.3716, 5.3744, true, true, true), // ch 5.3730
+    s(5.4036, 5.4064, true, true, true), // ch 5.4050
+];
+
+fn technician() -> Vec<Seg> {
+    // Technician HF is CW-ONLY on 80/40/15 m — the legacy Novice CW sub-bands. RTTY/data is
+    // NOT granted there (§97.301(e); ARRL Volunteer Monitor flags Tech FT8 on these as a
+    // violation). 10 m is the ONLY HF band where a Technician may run data (28.0–28.3).
+    let mut v = vec![
+        s(3.525, 3.600, true, false, false), // 80 m CW only (Tech: no data)
+        s(7.025, 7.125, true, false, false), // 40 m CW only (Tech: no data)
+        s(21.025, 21.200, true, false, false), // 15 m CW only (Tech: no data)
+        s(28.000, 28.300, true, true, false), // 10 m CW/data (Tech DOES get data here)
+        s(28.300, 28.500, true, false, true), // 10 m phone (Tech capped at 28.500)
+    ];
+    v.extend_from_slice(VHF);
+    v
+}
+
+fn general() -> Vec<Seg> {
+    let mut v = vec![
+        s(1.800, 2.000, true, true, true),    // 160 m all-mode
+        s(3.525, 3.600, true, true, false),   // 80 m CW/data
+        s(3.800, 4.000, true, false, true),   // 80 m phone
+        s(7.025, 7.125, true, true, false),   // 40 m CW/data
+        s(7.175, 7.300, true, false, true),   // 40 m phone
+        s(10.100, 10.150, true, true, false), // 30 m CW/data (no phone, any class)
+        s(14.025, 14.150, true, true, false), // 20 m CW/data
+        s(14.225, 14.350, true, false, true), // 20 m phone
+        s(18.068, 18.110, true, true, false), // 17 m CW/data
+        s(18.110, 18.168, true, false, true), // 17 m phone
+        s(21.025, 21.200, true, true, false), // 15 m CW/data
+        s(21.275, 21.450, true, false, true), // 15 m phone
+        s(24.890, 24.930, true, true, false), // 12 m CW/data
+        s(24.930, 24.990, true, false, true), // 12 m phone
+        s(28.000, 28.300, true, true, false), // 10 m CW/data
+        s(28.300, 29.700, true, false, true), // 10 m phone
+    ];
+    v.extend_from_slice(SIXTY);
+    v.extend_from_slice(VHF);
+    v
+}
+
+fn extra() -> Vec<Seg> {
+    let mut v = vec![
+        s(1.800, 2.000, true, true, true),    // 160 m all-mode
+        s(3.500, 3.600, true, true, false),   // 80 m CW/data (Extra bottom 3.500)
+        s(3.600, 4.000, true, false, true),   // 80 m phone (Extra floor 3.600)
+        s(7.000, 7.125, true, true, false),   // 40 m CW/data (Extra bottom 7.000)
+        s(7.125, 7.300, true, false, true),   // 40 m phone (Extra floor 7.125)
+        s(10.100, 10.150, true, true, false), // 30 m CW/data
+        s(14.000, 14.150, true, true, false), // 20 m CW/data (Extra bottom 14.000)
+        s(14.150, 14.350, true, false, true), // 20 m phone (Extra floor 14.150)
+        s(18.068, 18.110, true, true, false), // 17 m CW/data
+        s(18.110, 18.168, true, false, true), // 17 m phone
+        s(21.000, 21.200, true, true, false), // 15 m CW/data (Extra bottom 21.000)
+        s(21.200, 21.450, true, false, true), // 15 m phone (Extra floor 21.200)
+        s(24.890, 24.930, true, true, false), // 12 m CW/data
+        s(24.930, 24.990, true, false, true), // 12 m phone
+        s(28.000, 28.300, true, true, false), // 10 m CW/data
+        s(28.300, 29.700, true, false, true), // 10 m phone
+    ];
+    v.extend_from_slice(SIXTY);
+    v.extend_from_slice(VHF);
+    v
+}
+
+/// The privilege segments for a class. `Open` borrows Extra's segments so the band dropdown
+/// jumps to the conventional full-privilege segment starts (the lockout never consults them —
+/// it short-circuits Open to allowed), PLUS [`REGION1`] — the bands the US table cannot
+/// describe at all. That extension is appended here rather than added to `extra()` for the
+/// reason spelled out on the constant: it is where a non-US pick parks, never a US privilege.
+fn segments(class: LicenseClass) -> Vec<Seg> {
+    match class {
+        LicenseClass::Technician => technician(),
+        LicenseClass::General => general(),
+        LicenseClass::Extra => extra(),
+        LicenseClass::Open => {
+            let mut v = extra();
+            v.extend_from_slice(REGION1);
+            v
+        }
+    }
+}
+
+fn allows(seg: &Seg, mode: OperatingMode) -> bool {
+    match mode {
+        OperatingMode::Cw => seg.cw,
+        // RTTY and the keyboard modes (PSK31…) are data emissions (§97.305 puts
+        // RTTY and data in the same segments).
+        OperatingMode::Digital | OperatingMode::Rtty | OperatingMode::Keyboard => seg.data,
+        OperatingMode::Phone => seg.phone,
+    }
+}
+
+/// May this class transmit `mode` at `emission_mhz` (the EMITTED RF, not the dial)? `Open`
+/// always may. US classes: the emission must fall in a segment that authorizes the mode.
+///
+/// ⚠️ `Open` RETURNING `true` OFF EVERY NAMED BAND IS DELIBERATE — POLICY, NOT AN OVERSIGHT
+/// (operator ruling, 2026-08-13; it has now been "corrected" toward a blanket off-band
+/// refusal twice in review, so the reasoning lives here rather than in a thread).
+///
+/// The tempting change is "if the dial is off the band plan, refuse". It is wrong, and the
+/// UK settles it: the UK 60 m allocation starts at **5.2585 MHz**, while `bandplan::
+/// band_for_dial` names only 5.3–5.5 as "60m" — so a UK operator working their own legal
+/// allocation is, by our table, off-band. The table is US-centric by construction (it is
+/// built from 47 CFR 97.301 and ADIF's registered band names), and `Open` exists precisely
+/// for the operators that table does not describe: every non-US licensee, plus anyone who
+/// has not declared a class. Refusing off-band TX would block exactly them, on their own
+/// legal frequencies, while protecting nobody — a US class already fails closed here on the
+/// dial, because no segment matches.
+///
+/// So the division of labour is: **US classes are gated by this function; `Open` is trusted.**
+/// What still protects an `Open` operator from an accidental off-band over is behavioural,
+/// not this gate — `Engine::observe_rig_freq` halts transmit when the knob leaves the bands
+/// (cutting an over in flight and dropping a latched key). That halt CUTS a transmission; it
+/// does not prevent the next one, and it is not supposed to.
+pub fn tx_allowed(class: LicenseClass, emission_mhz: f64, mode: OperatingMode) -> bool {
+    if matches!(class, LicenseClass::Open) {
+        return true;
+    }
+    segments(class)
+        .iter()
+        .any(|seg| emission_mhz >= seg.lo && emission_mhz < seg.hi && allows(seg, mode))
+}
+
+/// The lowest frequency (MHz) at which `class` may use `mode` on `band` — where a band
+/// dropdown should park the VFO. `None` = the operator has no privilege for that band+mode
+/// (so the band is omitted from the dropdown). 60 m is excluded (channelized; tune manually).
+pub fn segment_start(class: LicenseClass, band: &str, mode: OperatingMode) -> Option<f64> {
+    if band == "60m" {
+        return None;
+    }
+    segments(class)
+        .iter()
+        .filter(|seg| allows(seg, mode) && crate::bandplan::band_for_dial(seg.lo) == Some(band))
+        .map(|seg| seg.lo)
+        .fold(None, |acc, lo| Some(acc.map_or(lo, |a: f64| a.min(lo))))
+}
+
+/// An SSB signal occupies ~2.8 kHz beside the carrier. THE passband width the whole app
+/// judges phone by: the transmit gate measures the emission with it (`Engine::emission_allowed`)
+/// and [`phone_home`] parks clear of a segment edge by it. ONE constant, because a home dial
+/// computed against a narrower belief than the gate measures with is a dial the gate then
+/// refuses — which is precisely the bug [`phone_home`] exists to end.
+pub const SSB_BW_MHZ: f64 = 0.0028;
+
+/// Where a PHONE band pick should park the dial for `class` on `band` — with the sideband
+/// that band's convention uses. `None` = no phone privilege there (the band is omitted from
+/// the dropdown).
+///
+/// ⚠️ NOT [`segment_start`], which is the EDGE. On the LSB bands (<10 MHz) the passband hangs
+/// BELOW the dial, so parking ON the edge puts the lower 2.8 kHz outside the segment and the
+/// transmit gate then refuses the very dial the band picker chose. Lifting the LSB home by one
+/// passband is what makes the pick keyable. USB extends upward from `lo`, so the edge is
+/// already clear there.
+///
+/// WHY IT IS A FUNCTION AND NOT THREE COPIES (repair, 2026-08): the lift lived in
+/// `Engine::mode_home` only. `Engine::band_pick_default` (the band dropdown's pick — the
+/// `pick_band` path) and the `get_licensed_band_plan` command each recomputed the same home
+/// from the bare `segment_start` and got an unkeyable dial: picking 40 m in Phone as an Extra
+/// landed on 7.1250 LSB, whose passband starts at 7.1222 — below the 7.125 phone floor — so
+/// the cockpit showed 🔒 TX LOCKED on a band the operator is fully licensed for. 160/80/40 m
+/// are the LSB phone bands this bit. Every phone home in the app now comes from here.
+pub fn phone_home(class: LicenseClass, band: &str) -> Option<(f64, &'static str)> {
+    segment_start(class, band, OperatingMode::Phone).map(|lo| {
+        if lo < 10.0 {
+            (lo + SSB_BW_MHZ, "LSB")
+        } else {
+            (lo, "USB")
+        }
+    })
+}
+
+/// The PHONE (SSB/image) sub-band the operator may use on `band`, as an inclusive/exclusive
+/// `[lo, hi)` MHz span for the band-strip's "where you may talk" shading. `None` when the class
+/// has no phone privilege there, or for `Open` (non-US — no US sub-band model) and 60 m
+/// (channelized).
+///
+/// LEGAL-HONESTY INVARIANT: this unions all of a class's phone segments on the band into ONE
+/// span (lowest lo, highest hi). That is only honest while each band's phone privilege is a
+/// SINGLE contiguous segment — true for every current US band, enforced by the test
+/// `every_band_has_at_most_one_contiguous_phone_segment_per_class`. If a band is ever split into
+/// disjoint phone sub-bands, this would shade the no-phone gap between them as legal; then this
+/// must return a segment LIST and the strip must shade each separately.
+pub fn phone_segment(class: LicenseClass, band: &str) -> Option<(f64, f64)> {
+    // 13 cm is the one band whose phone privilege is genuinely DISJOINT (2300–2310 and
+    // 2390–2450; the gap is not amateur spectrum). Unioning would shade 2310–2390 as
+    // legal — the exact dishonesty the invariant above forbids — so like channelized
+    // 60 m it gets no single-span shade. The TX lockout still enforces per segment.
+    if band == "60m" || band == "13cm" || matches!(class, LicenseClass::Open) {
+        return None;
+    }
+    let mut lo = f64::INFINITY;
+    let mut hi = f64::NEG_INFINITY;
+    for seg in segments(class)
+        .iter()
+        .filter(|seg| seg.phone && crate::bandplan::band_for_dial(seg.lo) == Some(band))
+    {
+        lo = lo.min(seg.lo);
+        hi = hi.max(seg.hi);
+    }
+    lo.is_finite().then_some((lo, hi))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::settings::LicenseClass::*;
+    use crate::settings::OperatingMode::{Cw, Digital, Phone};
+
+    /// The exact case that leaked onto the Needed board: LU6HL spotted on 7.140 SSB. 7.140 sits
+    /// in the 40 m phone segment a GENERAL may not use (their phone starts at 7.175) but an EXTRA
+    /// may (Extra phone from 7.125). The board's privilege gate keys off precisely this.
+    #[test]
+    fn general_may_not_work_7140_phone_but_extra_may() {
+        assert!(
+            !tx_allowed(General, 7.140, Phone),
+            "7.140 is Extra-only 40m phone"
+        );
+        assert!(
+            tx_allowed(Extra, 7.140, Phone),
+            "Extra phone reaches down to 7.125"
+        );
+        // And the segment boundary the case turns on: 7.175 is where General phone begins.
+        assert!(!tx_allowed(General, 7.174, Phone));
+        assert!(tx_allowed(General, 7.175, Phone));
+    }
+
+    #[test]
+    fn open_allows_everything() {
+        assert!(tx_allowed(Open, 14.000, Phone)); // even the Extra-only bottom, even phone there
+        assert!(tx_allowed(Open, 7.200, Cw));
+        assert!(tx_allowed(Open, 5.000, Digital)); // off any US band — Open doesn't care
+    }
+
+    #[test]
+    fn technician_hf_is_cw_only_on_80_40_15_and_data_only_on_10m() {
+        assert!(tx_allowed(Technician, 3.550, Cw)); // 80 m CW ok
+                                                    // 80/40/15 m are CW ONLY for a Technician — FT8/RTTY there is a Part 97 violation.
+        assert!(!tx_allowed(Technician, 3.573, Digital)); // 80 m FT8 NOT legal for Tech
+        assert!(!tx_allowed(Technician, 7.074, Digital)); // 40 m FT8 NOT legal for Tech
+        assert!(!tx_allowed(Technician, 21.074, Digital)); // 15 m FT8 NOT legal for Tech
+        assert!(!tx_allowed(Technician, 3.850, Phone)); // no 80 m phone for Tech
+        assert!(!tx_allowed(Technician, 14.074, Digital)); // no 20 m at all for Tech
+                                                           // 10 m is the only HF band where a Technician may run data.
+        assert!(tx_allowed(Technician, 28.074, Digital)); // 10 m FT8 ok
+        assert!(tx_allowed(Technician, 28.400, Phone)); // 10 m phone ok
+        assert!(!tx_allowed(Technician, 28.600, Phone)); // Tech 10 m phone capped at 28.500
+    }
+
+    #[test]
+    fn vhf_is_full_for_technician_incl_data_band_wide() {
+        assert!(tx_allowed(Technician, 50.313, Digital)); // 6 m FT8 (in the all-mode segment)
+        assert!(tx_allowed(Technician, 144.174, Digital)); // 2 m FT8
+        assert!(tx_allowed(Technician, 1296.174, Digital)); // 23 cm FT8 (IC-9700)
+        assert!(tx_allowed(Technician, 1296.100, Phone)); // 23 cm SSB
+        assert!(tx_allowed(Technician, 146.520, Phone)); // 2 m phone
+        assert!(!tx_allowed(Technician, 50.050, Digital)); // 6 m 50.0–50.1 is CW-only
+        assert!(tx_allowed(Technician, 50.050, Cw)); // ...but CW is fine there
+    }
+
+    #[test]
+    fn general_vs_extra_phone_floors_and_bottoms() {
+        // 20 m phone floor: Extra 14.150, General 14.225.
+        assert!(tx_allowed(Extra, 14.150, Phone));
+        assert!(!tx_allowed(General, 14.150, Phone));
+        assert!(tx_allowed(General, 14.225, Phone));
+        // Extra-only CW bottoms (e.g. 14.000–14.025).
+        assert!(tx_allowed(Extra, 14.010, Cw));
+        assert!(!tx_allowed(General, 14.010, Cw)); // General CW floor 14.025
+        assert!(tx_allowed(General, 14.030, Cw));
+        // 40 m phone floor: Extra 7.125, General 7.175.
+        assert!(tx_allowed(Extra, 7.130, Phone));
+        assert!(!tx_allowed(General, 7.130, Phone));
+    }
+
+    #[test]
+    fn rtty_rides_the_data_segments() {
+        use crate::settings::OperatingMode::Rtty;
+        assert!(tx_allowed(General, 14.083, Rtty)); // 20 m RTTY window: CW/data segment
+        assert!(!tx_allowed(General, 14.300, Rtty)); // never in a phone segment
+        assert!(!tx_allowed(Technician, 3.583, Rtty)); // Tech 80 m is CW-only — no RTTY
+        assert!(tx_allowed(Technician, 28.083, Rtty)); // 10 m: the one Tech HF data grant
+    }
+
+    #[test]
+    fn thirty_meters_is_data_cw_only_no_phone_any_class() {
+        assert!(tx_allowed(General, 10.136, Digital)); // 30 m FT8 ok
+        assert!(tx_allowed(Extra, 10.130, Cw));
+        assert!(!tx_allowed(General, 10.130, Phone)); // never phone on 30 m
+        assert!(!tx_allowed(Technician, 10.130, Cw)); // Tech not authorized on 30 m
+    }
+
+    #[test]
+    fn emission_edge_is_half_open_inclusive_low() {
+        // Exactly the floor is allowed; just below is not (the emission, not the dial).
+        assert!(tx_allowed(General, 14.225, Phone));
+        assert!(!tx_allowed(General, 14.2249, Phone));
+        // Just below the upper edge is allowed; the upper edge itself is not.
+        assert!(tx_allowed(General, 14.349, Phone));
+        assert!(!tx_allowed(General, 14.350, Phone));
+    }
+
+    #[test]
+    fn every_phone_home_is_a_dial_its_class_may_actually_key() {
+        // THE contract that binds every phone band picker in the app. A picker parks the dial;
+        // the transmit gate then judges the EMISSION — the whole passband, both edges, LSB
+        // hanging below the dial. A home the gate refuses is a band the operator is licensed
+        // for and cannot key, which is what shipped while two of the three pickers recomputed
+        // the home from the bare `segment_start` (Extra picking 40 m → 7.1250, whose passband
+        // opens at 7.1222, under the 7.125 phone floor → 🔒 TX LOCKED).
+        const BANDS: &[&str] = &[
+            "160m", "80m", "40m", "30m", "20m", "17m", "15m", "12m", "10m", "6m", "2m", "1.25m",
+            "70cm", "23cm",
+        ];
+        let mut homes = 0;
+        for class in [Technician, General, Extra, Open] {
+            for band in BANDS {
+                let Some((dial, sb)) = phone_home(class, band) else {
+                    continue;
+                };
+                homes += 1;
+                assert_eq!(
+                    sb,
+                    if dial < 10.0 { "LSB" } else { "USB" },
+                    "{class:?} {band}: the home's sideband must follow the band's convention"
+                );
+                // The same span `Engine::emission_allowed` measures for Phone.
+                let (lo, hi) = if dial < 10.0 {
+                    (dial - SSB_BW_MHZ, dial)
+                } else {
+                    (dial, dial + SSB_BW_MHZ)
+                };
+                assert!(
+                    tx_allowed(class, lo, Phone) && tx_allowed(class, hi, Phone),
+                    "{class:?} {band}: the phone home {dial:.4} emits over [{lo:.4}, {hi:.4}], \
+                     which leaves the phone segment"
+                );
+            }
+        }
+        assert!(
+            homes > 20,
+            "the sweep must actually have found homes to check"
+        );
+        // …and the LSB lift is a real move, not a rounding: 160/80/40 m are the bands where
+        // the passband hangs below the dial.
+        assert_eq!(phone_home(Extra, "40m"), Some((7.125 + SSB_BW_MHZ, "LSB")));
+        assert_eq!(
+            phone_home(General, "40m"),
+            Some((7.175 + SSB_BW_MHZ, "LSB"))
+        );
+        assert_eq!(phone_home(Extra, "20m"), Some((14.150, "USB"))); // USB: already clear
+        assert_eq!(phone_home(Technician, "20m"), None); // no privilege, no home
+    }
+
+    #[test]
+    fn segment_start_for_the_band_dropdown() {
+        assert_eq!(segment_start(Extra, "20m", Phone), Some(14.150));
+        assert_eq!(segment_start(General, "20m", Phone), Some(14.225));
+        assert_eq!(segment_start(Technician, "20m", Phone), None); // Tech has no 20 m
+        assert_eq!(segment_start(Technician, "80m", Cw), Some(3.525));
+        assert_eq!(segment_start(Extra, "80m", Cw), Some(3.500));
+        assert_eq!(segment_start(Technician, "10m", Phone), Some(28.300));
+        assert_eq!(segment_start(Technician, "10m", Cw), Some(28.000));
+        // Open uses the conventional (Extra) starts.
+        assert_eq!(segment_start(Open, "20m", Phone), Some(14.150));
+        // 60 m is channelized — never in the dropdown.
+        assert_eq!(segment_start(General, "60m", Phone), None);
+    }
+
+    #[test]
+    fn phone_segment_span_for_the_band_strip_shade() {
+        assert_eq!(phone_segment(Extra, "20m"), Some((14.150, 14.350)));
+        assert_eq!(phone_segment(General, "20m"), Some((14.225, 14.350))); // General phone floor higher
+        assert_eq!(phone_segment(Technician, "20m"), None); // Tech has no 20 m
+        assert_eq!(phone_segment(Technician, "10m"), Some((28.300, 28.500))); // Tech 10 m phone cap
+        assert_eq!(phone_segment(General, "30m"), None); // 30 m: no phone, any class
+        assert_eq!(phone_segment(Open, "20m"), None); // non-US: the strip skips shading
+        assert_eq!(phone_segment(General, "60m"), None); // channelized
+    }
+
+    #[test]
+    fn every_band_has_at_most_one_contiguous_phone_segment_per_class() {
+        // Guards `phone_segment`'s union-into-one-span: if the tables ever split a band's phone
+        // privilege into DISJOINT segments, the strip would shade the no-phone gap as legal. This
+        // fails loudly at that point so the shading stays legally honest.
+        use std::collections::BTreeMap;
+        for class in [Technician, General, Extra] {
+            let mut by_band: BTreeMap<&'static str, Vec<(f64, f64)>> = BTreeMap::new();
+            for seg in segments(class).iter().filter(|s| s.phone) {
+                if let Some(b) = crate::bandplan::band_for_dial(seg.lo) {
+                    by_band.entry(b).or_default().push((seg.lo, seg.hi));
+                }
+            }
+            for (band, mut segs) in by_band {
+                // 60 m is channelized (5 discrete phone channels) and 13 cm's privilege is
+                // genuinely disjoint (2300–2310 / 2390–2450, the gap is not amateur) —
+                // both legitimately multi-segment, and `phone_segment` early-returns None
+                // for both, so the union never runs there.
+                if band == "60m" || band == "13cm" {
+                    continue;
+                }
+                segs.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+                for w in segs.windows(2) {
+                    assert!(
+                        w[0].1 >= w[1].0,
+                        "{class:?} {band}: disjoint phone segments {:?} and {:?} — phone_segment() \
+                         would bridge the gap; return a segment list and shade each instead",
+                        w[0],
+                        w[1]
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sixty_meters_is_enforced_even_though_not_in_the_dropdown() {
+        assert!(tx_allowed(General, 5.3590, Phone)); // inside the new subband
+        assert!(tx_allowed(General, 5.3320, Phone)); // a legacy channel center
+        assert!(!tx_allowed(General, 5.3400, Phone)); // between channels → blocked
+        assert!(!tx_allowed(Technician, 5.3590, Phone)); // Tech not authorized on 60 m
+    }
+}

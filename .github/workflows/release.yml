@@ -1,0 +1,1031 @@
+# Nexus release pipeline — tag → build every platform → verify → publish.
+#
+# GitHub is primary. Push a version tag and this builds Windows, Linux x86_64, and the
+# two Raspberry Pi bases, verifies each artifact, and publishes a GitHub Release with all
+# of them attached. No hand-assembly, no scrub — this repo IS the published source.
+#
+#   git tag v0.14.0 && git push origin v0.14.0     # full automatic release
+#   (Actions ▸ Release ▸ Run workflow)             # build + verify only, publishes NOTHING
+#
+# The manual (workflow_dispatch) path exists to prove a build green WITHOUT cutting a
+# release: every build/verify job runs, but the publish job is gated on a real tag push.
+#
+# SCOPE: this publishes to GitHub. SourceForge FRS upload and the version.json update
+# endpoint are a deliberate fast-follow (each needs its own secret + external system);
+# the SF *git* mirror is scripts/mirror-to-sourceforge.sh. See
+# nexus-notes/single-repo-pipeline-plan.md.
+#
+# WHY THE GATES: on 2026-07-20 a fully-green build shipped a .deb with the AI CW model
+# silently absent (14 MB light, no error anywhere). "Automatic on tag" here does NOT mean
+# "unchecked" — every artifact is proven (arch, model present + digest, version == tag)
+# before the release is created.
+
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch: {}
+
+# Creating a Release needs write access to the repo contents.
+permissions:
+  contents: write
+
+env:
+  # The DeepCW model is gitignored (AGPL-3.0 (c) e04); every build job stages it from this
+  # release and pins it by digest. One place to bump if it is ever re-folded.
+  DEEPCW_RELEASE: deepcw-model-v1
+  MODEL_SHA: a7b3b4aa2610d3e88b8c7d4420eceee31be2d0ae595b3413264334f3ffb1eab5
+  MODEL_JSON_SHA: b4342157b90229ee7380e165f3d8036179b80d1e6ae02f2557388b7fcd558c01
+  # The highest glibc symbol version the published x86_64 Linux binaries may require, and
+  # therefore the oldest distro they run on. 2.39 = Ubuntu 24.04, which is what the pinned
+  # `ubuntu-24.04` runner below produces today; docs/install.md states the same floor to
+  # operators and the two must be changed together.
+  #
+  # WHY THIS IS A GATE AND NOT A COMMENT. Before it, the floor was an emergent property of the
+  # string `ubuntu-latest`: nothing pinned it, nothing declared it, and nothing checked it. It
+  # silently excluded Ubuntu 22.04 and every Mint 21.x built on it (glibc 2.35 — issue #3), and
+  # the day GitHub rolls that label to a newer image it would rise again and break the operators
+  # who work today, with no commit to blame and a fully green build. An AppImage cannot absorb
+  # it either: an AppImage bundles application libraries, not libc.
+  #
+  # The .deb declares no `libc6 (>= x.y)` to catch it at install time, and it deliberately must
+  # not: `bundle.linux.deb.depends` in tauri.conf.json is the ONLY deb-depends config in the
+  # repo and ALL FIVE .debs build from it — scripts/Dockerfile.pi seds the bundle list and
+  # createUpdaterArtifacts, never depends — so an x86 floor stamped there would make the Pi
+  # bookworm package (glibc 2.36) refuse to install on the Pis it serves today. Any declared
+  # floor has to be per-target.
+  GLIBC_FLOOR: '2.39'
+
+jobs:
+  # ---------------------------------------------------------------------------------------
+  # Linux x86_64 — .deb + AppImage via the same scripts/build-linux.sh developers use.
+  # ---------------------------------------------------------------------------------------
+  linux-x86:
+    name: Linux x86_64 (.deb + AppImage)
+    # PINNED, not `ubuntu-latest`. The build host's glibc IS the floor of every published
+    # x86_64 artifact, so an unpinned label makes the supported-distro list move on GitHub's
+    # schedule rather than ours. The arm64 jobs below have always been pinned AND containerised
+    # (`debian:${BASE}`) and name their base in the filename; this is the same discipline for
+    # x86_64. Changing this line changes who can run Nexus — keep it in step with GLIBC_FLOOR
+    # and docs/install.md.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Stage the DeepCW model (not committed — AGPL-3.0 (c) e04)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release download "$DEEPCW_RELEASE" --repo "${{ github.repository }}" \
+            --pattern 'model.onnx*' --dir src-tauri/resources/deepcw --clobber
+          echo "$MODEL_SHA  src-tauri/resources/deepcw/model.onnx" | sha256sum -c -
+          echo "$MODEL_JSON_SHA  src-tauri/resources/deepcw/model.onnx.json" | sha256sum -c -
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev \
+            librsvg2-dev libxdo-dev libssl-dev libsoup-3.0-dev patchelf \
+            build-essential cmake ninja-build gfortran \
+            libfftw3-dev libboost-dev libasound2-dev libudev-dev \
+            libusb-1.0-0-dev \
+            libfuse2
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.93.1
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+
+      # AppImage's bundler (appimagetool) normally needs FUSE, which hosted runners lack.
+      # APPIMAGE_EXTRACT_AND_RUN makes it self-extract instead — the standard CI workaround.
+      - name: Build .deb + AppImage
+        env:
+          APPIMAGE_EXTRACT_AND_RUN: 1
+          # The AppImage is self-updatable and gets a .sig; the .deb is apt-managed and cannot
+          # self-update, so it is published unsigned by design.
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: bash scripts/build-linux.sh
+
+      - name: Verify artifacts
+        run: |
+          set -euo pipefail
+          deb=$(find src-tauri/target/release/bundle/deb -name '*.deb' -print -quit)
+          app=$(find src-tauri/target/release/bundle/appimage -name '*.AppImage' -print -quit)
+          [ -n "$deb" ] || { echo "no .deb produced"; exit 1; }
+          [ -n "$app" ] || { echo "no .AppImage produced"; exit 1; }
+          [ "$(dpkg-deb -f "$deb" Architecture)" = "amd64" ] || { echo "deb not amd64"; exit 1; }
+          # The model must be IN the package — the failure that shipped on 2026-07-20 is
+          # invisible to every check except looking inside the artifact.
+          dpkg-deb -x "$deb" /tmp/dc
+          m=/tmp/dc/usr/lib/Nexus/resources/deepcw/model.onnx
+          [ -s "$m" ] || { echo "DeepCW model missing from the .deb"; exit 1; }
+          echo "$MODEL_SHA  $m" | sha256sum -c -
+          # HAMLIB MUST BE IN BOTH ARTIFACTS, and it must RUN from where it lands.
+          #
+          # Before 1.9.0 the AppImage shipped Hamlib's five licence .txt files and no Hamlib, and
+          # nothing went red: `resources/hamlib/*` still matched the licence files, so the bundle
+          # built green and CAT was simply dead for anyone who had not separately apt-installed
+          # libhamlib-utils. Presence is checked inside the package, not on the build tree.
+          for f in rigctld rigctl rotctld rotctl libhamlib.so.4; do
+            [ -s "/tmp/dc/usr/lib/Nexus/resources/hamlib/$f" ] \
+              || { echo "$f missing from the .deb"; exit 1; }
+          done
+          # …and the same inside the AppImage, which is the package that was actually broken.
+          "$app" --appimage-extract >/dev/null
+          hl=squashfs-root/usr/lib/Nexus/resources/hamlib
+          [ -s "$hl/rigctld" ] || { echo "rigctld missing from the AppImage"; exit 1; }
+          # GSTREAMER PLUGINS, or every alert tone in the app is silently dead. linuxdeploy
+          # bundles GStreamer's core libraries and no plugins, then points the plugin search
+          # path INSIDE the AppImage at a directory it never created — which also suppresses
+          # the scan that would have found the host's. WebKit's Web Audio runs on appsrc,
+          # appsink and autoaudiosink, so the band-edge tones, alert sounds and DXped alarm
+          # all fail with "element not found" and nothing else says a word. build-linux.sh
+          # copies them in; this proves they survived into the shipped file.
+          gst=squashfs-root/usr/lib/gstreamer-1.0
+          for p in app autodetect coreelements; do
+            [ -s "$gst/libgst$p.so" ] || { echo "libgst$p.so missing from the AppImage — its alert tones cannot work"; exit 1; }
+          done
+          # THE ONE THAT MATTERS: it has to find its own libhamlib, not the runner's. A CI box
+          # with Hamlib installed would let a broken rpath pass a bare --version, which is exactly
+          # how the first cut of fetch-hamlib-unix.sh looked correct while loading /lib's copy.
+          # Copy to a bare directory so there is nothing else it could possibly resolve against.
+          mkdir -p /tmp/hlcheck && cp "$hl/rigctld" "$hl/libhamlib.so.4" /tmp/hlcheck/
+          cp "$hl"/libusb-1.0.so.0 /tmp/hlcheck/ 2>/dev/null || true
+          got=$(ldd /tmp/hlcheck/rigctld | awk '/libhamlib/ {print $3}')
+          case "$got" in
+            /tmp/hlcheck/*) ;;
+            *) echo "bundled rigctld resolves libhamlib to '$got', not its own copy"; exit 1 ;;
+          esac
+          /tmp/hlcheck/rigctld --version || { echo "bundled rigctld will not run"; exit 1; }
+          rm -rf squashfs-root /tmp/hlcheck
+          # GLIBC FLOOR — the check that makes the supported-distro list a decision instead of
+          # a side effect of the runner image. Both shipped binaries are read: the .deb's
+          # payload and the AppImage's INNER binary, because an AppImage bundles application
+          # libraries but not libc, so it carries exactly the same requirement and papers over
+          # nothing. A binary needing more than GLIBC_FLOOR cannot start on the oldest distro we
+          # say we support, which is the failure operators actually meet: the package installs,
+          # the menu entry appears, and clicking it does nothing at all.
+          #
+          # Sorted with `sort -V` because glibc versions are not lexical — 2.9 sorts after 2.39
+          # as text and before it as a version.
+          appdir=$(mktemp -d)
+          chmod +x "$app"
+          app_abs=$(readlink -f "$app")
+          ( cd "$appdir" && "$app_abs" --appimage-extract >/dev/null )
+          floor_ok() {
+            # `|| true` on the pipeline, not on the assignment: under `set -e` a grep that
+            # matches nothing would abort the step before the empty-result check below could
+            # report WHY. An empty result means the check itself is broken (wrong path, objdump
+            # missing, a statically linked binary) and must fail loudly, not pass quietly.
+            need=$( { objdump -T "$2" 2>/dev/null | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' \
+                      | sort -uV | tail -1; } || true )
+            [ -n "$need" ] || { echo "$1: no GLIBC symbol versions found in $2 — check broken"; exit 1; }
+            if [ "$(printf '%s\n%s\n' "$GLIBC_FLOOR" "$need" | sort -V | tail -1)" != "$GLIBC_FLOOR" ]; then
+              echo "$1 requires GLIBC_$need, above the declared floor GLIBC_$GLIBC_FLOOR."
+              echo "The build host moved, or a new dependency raised it. Do NOT just bump the"
+              echo "floor: that silently drops every operator between the two versions."
+              exit 1
+            fi
+            echo "$1: needs GLIBC_$need, floor GLIBC_$GLIBC_FLOOR — ok"
+          }
+          floor_ok "deb payload" /tmp/dc/usr/bin/Nexus
+          floor_ok "AppImage inner binary" "$appdir/squashfs-root/usr/bin/Nexus"
+          # THE WAYLAND CLIENT LIBRARY MUST NOT BE IN HERE (#138). It has to match the host's
+          # compositor, which is why it is on AppImage's own excludelist; linuxdeploy's GTK plugin
+          # copies it in anyway and build-linux.sh removes it again before signing. That removal is
+          # invisible if it ever stops happening — the AppImage still builds, still installs, and
+          # opens to a blank white window on a distro whose Wayland is newer than the build host's.
+          # So it is asserted on the SHIPPED artifact rather than trusted in the script.
+          if [ -e "$appdir/squashfs-root/usr/lib/libwayland-client.so.0" ]; then
+            echo "the AppImage bundles libwayland-client.so.0, which must come from the host."
+            echo "scripts/build-linux.sh strips it before signing — that step did not run, or ran"
+            echo "and the result was overwritten. See #138 (blank window on Fedora 44)."
+            exit 1
+          fi
+          # Positive control: the check above is a path test, and a path test against a tree that
+          # failed to extract passes for the wrong reason. Something we DO bundle must be present.
+          [ -e "$appdir/squashfs-root/usr/lib/libwebkit2gtk-4.1.so.0" ] \
+            || { echo "AppDir looks wrong: libwebkit2gtk is missing too — the check is broken, not the bundle"; exit 1; }
+          echo "AppImage: libwayland-client.so.0 absent, webkit present — ok"
+          mkdir -p out && cp "$app" out/
+          # NAME THE PC PACKAGE FOR THE MACHINE IT INSTALLS ON, not just its architecture
+          # (operator ask, 1.0.0). Tauri emits Nexus_<ver>_amd64.deb; the Pi jobs emit
+          # Nexus_<ver>_pi_arm64_<base>.deb. Someone scanning the release page should not have to
+          # know that amd64 means "PC" and arm64 means "Pi" to pick the right file. The AppImage
+          # keeps its name deliberately: it is one of the two SIGNED self-updating artifacts and
+          # is not a Debian package, so renaming it would churn the updater manifest for nothing.
+          ver=$(dpkg-deb -f "$deb" Version)
+          cp "$deb" "out/Nexus_${ver}_pc_amd64.deb"
+          # The AppImage's updater signature, when the signing secrets were present.
+          [ -f "$app.sig" ] && cp "$app.sig" out/ || echo "note: unsigned build (no signing secrets)"
+          ( cd out && sha256sum ./* )
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nexus-linux-x86
+          path: out/*
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------------------
+  # Windows — cross-compiled NSIS installer (offline WebView2 + Hamlib bundled).
+  # ---------------------------------------------------------------------------------------
+  windows:
+    name: Windows (NSIS installer)
+    runs-on: ubuntu-latest
+    env:
+      # Baked into the binary via option_env! (build.rs). Only referenced in this
+      # tag/dispatch-triggered job — NEVER in a pull_request job — so a fork PR cannot
+      # reach it. The key is extractable from any shipped binary regardless (it is a
+      # read-only ClubLog most-wanted token); the proper fix is a proxy — see
+      # nexus-notes/clublog-key-proxy-plan.md.
+      CLUBLOG_API_KEY: ${{ secrets.CLUBLOG_API_KEY }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Stage the DeepCW model (not committed — AGPL-3.0 (c) e04)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release download "$DEEPCW_RELEASE" --repo "${{ github.repository }}" \
+            --pattern 'model.onnx*' --dir src-tauri/resources/deepcw --clobber
+          echo "$MODEL_SHA  src-tauri/resources/deepcw/model.onnx" | sha256sum -c -
+          echo "$MODEL_JSON_SHA  src-tauri/resources/deepcw/model.onnx.json" | sha256sum -c -
+
+      - name: Install MinGW-w64 cross toolchain + NSIS
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64 gfortran-mingw-w64-x86-64 \
+            binutils-mingw-w64-x86-64 \
+            libboost-dev cmake ninja-build build-essential nsis
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.93.1
+          targets: x86_64-pc-windows-gnu
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+
+      - name: Cross-build the NSIS installer
+        # Signed for self-update: the bundler emits a `.sig` beside the installer when these are
+        # present. If the secrets are absent (a fork, or before they are configured) the build
+        # still succeeds unsigned — the updater simply has nothing to verify, which is the right
+        # failure: no release, rather than an unsigned one clients would refuse anyway.
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: bash scripts/build-windows-cross.sh
+
+      - name: Verify installer
+        run: |
+          set -euo pipefail
+          exe=$(find src-tauri/target/x86_64-pc-windows-gnu/release/bundle/nsis -name '*-setup.exe' -print -quit)
+          [ -n "$exe" ] || { echo "no NSIS installer produced"; exit 1; }
+          # It bundles the offline WebView2 runtime + Hamlib, so it is large by design; a
+          # runt file means a bundling step silently no-op'd.
+          sz=$(stat -c%s "$exe")
+          [ "$sz" -gt 50000000 ] || { echo "installer only $sz bytes — bundling likely failed"; exit 1; }
+          # The WebView2 payload SPECIFICALLY (IK6HQL: a runtime missing at first launch sent
+          # him to install it by hand). The runner has WebView2 preinstalled, so only the
+          # artifact itself can prove the offline runtime is inside. A bare size floor can't:
+          # Hamlib+DSP alone clear 50 MB. The offline runtime is ~150 MB of the total, so
+          # assert BOTH the 7z listing names it AND the size clears a floor only the runtime
+          # explains. If Tauri renames the payload, the listing check fails loudly here — fix
+          # the pattern with the new name, don't drop to size-only.
+          sudo apt-get install -y --no-install-recommends p7zip-full >/dev/null
+          7z l "$exe" | grep -qi 'WebView2.*\.exe' \
+            || { echo "NSIS listing has no WebView2 payload — webviewInstallMode broke"; 7z l "$exe" | tail -40; exit 1; }
+          [ "$sz" -gt 190000000 ] || { echo "installer only $sz bytes — too small to contain the ~150 MB offline WebView2 runtime"; exit 1; }
+          mkdir -p out && cp "$exe" out/
+          # The updater signature, when the signing secrets were present.
+          [ -f "$exe.sig" ] && cp "$exe.sig" out/ || echo "note: unsigned build (no signing secrets)"
+
+          # ---- Crash symbols -------------------------------------------------------------
+          # A field crash report names a bare offset ("Nexus.exe+0x01ebcc35") and nothing can
+          # resolve it after the fact: the crash handler in src-tauri/src/main.rs cannot walk
+          # symbols (it runs with no allocation and about a page of stack), and the RELEASE
+          # BINARY IS NOT KEPT ANYWHERE — the artifact is the NSIS installer, whose payload is
+          # solid-compressed. The 1.8.1 report from a Flex/DAX station was unresolvable for
+          # exactly that reason, after downloading both the release asset and the workflow
+          # artifact and finding only the installer in each.
+          #
+          # ⚠️ THERE IS NO PDB TO SHIP, and asking for one is the natural mistake: PDBs are an
+          # MSVC artifact and this job cross-builds `x86_64-pc-windows-gnu` on ubuntu. What
+          # MinGW leaves behind is the SYMBOL TABLE, which survives because the release profile
+          # sets `strip = "debuginfo"` (DWARF only) rather than `strip = "symbols"`.
+          #
+          # So publish the table, not the binary: `nm` output is ~1.5 MB gzipped against 87 MB
+          # for Nexus.exe, and it answers the only question a crash report asks — which function
+          # owns this address. Resolve with the offset added to the 0x140000000 image base.
+          bin="src-tauri/target/x86_64-pc-windows-gnu/release/Nexus.exe"
+          if [ -f "$bin" ]; then
+            # Name it off the installer so the map can never drift from the build it describes.
+            sym="out/$(basename "$exe" -setup.exe).sym.gz"
+            x86_64-w64-mingw32-nm -C --defined-only -n "$bin" | gzip -9 > "$sym"
+            # A symbol map that resolved nothing would be worse than none — it would look like
+            # coverage. Require real entries, not just a non-empty file.
+            n=$(gzip -dc "$sym" | grep -c ' T ' || true)
+            [ "$n" -gt 1000 ] || { echo "symbol map has only $n text symbols — stripped too far"; exit 1; }
+            echo "symbol map: $n text symbols"
+          else
+            echo "no unpacked Nexus.exe to take symbols from — expected at $bin"; exit 1
+          fi
+          ( cd out && sha256sum ./* )
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nexus-windows
+          path: out/*
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------------------
+  # macOS — Apple Silicon DMG, signed and notarized. First shipped 1.5.1 (operator's
+  # Apple Developer enrollment 2026-08-16).
+  #
+  # aarch64 ONLY, deliberately: the modem is Fortran, and Homebrew's gfortran is
+  # single-arch — a universal binary needs an x86_64 gfortran+FFTW toolchain the arm64
+  # runner does not have. Apple Silicon covers every Mac sold since 2020; Intel Macs
+  # build from source (which works out of the box as of 1.5.0 — see NOTICE/on8st PRs).
+  #
+  # Signing: APPLE_CERTIFICATE (base64 .p12) + APPLE_CERTIFICATE_PASSWORD into an
+  # ephemeral keychain; the identity is READ BACK from the keychain rather than stored
+  # as a secret, so a certificate renewal never needs a workflow edit. Notarization:
+  # App Store Connect API key (APPLE_API_KEY_ID / APPLE_API_ISSUER_ID /
+  # APPLE_API_KEY_CONTENT) — Tauri runs notarytool + stapling itself when those are in
+  # the environment. No Apple ID password anywhere.
+  # ---------------------------------------------------------------------------------------
+  macos:
+    name: macOS (Apple Silicon .dmg)
+    runs-on: macos-14
+    env:
+      CLUBLOG_API_KEY: ${{ secrets.CLUBLOG_API_KEY }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Stage the DeepCW model (not committed — AGPL-3.0 (c) e04)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release download "$DEEPCW_RELEASE" --repo "${{ github.repository }}" \
+            --pattern 'model.onnx*' --dir src-tauri/resources/deepcw --clobber
+          echo "$MODEL_SHA  src-tauri/resources/deepcw/model.onnx" | shasum -a 256 -c -
+          echo "$MODEL_JSON_SHA  src-tauri/resources/deepcw/model.onnx.json" | shasum -a 256 -c -
+
+      - name: Install build dependencies
+        run: brew install cmake ninja gcc fftw boost libusb
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.93.1
+          targets: aarch64-apple-darwin
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+
+      - name: Import the signing certificate into an ephemeral keychain
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          KEYCHAIN_PW="$(openssl rand -hex 24)"
+          KEYCHAIN="$RUNNER_TEMP/nexus-signing.keychain-db"
+          echo "$APPLE_CERTIFICATE" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security create-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN"
+          security set-keychain-settings -lut 3600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" \
+            -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PW" "$KEYCHAIN" >/dev/null
+          security list-keychains -d user -s "$KEYCHAIN" login.keychain
+          rm -f "$RUNNER_TEMP/cert.p12"
+          # The identity string, read back from what was actually imported.
+          ident=$(security find-identity -v -p codesigning "$KEYCHAIN" \
+            | awk -F'"' '/Developer ID Application/ {print $2; exit}')
+          [ -n "$ident" ] || { echo "no Developer ID Application identity in the certificate"; exit 1; }
+          echo "APPLE_SIGNING_IDENTITY=$ident" >> "$GITHUB_ENV"
+          echo "signing as: $ident"
+
+      - name: Build the web UI
+        run: |
+          npm --prefix ui ci
+          npm --prefix ui run build
+
+      - name: Install tauri-cli
+        run: cargo install tauri-cli --version "^2" --locked
+
+      # Hamlib for macOS. Explicit here because this job runs `cargo tauri build` directly —
+      # Linux and the Pi get it inside scripts/build-linux.sh, and macOS would silently ship
+      # without it, which is the exact hole this whole change closes. The script's own CAT-DEAD
+      # guard fails the build rather than producing a bundle with licence texts and no Hamlib.
+      - name: Stage Hamlib (bundled rigctld — no brew install for the user)
+        run: bash scripts/fetch-hamlib-unix.sh
+
+      # ⭐ AND SIGN IT, or notarization rejects the whole app. Apple requires EVERY Mach-O
+      # inside the bundle to carry a Developer ID signature, the hardened runtime and a secure
+      # timestamp — Tauri signs the app binary and its own libraries, not resources we stage.
+      # The 1.9.0 attempt failed here with exactly three messages, once per Hamlib executable:
+      # "not signed with a valid Developer ID certificate", "does not have the hardened runtime
+      # enabled", "signature does not include a secure timestamp". Windows does not notarize
+      # and Linux does not sign, so this can only ever surface on the macOS job.
+      #
+      # Discovered by FILE TYPE rather than a hard-coded list: a future Hamlib tool added to
+      # `fetch-hamlib-unix.sh` would otherwise be staged unsigned and fail notarization again,
+      # a whole release later. Libraries are signed before the executables that load them.
+      - name: Sign the bundled Hamlib binaries
+        run: |
+          set -euo pipefail
+          hl=src-tauri/resources/hamlib
+          # `mapfile` is bash 4+; macOS runners are bash 3.2. while-read is portable.
+          macho=()
+          while IFS= read -r f; do macho+=("$f"); done < <(
+            find "$hl" -type f -exec sh -c \
+              'file -b "$1" | grep -q "Mach-O" && echo "$1"' _ {} \; | sort)
+          [ "${#macho[@]}" -gt 0 ] || { echo "no Mach-O staged under $hl — staging failed"; exit 1; }
+          echo "signing ${#macho[@]} Mach-O file(s) as: $APPLE_SIGNING_IDENTITY"
+          # dylibs first, then the programs that load them.
+          for f in "${macho[@]}"; do case "$f" in *.dylib) : ;; *) continue ;; esac
+            codesign --force --options runtime --timestamp --sign "$APPLE_SIGNING_IDENTITY" "$f"
+          done
+          for f in "${macho[@]}"; do case "$f" in *.dylib) continue ;; esac
+            codesign --force --options runtime --timestamp --sign "$APPLE_SIGNING_IDENTITY" "$f"
+          done
+          # Verify here rather than discovering it 10 minutes later in notarization.
+          for f in "${macho[@]}"; do
+            codesign --verify --strict --verbose=2 "$f"
+            codesign -dvv "$f" 2>&1 | grep -q "flags=.*runtime" \
+              || { echo "$f: hardened runtime missing after signing"; exit 1; }
+          done
+          echo "all staged Hamlib binaries signed, hardened and timestamped"
+
+      - name: Build, sign and notarize the DMG
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER_ID }}
+          APPLE_API_KEY_CONTENT: ${{ secrets.APPLE_API_KEY_CONTENT }}
+        run: |
+          set -euo pipefail
+          # notarytool wants the .p8 on disk; Tauri picks it up via APPLE_API_KEY_PATH.
+          printf '%s\n' "$APPLE_API_KEY_CONTENT" > "$RUNNER_TEMP/AuthKey.p8"
+          export APPLE_API_KEY_PATH="$RUNNER_TEMP/AuthKey.p8"
+          ( cd src-tauri && cargo tauri build --target aarch64-apple-darwin \
+              --features radio,custom-protocol --bundles app,dmg )
+          rm -f "$RUNNER_TEMP/AuthKey.p8"
+
+      - name: Verify the artifacts
+        env:
+          # Only consulted to decide whether the updater bundle is REQUIRED below —
+          # a build that had the signing key must ship it; a fork without secrets
+          # legitimately cannot.
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          bundle=src-tauri/target/aarch64-apple-darwin/release/bundle
+          dmg=$(find "$bundle/dmg" -name '*.dmg' -print -quit)
+          tarball=$(find "$bundle/macos" -name '*.app.tar.gz' -print -quit)
+          [ -n "$dmg" ] || { echo "no DMG produced"; exit 1; }
+          app=$(find "$bundle/macos" -maxdepth 1 -name '*.app' -print -quit)
+          # Gatekeeper's own verdict on what shipped — signing AND notarization AND
+          # staple, the exact test a user's first double-click runs.
+          spctl -a -t exec -vv "$app"
+          xcrun stapler validate "$app"
+          # The model must be IN the bundle — the 2026-07-20 .deb shipped without it
+          # and nothing but looking inside the artifact can catch that class.
+          m="$app/Contents/Resources/resources/deepcw/model.onnx"
+          [ -s "$m" ] || { echo "DeepCW model missing from the .app"; exit 1; }
+          echo "$MODEL_SHA  $m" | shasum -a 256 -c -
+          # HAMLIB MUST BE IN THE .app, AND THE APP MUST LOOK WHERE IT LANDS (#190).
+          #
+          # The Linux job has had this gate since 1.9.0; macOS had the staging and the
+          # signing but no gate, and that is the hole 1.9.2 shipped through: the tools were
+          # in the bundle, correctly signed, at Contents/Resources/resources/hamlib — while
+          # the resolver looked one directory up the tree, so EVERY fresh macOS install had
+          # no CAT at all. Presence alone would not have caught it; the second check is the
+          # one that matters, because it asserts the shipped PATH against the shipped CODE
+          # instead of against a fixture that agrees with the code.
+          hl="$app/Contents/Resources/resources/hamlib"
+          for f in rigctld rigctl rotctld rotctl; do
+            [ -s "$hl/$f" ] || { echo "$f missing from the .app"; exit 1; }
+          done
+          grep -q '\.\./Resources/resources/hamlib/' crates/tempo-audio/src/rigctld_proc.rs \
+            || { echo "the app does not search Contents/Resources/resources/hamlib (#190)"; exit 1; }
+          # It also has to RUN from where it lands — a wrong install-name or a missing dylib
+          # looks identical to a working build until a user double-clicks.
+          "$hl/rigctld" --version || { echo "bundled rigctld will not run"; exit 1; }
+          # …AND RUNNING HERE PROVES LESS THAN IT LOOKS: this runner has Homebrew, so an
+          # absolute /opt/homebrew/... path baked into any shipped Mach-O resolves perfectly
+          # in CI and dies on an operator's Mac. That is how the 1.10.0 CAT regression
+          # shipped — the four tools were repointed to @rpath but libhamlib.4.dylib still
+          # named Homebrew's libusb, and dyld killed every bundled tool before main on any
+          # Mac without it. Sweep EVERY Mach-O in the shipped .app: only @rpath/@loader_path
+          # or genuine system libraries. Per-file positive control: a real Mach-O always
+          # links libSystem, so a scan that cannot see it is reading nothing.
+          for f in "$hl"/rigctld "$hl"/rigctl "$hl"/rotctld "$hl"/rotctl "$hl"/*.dylib; do
+            [ -f "$f" ] || continue
+            deps=$(otool -L "$f")
+            printf '%s\n' "$deps" | grep -q '/usr/lib/libSystem.B.dylib' \
+              || { echo "otool read no dependencies from $f"; exit 1; }
+            bad=$(printf '%s\n' "$deps" | tail -n +2 | awk '{print $1}' \
+                  | grep -vE '^@rpath/|^@loader_path/|^/usr/lib/|^/System/' || true)
+            [ -z "$bad" ] || { echo "$f links outside the bundle — dead on a Mac without those paths:"; echo "$bad"; exit 1; }
+          done
+          mkdir -p out
+          ver=$(grep -m1 '"version"' src-tauri/tauri.conf.json | sed -E 's/.*"version": *"([^"]+)".*/\1/')
+          cp "$dmg" "out/Nexus_${ver}_aarch64.dmg"
+          if [ -n "$tarball" ] && [ -f "$tarball.sig" ]; then
+            cp "$tarball" "out/Nexus_${ver}_aarch64.app.tar.gz"
+            cp "$tarball.sig" "out/Nexus_${ver}_aarch64.app.tar.gz.sig"
+          elif [ -n "${TAURI_SIGNING_PRIVATE_KEY:-}" ]; then
+            # The key was present, so a missing tarball/.sig is a bundler regression,
+            # not a fork build — and it must fail HERE, with the same hard bar as the
+            # DMG above. Left as a note, it publishes a latest.json with no
+            # darwin-aarch64 entry: every mac client's hourly check then finds
+            # nothing, forever, and useSelfUpdate swallows that by design, so no one
+            # ever reports it (mac QA audit, 2026-08-17). Gated on the key, not the
+            # event, so a workflow_dispatch dry-run catches it before a tag does.
+            echo "signing key present but no signed updater bundle was produced"; exit 1
+          else
+            echo "note: no signed updater bundle (missing signing secrets?)"
+          fi
+          ( cd out && shasum -a 256 ./* )
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nexus-macos
+          path: out/*
+          if-no-files-found: error
+
+  smoke-macos:
+    name: Smoke — mount + launch the macOS artifact
+    needs: macos
+    runs-on: macos-14
+    steps:
+      # Checkout BEFORE download-artifact: the updater-signature check below reads the
+      # minisign pubkey out of src-tauri/tauri.conf.json, and checkout's default clean
+      # would delete an already-downloaded dist/ as untracked files.
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: nexus-macos
+          merge-multiple: true
+
+      - name: Mount the DMG and Gatekeeper-assess the app
+        run: |
+          set -euo pipefail
+          dmg=$(find dist -name '*.dmg' -print -quit)
+          [ -n "$dmg" ] || { echo "no dmg in the nexus-macos artifact"; exit 1; }
+          mnt=$(hdiutil attach "$dmg" -nobrowse | awk -F'\t' 'END{print $NF}')
+          app=$(find "$mnt" -maxdepth 1 -name '*.app' -print -quit)
+          [ -n "$app" ] || { echo "no .app inside the DMG"; exit 1; }
+          # A FRESH machine's verdict — this runner never saw the signing keychain.
+          spctl -a -t exec -vv "$app"
+          cp -R "$app" "$RUNNER_TEMP/Nexus.app"
+          hdiutil detach "$mnt"
+
+      - name: Gate on the SIGNED entitlements + Info.plist (the dead-mic class)
+        run: |
+          set -euo pipefail
+          app="$RUNNER_TEMP/Nexus.app"
+          # The microphone entitlement must be in the SIGNATURE of the shipped app, not
+          # merely in the repo's Entitlements.plist: it reaches the bundle through two
+          # config hops (bundle.macOS.entitlements -> Entitlements.plist), and losing
+          # either hop — a config typo, a tauri-cli behaviour change (reinstalled fresh
+          # at ^2 every release), a renamed plist — re-ships the 1.5.x–1.6.1 silent-mic
+          # DMGs with every other gate green. A headless runner can never exercise
+          # capture, so reading the signature is the strongest check available here.
+          codesign -d --entitlements - --xml "$app" > "$RUNNER_TEMP/entitlements.xml"
+          grep -q 'com.apple.security.device.audio-input' "$RUNNER_TEMP/entitlements.xml" \
+            || { echo "mic entitlement missing from the signed app"; cat "$RUNNER_TEMP/entitlements.xml"; exit 1; }
+          # And the usage string, in the same breath: without NSMicrophoneUsageDescription
+          # macOS refuses the prompt outright even WITH the entitlement. PlistBuddy exits
+          # non-zero when the key is absent, which fails the step under -e.
+          desc=$(/usr/libexec/PlistBuddy -c 'Print :NSMicrophoneUsageDescription' "$app/Contents/Info.plist")
+          [ -n "$desc" ] || { echo "NSMicrophoneUsageDescription is empty"; exit 1; }
+          echo "signed entitlements + mic usage string verified"
+
+      - name: Launch the app and require it to stay alive
+        run: |
+          set -euo pipefail
+          "$RUNNER_TEMP/Nexus.app/Contents/MacOS/"* &
+          pid=$!
+          # Same bar as smoke-windows: first run does real work; after 45 s the
+          # only question is whether it is still running.
+          sleep 45
+          kill -0 "$pid" || { echo "app exited during startup — dead-on-arrival artifact"; exit 1; }
+          echo "alive after 45 s (pid $pid) — startup smoke passed"
+          kill "$pid" || true
+
+      - name: Exercise the updater artifact (app.tar.gz + minisign signature)
+        run: |
+          set -euo pipefail
+          # WHAT THIS PROVES: the tarball a mac client downloads on its hourly check
+          # unpacks (tar integrity), contains a .app whose code signature is intact and
+          # whose version matches the DMG's, and carries a minisign signature that
+          # verifies against the pubkey compiled into every shipped client
+          # (tauri.conf.json plugins.updater.pubkey) — i.e. the plugin's own signature
+          # check will accept exactly these bytes.
+          # WHAT THIS DOES NOT PROVE: Gatekeeper's verdict on the swapped-in app (the
+          # updater writes without quarantine, so Gatekeeper never assesses it), and the
+          # plugin's swap/restart logic itself — that runs only against a real installed
+          # app and lives on the Mac bench list.
+          tarball=$(find dist -name '*.app.tar.gz' -print -quit)
+          if [ -z "$tarball" ]; then
+            # Only reachable on a fork build without signing secrets: the macos verify
+            # step now hard-fails when the key was present and no bundle appeared.
+            echo "::warning::no app.tar.gz in the artifact — updater bundle NOT exercised (no signing secrets?)"
+            exit 0
+          fi
+          [ -s "$tarball.sig" ] || { echo "updater tarball has no .sig beside it"; exit 1; }
+          mkdir -p "$RUNNER_TEMP/updater"
+          tar -xzf "$tarball" -C "$RUNNER_TEMP/updater"
+          upapp=$(find "$RUNNER_TEMP/updater" -maxdepth 1 -name '*.app' -print -quit)
+          [ -n "$upapp" ] || { echo "no .app inside the updater tarball"; exit 1; }
+          codesign --verify --deep --strict "$upapp"
+          dmgver=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$RUNNER_TEMP/Nexus.app/Contents/Info.plist")
+          upver=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$upapp/Contents/Info.plist")
+          [ "$dmgver" = "$upver" ] || { echo "version mismatch: DMG=$dmgver updater=$upver"; exit 1; }
+          # The signature check, with the real verifier. brew is already a hard
+          # dependency of the macos BUILD job, so a brew outage blocks the pipeline
+          # either way; a flake here is a re-run, not a shipped regression.
+          brew install minisign
+          # Both are base64: the conf pubkey decodes to a minisign .pub file, the .sig
+          # to a minisign signature. (`--decode` — macOS base64 has no GNU -d.)
+          jq -r '.plugins.updater.pubkey' src-tauri/tauri.conf.json \
+            | base64 --decode > "$RUNNER_TEMP/updater.pub"
+          base64 --decode < "$tarball.sig" > "$RUNNER_TEMP/updater.minisig"
+          minisign -Vm "$tarball" -p "$RUNNER_TEMP/updater.pub" -x "$RUNNER_TEMP/updater.minisig"
+          echo "updater bundle verified: unpacks, signed app v$upver matches the DMG, minisign signature valid"
+
+  # ---------------------------------------------------------------------------------------
+  # Raspberry Pi — one .deb per live Pi OS base, native on the hosted arm64 runner.
+  # (Same job as ci.yml's pi-deb; duplicated here so a tag builds everything in one run.)
+  # ---------------------------------------------------------------------------------------
+  pi:
+    name: Raspberry Pi .deb (${{ matrix.base }})
+    runs-on: ubuntu-24.04-arm
+    strategy:
+      fail-fast: false
+      matrix:
+        base: [bookworm, trixie]
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Stage the DeepCW model (not committed — AGPL-3.0 (c) e04)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release download "$DEEPCW_RELEASE" --repo "${{ github.repository }}" \
+            --pattern 'model.onnx*' --dir src-tauri/resources/deepcw --clobber
+          echo "$MODEL_SHA  src-tauri/resources/deepcw/model.onnx" | sha256sum -c -
+          echo "$MODEL_JSON_SHA  src-tauri/resources/deepcw/model.onnx.json" | sha256sum -c -
+
+      - name: Build .deb in a debian:${{ matrix.base }} container
+        run: >
+          docker buildx build
+          --platform linux/arm64
+          -f scripts/Dockerfile.pi
+          --build-arg BASE=${{ matrix.base }}
+          --progress=plain
+          --target export
+          --output type=local,dest=pi-out/${{ matrix.base }}
+          .
+
+      - name: Tag the artifact with its base, and verify it
+        run: |
+          set -euo pipefail
+          deb=$(find pi-out/${{ matrix.base }} -name '*.deb' -print -quit)
+          [ -n "$deb" ] || { echo "no .deb produced"; exit 1; }
+          ver=$(dpkg-deb -f "$deb" Version)
+          [ "$(dpkg-deb -f "$deb" Architecture)" = "arm64" ] || { echo "not arm64"; exit 1; }
+          dpkg-deb -x "$deb" /tmp/debcheck
+          bin=$(find /tmp/debcheck/usr/bin -type f -print -quit)
+          file "$bin" | grep -q 'ARM aarch64' || { echo "payload is not ARM aarch64"; exit 1; }
+          m=/tmp/debcheck/usr/lib/Nexus/resources/deepcw/model.onnx
+          [ -s "$m" ] || { echo "DeepCW model missing from the package"; exit 1; }
+          echo "$MODEL_SHA  $m" | sha256sum -c -
+          mv "$deb" "pi-out/${{ matrix.base }}/Nexus_${ver}_pi_arm64_${{ matrix.base }}.deb"
+          sha256sum pi-out/${{ matrix.base }}/*.deb
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nexus-pi-${{ matrix.base }}
+          path: pi-out/${{ matrix.base }}/*.deb
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------------------
+  # Publish — only on a real tag push. Gathers every artifact, proves version == tag across
+  # ALL of them, and creates the GitHub Release. A dispatch run stops before this.
+  # ---------------------------------------------------------------------------------------
+  # ---------------------------------------------------------------------------------------
+  # Windows artifact smoke — install the ACTUAL installer on a real Windows runner, launch
+  # the ACTUAL installed exe, and require it to still be running 45 s later. This is the
+  # dead-on-arrival gate: a cross-built artifact can pass every Linux-side check and still
+  # crash at startup on real Windows (missing DLL, bundler no-op, WebView2 wiring). Runs on
+  # BOTH the tag path and the dispatch dry-run, so a broken artifact is caught in rehearsal.
+  # ---------------------------------------------------------------------------------------
+  smoke-windows:
+    name: Smoke — install + launch the Windows artifact
+    needs: windows
+    runs-on: windows-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: nexus-windows
+          merge-multiple: true
+
+      - name: Silent-install the NSIS artifact
+        shell: pwsh
+        run: |
+          $setup = Get-ChildItem dist -Filter '*-setup.exe' | Select-Object -First 1
+          if (-not $setup) { throw 'no *-setup.exe in the nexus-windows artifact' }
+          Write-Host "installing $($setup.Name) silently (per-user, /S)"
+          $p = Start-Process -FilePath $setup.FullName -ArgumentList '/S' -PassThru -Wait
+          if ($p.ExitCode -ne 0) { throw "installer exited $($p.ExitCode)" }
+
+      - name: Launch the installed app and require it to stay alive
+        shell: pwsh
+        run: |
+          # Per-user NSIS install → find the installed exe under LOCALAPPDATA.
+          $exe = Get-ChildItem "$env:LOCALAPPDATA" -Recurse -Depth 3 -Filter 'Nexus.exe' -ErrorAction SilentlyContinue |
+                 Select-Object -First 1
+          if (-not $exe) { throw "Nexus.exe not found under $env:LOCALAPPDATA after install" }
+          Write-Host "launching $($exe.FullName)"
+          $p = Start-Process -FilePath $exe.FullName -PassThru
+          # First run does real work (profile creation, webview init) — give it
+          # 45 s, then the only question that matters: is it still running?
+          Start-Sleep -Seconds 45
+          if ($p.HasExited) {
+            throw "app exited during startup (code $($p.ExitCode)) — dead-on-arrival artifact"
+          }
+          Write-Host "alive after 45 s (pid $($p.Id)) — startup smoke passed"
+          Stop-Process -Id $p.Id -Force
+
+  # The offline manual (PDF + EPUB), built from the same docs/guide pages the website
+  # syncs, so the downloadable manual can never drift from the shipped one. GitHub's ubuntu
+  # runner already carries google-chrome (the PDF renders through it via CDP for real page
+  # numbers); pandoc and the websockets client are the only adds. Uploaded as an artifact the
+  # publish job attaches to the Release, where the site's download buttons point
+  # (releases/latest/download/Nexus-Manual.pdf / .epub — stable names, version on the cover).
+  manual:
+    name: Manual (PDF + EPUB)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Tools (pandoc + the CDP websockets client; Chrome is preinstalled)
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends pandoc
+          python3 -m pip install --quiet websockets pillow  # websockets: CDP for the PDF; pillow: WebP→PNG for the EPUB
+      - name: Build the manual
+        run: |
+          set -euo pipefail
+          ver=$(grep -m1 '"version"' src-tauri/tauri.conf.json | sed -E 's/.*"version": *"([^"]+)".*/\1/')
+          mkdir -p manualdist
+          python3 scripts/build-manual-pdf.py  --version "$ver" --out manualdist/Nexus-Manual.pdf
+          python3 scripts/build-manual-epub.py --version "$ver" --out manualdist/Nexus-Manual.epub
+          ls -l manualdist
+          # A real PDF and a real EPUB, or fail the job — never ship an empty download.
+          [ -s manualdist/Nexus-Manual.pdf ] && head -c4 manualdist/Nexus-Manual.pdf | grep -q '%PDF'
+          [ -s manualdist/Nexus-Manual.epub ]
+      - name: Validate the EPUB (W3C epubcheck — the shipped download must be valid)
+        run: |
+          set -euo pipefail
+          EC=5.3.0
+          curl -fsSL "https://github.com/w3c/epubcheck/releases/download/v${EC}/epubcheck-${EC}.zip" -o /tmp/ec.zip
+          python3 -c "import zipfile; zipfile.ZipFile('/tmp/ec.zip').extractall('/tmp')"
+          java -jar "/tmp/epubcheck-${EC}/epubcheck.jar" manualdist/Nexus-Manual.epub
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nexus-manual
+          path: manualdist/*
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub Release
+    # Windows + Linux gate the release (operator's release order); the Pi .debs attach
+    # in publish-pi as they finish and can never hold the primary artifacts hostage.
+    # smoke-windows gates too: an installer that dies at launch must never publish.
+    needs: [linux-x86, windows, smoke-windows, macos, smoke-macos, manual]
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    # `actions: write` is for the downstream hand-off at the end of this job. Job-level
+    # permissions REPLACE the workflow-level block rather than adding to it, so `contents:
+    # write` is repeated here — without it this job loses its ability to create the release.
+    permissions:
+      contents: write
+      actions: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0   # need tags + history for the notes range
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: nexus-linux-x86
+          merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: nexus-windows
+          merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: nexus-macos
+          merge-multiple: true
+
+      - name: Derive + cross-check the version
+        id: ver
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          ver="${tag#v}"
+          # A prerelease tag (v1.10.3-beta.1) heads to the same BASE version the artifacts and
+          # tauri.conf.json carry (1.10.3); strip the -suffix for those cross-checks. ver/tag keep
+          # the suffix for the release title and the latest.json version.
+          base_ver="${ver%%-*}"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "ver=$ver" >> "$GITHUB_OUTPUT"
+          # The tag must match the version in tauri.conf.json — the single source of truth
+          # every artifact is stamped from. A mismatch means someone forgot to bump.
+          conf=$(grep -m1 '"version"' src-tauri/tauri.conf.json | sed -E 's/.*"version": *"([^"]+)".*/\1/')
+          [ "$conf" = "$base_ver" ] || { echo "tag $tag (base $base_ver) != tauri.conf.json ($conf)"; exit 1; }
+          # And every artifact filename must carry that exact version — catches a stale
+          # artifact from a cached/retried job sneaking into the release.
+          for f in dist/*; do
+            case "$(basename "$f")" in
+              *"$base_ver"*) : ;;
+              *) echo "artifact does not carry version $base_ver: $f"; exit 1 ;;
+            esac
+          done
+          echo "All artifacts stamped $base_ver:"; ls -la dist/
+
+      - name: Assemble release notes
+        run: |
+          set -euo pipefail
+          ver="${{ steps.ver.outputs.ver }}"
+          notes="dist/NOTES.md"
+          if [ -f "docs/RELEASE_NOTES-$ver.md" ]; then
+            cp "docs/RELEASE_NOTES-$ver.md" "$notes"
+          else
+            # Fall back to the commit range since the previous tag. Hand-written notes in
+            # docs/RELEASE_NOTES-<ver>.md take precedence when present.
+            prev=$(git describe --tags --abbrev=0 "${{ steps.ver.outputs.tag }}^" 2>/dev/null || true)
+            echo "# Nexus $ver" > "$notes"; echo >> "$notes"
+            if [ -n "$prev" ]; then
+              echo "Changes since $prev:" >> "$notes"; echo >> "$notes"
+              git log --no-merges --pretty='- %s' "$prev..${{ steps.ver.outputs.tag }}" >> "$notes"
+            else
+              git log --no-merges --pretty='- %s' -n 50 "${{ steps.ver.outputs.tag }}" >> "$notes"
+            fi
+          fi
+          echo "----- notes -----"; cat "$notes"
+
+      - name: Checksums
+        run: ( cd dist && sha256sum Nexus_* | tee SHA256SUMS.txt )
+
+      # The self-update manifest. Generated FROM the .sig files the bundler just produced, so it
+      # can never disagree with what actually shipped — a hand-maintained manifest is a signature
+      # mismatch waiting to happen, and the client's only symptom would be a silent refusal.
+      #
+      # Windows NSIS + Linux AppImage only: .deb (amd64 and both Pi bases) is apt-managed and
+      # cannot self-update, so those platforms keep the notify-and-download path forever. Emitting
+      # a manifest entry for them would promise an update route that does not exist.
+      - name: Build the updater manifest (latest.json)
+        run: |
+          set -euo pipefail
+          ver='${{ steps.ver.outputs.ver }}'
+          tag='${{ steps.ver.outputs.tag }}'
+          base="https://github.com/kd9taw/Nexus/releases/download/$tag"
+          win=$(find dist -name '*_x64-setup.exe' -print -quit)
+          app=$(find dist -name '*_amd64.AppImage' -print -quit)
+          platforms=''
+          add() { # $1=platform key  $2=artifact path
+            [ -n "$2" ] && [ -f "$2.sig" ] || { echo "note: no signature for ${1:-?} — omitting"; return; }
+            platforms="$platforms$(printf '"%s":{"signature":"%s","url":"%s/%s"},' \
+              "$1" "$(cat "$2.sig")" "$base" "$(basename "$2")")"
+          }
+          mac=$(find dist -name '*_aarch64.app.tar.gz' -print -quit)
+          add "windows-x86_64" "$win"
+          add "linux-x86_64"   "$app"
+          add "darwin-aarch64" "$mac"
+          if [ -z "$platforms" ]; then
+            echo "No signed artifacts — skipping latest.json. Clients keep the notify-only path."
+            exit 0
+          fi
+          printf '{"version":"%s","notes":"See the release notes.","pub_date":"%s","platforms":{%s}}\n' \
+            "$ver" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${platforms%,}" > dist/latest.json
+          python3 -c "import json;json.load(open('dist/latest.json'));print('latest.json valid')"
+          cat dist/latest.json
+
+      - name: Bring in the manual (PDF + EPUB)
+        uses: actions/download-artifact@v4
+        with:
+          name: nexus-manual
+          path: dist
+
+      - name: Create the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # A SemVer prerelease tag (any hyphen, e.g. -beta.N) publishes as a GitHub pre-release so
+          # it never becomes "Latest" and downstream leaves the stable feeds alone; a plain X.Y.Z is
+          # explicitly marked --latest.
+          gh release create "${{ steps.ver.outputs.tag }}" \
+            --title "Nexus ${{ steps.ver.outputs.ver }}" \
+            --notes-file dist/NOTES.md \
+            $( case "${{ steps.ver.outputs.tag }}" in *-*) echo --prerelease ;; *) echo --latest ;; esac ) \
+            dist/Nexus_* dist/Nexus-Manual.pdf dist/Nexus-Manual.epub dist/SHA256SUMS.txt \
+            $( [ -f dist/latest.json ] && echo dist/latest.json )
+
+  # Second wave (operator's release order: Windows + Linux first, then Pi): attach the
+  # Raspberry Pi .debs to the already-published release as their builds finish. Waits on
+  # publish so the release exists; a Pi failure never blocks the primary platforms.
+      # ── HAND OFF TO THE DOWNSTREAM PUBLISH ────────────────────────────────────────────
+      # Without this, publish.yml never runs on its own and the release reaches NOBODY: the
+      # SourceForge upload, the site's version.json and the Cloudflare deploy all wait on it,
+      # and nothing goes red — which is exactly how 1.0.1 shipped while the in-app update check
+      # told every operator 1.0.0 was newest for two days. It was still true at 1.0.5 (every
+      # run of publish.yml in this repo's history has been a manual dispatch), so this closes it.
+      #
+      # `on: release: published` cannot do the job: GitHub suppresses events raised by
+      # GITHUB_TOKEN to stop recursion, and this job creates the release with exactly that.
+      # workflow_dispatch is the documented exception — "workflow_dispatch and
+      # repository_dispatch events always create workflow runs" — so NO PAT is needed, only
+      # `actions: write` above. publish.yml's own header says a PAT is required; that is wrong,
+      # and it is corrected there.
+      #
+      # Fired from THIS job rather than publish-pi on purpose. publish.yml opens by polling for
+      # all five installers and their checksums with a 30-minute deadline, so it is built to be
+      # started before the Pi .debs land and to wait for them. And publish-pi SKIPS when the Pi
+      # build fails (0.18.0), which would leave the hand-off unreachable in the one case where
+      # someone most needs to be told — this way it times out loudly instead.
+      #
+      # `|| true`: the release itself is already published and correct at this point. A failed
+      # hand-off must not turn a good release red; the run summary carries the warning and the
+      # manual dispatch is still there.
+      - name: Hand off to the downstream publish (SourceForge + site)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          tag="${GITHUB_REF_NAME}"
+          if gh workflow run publish.yml --repo "${{ github.repository }}" -f tag="$tag"; then
+            echo "Dispatched publish.yml for $tag" >> "$GITHUB_STEP_SUMMARY"
+          else
+            {
+              echo "### ⚠️ Downstream publish was NOT dispatched"
+              echo "The release is published and correct, but SourceForge, the site's"
+              echo "\`version.json\` and the Cloudflare deploy have not run."
+              echo ""
+              echo "Run it by hand:"
+              echo '```'
+              echo "gh workflow run publish.yml --repo ${{ github.repository }} -f tag=$tag"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  publish-pi:
+    name: Attach Raspberry Pi .debs
+    needs: [publish, pi]
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: pidist
+          pattern: nexus-pi-*
+          merge-multiple: true
+      - name: Upload to the release + extend SHA256SUMS
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          ls -la pidist/
+          gh release upload "$tag" --repo "${{ github.repository }}" pidist/Nexus_* --clobber
+          # Append the Pi sums to the published SHA256SUMS.txt so one file covers all.
+          gh release download "$tag" --repo "${{ github.repository }}" --pattern SHA256SUMS.txt --dir . --clobber
+          ( cd pidist && sha256sum Nexus_* ) >> SHA256SUMS.txt
+          gh release upload "$tag" --repo "${{ github.repository }}" SHA256SUMS.txt --clobber

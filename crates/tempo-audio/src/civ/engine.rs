@@ -1,0 +1,774 @@
+//! The CI-V serial engine — ONE thread owns the CI-V byte stream and multiplexes three
+//! traffics over it:
+//!
+//! 1. **Command/reply** — requests arrive on a channel ([`CivHandle::transact`]), are written
+//!    to the port strictly one at a time, and the matching reply (or `FB`/`FA` ack) resolves
+//!    the caller. A per-request serial deadline keeps a dead radio from wedging the queue.
+//! 2. **Unsolicited transceive** — the radio pushes frequency (`00`) / mode (`01`) reports
+//!    when the operator touches the front panel; they fold into the shared [`CivState`]
+//!    (instant dial tracking, no polling).
+//! 3. **Scope waveform** (`27`) — routed to the [`ScopeAssembler`]; each completed sweep
+//!    lands in a latest-wins slot the radio loop drains into the waterfall.
+//!
+//! The engine is generic over [`CivIo`] (`Read + Write`), so the whole protocol path is
+//! unit-tested against an in-memory fake radio — only the constructor that opens a real
+//! serial port needs the `serial` feature (see [`super::broker`]).
+
+use std::io::{Read, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
+
+use super::frame::{Frame, FrameSplitter};
+use super::scope::{scope_stream_frames, ScopeAssembler, ScopeSweep};
+use super::state::CivState;
+
+/// The byte transport the engine drives: a real serial port in production (both
+/// `serialport`'s port types and our test fakes implement `Read + Write`). Reads must
+/// TIME OUT rather than block forever (`ErrorKind::TimedOut`/`WouldBlock` = "no data
+/// yet") — the engine's loop interleaves reads with the command queue.
+pub trait CivIo: Read + Write + Send {}
+impl<T: Read + Write + Send> CivIo for T {}
+
+/// How long the engine waits on the wire for one request's reply before failing it.
+/// CI-V at 115200 answers in ~10–20 ms; even 19200 stays well under this.
+const REQUEST_DEADLINE: Duration = Duration::from_millis(300);
+/// Read chunk timeout the loop expects `CivIo` reads to observe (the real port is opened
+/// with this; the loop just treats timeouts as "no data").
+pub const READ_TIMEOUT: Duration = Duration::from_millis(30);
+
+/// What reply resolves a request.
+#[derive(Debug, Clone, Copy)]
+pub enum Expect {
+    /// A set command → bare `FB` (ok) / `FA` (rejected).
+    Ack,
+    /// A read → a frame with this command byte (and this first data byte, for
+    /// sub-commanded reads like `15 02`).
+    Reply { cmd: u8, sub: Option<u8> },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CivError {
+    /// No matching reply within the deadline (radio off / wrong address / wrong baud).
+    Timeout,
+    /// The radio rejected the command (`FA`).
+    Nak,
+    /// The engine thread is gone.
+    Gone,
+}
+
+struct CivRequest {
+    frame: Frame,
+    expect: Expect,
+    /// `None` for the engine's own housekeeping commands (scope enable/disable): they
+    /// still occupy the pending slot — every write MUST, or their acks would resolve a
+    /// later caller's command on the half-duplex bus — but nobody awaits the result.
+    reply_to: Option<mpsc::SyncSender<Result<Frame, CivError>>>,
+}
+
+impl CivRequest {
+    fn resolve(self, r: Result<Frame, CivError>) {
+        if let Some(tx) = self.reply_to {
+            let _ = tx.try_send(r);
+        }
+    }
+}
+
+/// Cloneable client handle to the engine: transact commands, read the live state.
+#[derive(Clone)]
+pub struct CivHandle {
+    tx: mpsc::Sender<CivRequest>,
+    state: Arc<Mutex<CivState>>,
+    alive: Arc<AtomicBool>,
+}
+
+impl CivHandle {
+    /// Send one CI-V command and wait for its reply/ack. Serialized with every other
+    /// caller — the engine owns the half-duplex bus.
+    pub fn transact(&self, frame: Frame, expect: Expect) -> Result<Frame, CivError> {
+        // Fail in microseconds when the engine thread is dead — a wedged daemon must
+        // never serialize callers behind full recv timeouts (the UI-hang convoy).
+        if !self.alive.load(Ordering::Relaxed) {
+            return Err(CivError::Gone);
+        }
+        let (rtx, rrx) = mpsc::sync_channel(1);
+        self.tx
+            .send(CivRequest {
+                frame,
+                expect,
+                reply_to: Some(rtx),
+            })
+            .map_err(|_| CivError::Gone)?;
+        // The engine enforces REQUEST_DEADLINE per request; the extra headroom here covers
+        // requests queued behind others.
+        rrx.recv_timeout(REQUEST_DEADLINE * 4 + Duration::from_millis(100))
+            .map_err(|_| CivError::Timeout)?
+    }
+
+    /// A snapshot of the live state (freq/mode/PTT/meters folded from replies + transceive).
+    pub fn state(&self) -> CivState {
+        self.state.lock().map(|s| s.clone()).unwrap_or_default()
+    }
+}
+
+/// The running engine. Dropping it stops the thread (and the port closes with it).
+pub struct CivEngine {
+    handle: CivHandle,
+    scope_row: Arc<Mutex<Option<ScopeSweep>>>,
+    scope_enabled: Arc<AtomicBool>,
+    stop: Arc<AtomicBool>,
+    alive: Arc<AtomicBool>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl CivEngine {
+    /// Start the engine on `io`, talking to the radio at CI-V address `radio_addr`.
+    pub fn start(io: Box<dyn CivIo>, radio_addr: u8) -> CivEngine {
+        let (tx, rx) = mpsc::channel::<CivRequest>();
+        let state = Arc::new(Mutex::new(CivState::default()));
+        let scope_row = Arc::new(Mutex::new(None));
+        let scope_enabled = Arc::new(AtomicBool::new(false));
+        let stop = Arc::new(AtomicBool::new(false));
+        let alive = Arc::new(AtomicBool::new(true));
+        let thread = {
+            let state = state.clone();
+            let scope_row = scope_row.clone();
+            let scope_enabled = scope_enabled.clone();
+            let stop = stop.clone();
+            let alive = alive.clone();
+            std::thread::Builder::new()
+                .name("civ-engine".into())
+                .spawn(move || {
+                    engine_loop(
+                        io,
+                        radio_addr,
+                        rx,
+                        state,
+                        scope_row,
+                        scope_enabled,
+                        stop,
+                        alive,
+                    )
+                })
+                .expect("spawn civ-engine")
+        };
+        CivEngine {
+            handle: CivHandle {
+                tx,
+                state,
+                alive: alive.clone(),
+            },
+            scope_row,
+            scope_enabled,
+            stop,
+            alive,
+            thread: Some(thread),
+        }
+    }
+
+    pub fn handle(&self) -> CivHandle {
+        self.handle.clone()
+    }
+
+    /// Take the newest completed scope sweep, if one arrived since the last take.
+    pub fn take_scope_row(&self) -> Option<ScopeSweep> {
+        self.scope_row.lock().ok().and_then(|mut s| s.take())
+    }
+
+    /// Enable/disable the radio's scope waveform stream. The engine sends the CI-V
+    /// enable/disable commands on the transition (idempotent per state).
+    pub fn set_scope_enabled(&self, on: bool) {
+        self.scope_enabled.store(on, Ordering::Relaxed);
+    }
+
+    /// False once the engine thread has exited (I/O error — port unplugged/denied).
+    pub fn is_alive(&self) -> bool {
+        self.alive.load(Ordering::Relaxed)
+    }
+}
+
+impl Drop for CivEngine {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+/// One frame write with bounded retries for transient stalls.
+enum WriteOutcome {
+    Ok,
+    /// Timed out repeatedly — the request fails, the engine lives.
+    Transient,
+    /// Hard I/O error — the port is gone.
+    Fatal,
+}
+
+fn write_frame(io: &mut Box<dyn CivIo>, frame: &Frame) -> WriteOutcome {
+    let bytes = frame.to_bytes();
+    super::diag::log(super::diag::Dir::Tx, &bytes);
+    for _ in 0..3 {
+        match io.write_all(&bytes).and_then(|_| io.flush()) {
+            Ok(()) => return WriteOutcome::Ok,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                ) => {} // retry
+            Err(_) => return WriteOutcome::Fatal,
+        }
+    }
+    WriteOutcome::Transient
+}
+
+/// True when `f` resolves a request expecting `expect`. `FA` rejects both kinds.
+fn resolves(expect: Expect, f: &Frame) -> Option<Result<Frame, CivError>> {
+    if f.is_nak() {
+        return Some(Err(CivError::Nak));
+    }
+    match expect {
+        Expect::Ack => f.is_ack().then(|| Ok(f.clone())),
+        Expect::Reply { cmd, sub } => {
+            let sub_ok = sub.is_none_or(|s| f.data.first() == Some(&s));
+            (f.cmd == cmd && sub_ok).then(|| Ok(f.clone()))
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)] // one private loop, one call site
+fn engine_loop(
+    mut io: Box<dyn CivIo>,
+    radio_addr: u8,
+    rx: mpsc::Receiver<CivRequest>,
+    state: Arc<Mutex<CivState>>,
+    scope_row: Arc<Mutex<Option<ScopeSweep>>>,
+    scope_enabled: Arc<AtomicBool>,
+    stop: Arc<AtomicBool>,
+    alive: Arc<AtomicBool>,
+) {
+    let mut splitter = FrameSplitter::new();
+    let mut assembler = ScopeAssembler::new();
+    let mut pending: Option<(CivRequest, Instant)> = None;
+    // The engine's own housekeeping commands, queued ahead of caller traffic. They flow
+    // through the SAME pending slot as user requests — every write must, or their acks
+    // would resolve a later caller's command on the half-duplex bus.
+    let mut internal: std::collections::VecDeque<CivRequest> = std::collections::VecDeque::new();
+    let mut scope_sent: Option<bool> = None; // last commanded waveform-output state
+    let mut buf = [0u8; 512];
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+        // Keep the radio's waveform-output state in sync with the wanted flag.
+        let want_scope = scope_enabled.load(Ordering::Relaxed);
+        if scope_sent != Some(want_scope) {
+            for f in scope_stream_frames(radio_addr, want_scope) {
+                internal.push_back(CivRequest {
+                    frame: f,
+                    expect: Expect::Ack,
+                    reply_to: None,
+                });
+            }
+            scope_sent = Some(want_scope);
+        }
+        // Start the next queued request when idle (housekeeping first, then callers).
+        if pending.is_none() {
+            let next = internal.pop_front().map(Ok).unwrap_or_else(|| {
+                rx.try_recv().map_err(|e| match e {
+                    mpsc::TryRecvError::Empty => false,
+                    mpsc::TryRecvError::Disconnected => true,
+                })
+            });
+            match next {
+                Ok(req) => {
+                    // A transient write stall (USB hiccup) fails THIS REQUEST, never the
+                    // engine — killing the engine over one stall would take down all
+                    // native CAT including the ability to unkey a keyed radio.
+                    match write_frame(&mut io, &req.frame) {
+                        WriteOutcome::Ok => {
+                            pending = Some((req, Instant::now() + REQUEST_DEADLINE));
+                        }
+                        WriteOutcome::Transient => {
+                            req.resolve(Err(CivError::Timeout));
+                        }
+                        WriteOutcome::Fatal => {
+                            req.resolve(Err(CivError::Gone));
+                            break; // port gone for real
+                        }
+                    }
+                }
+                Err(true) => break, // all handles dropped
+                Err(false) => {}
+            }
+        }
+        // Read whatever arrived (short timeout keeps the loop responsive).
+        let frames = match io.read(&mut buf) {
+            Ok(0) => {
+                // A pipe-like fake returns Ok(0) at EOF; a serial port never does. Treat
+                // as "no data" so tests can drain, but yield so we don't spin.
+                std::thread::sleep(Duration::from_millis(1));
+                Vec::new()
+            }
+            Ok(n) => {
+                super::diag::log(super::diag::Dir::Rx, &buf[..n]);
+                splitter.push(&buf[..n])
+            }
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                ) =>
+            {
+                Vec::new()
+            }
+            Err(_) => break, // hard I/O error — port unplugged
+        };
+        for f in frames {
+            // Scope waveform frames go to the assembler, never to request matching.
+            if f.cmd == 0x27 {
+                if let Some(sweep) = assembler.push(&f) {
+                    if let Ok(mut slot) = scope_row.lock() {
+                        *slot = Some(sweep); // latest wins
+                    }
+                }
+                continue;
+            }
+            // Everything else refreshes the live state (replies AND transceive pushes).
+            if let Ok(mut s) = state.lock() {
+                s.apply(&f);
+            }
+            // Resolve the in-flight request if this frame answers it.
+            if let Some((req, _)) = &pending {
+                if let Some(result) = resolves(req.expect, &f) {
+                    let (req, _) = pending.take().unwrap();
+                    req.resolve(result);
+                }
+            }
+        }
+        // Fail a request the radio never answered.
+        if let Some((_, deadline)) = &pending {
+            if Instant::now() > *deadline {
+                let (req, _) = pending.take().unwrap();
+                req.resolve(Err(CivError::Timeout));
+            }
+        }
+    }
+    // Fail everything still queued so callers unblock immediately.
+    if let Some((req, _)) = pending.take() {
+        req.resolve(Err(CivError::Gone));
+    }
+    while let Ok(req) = rx.try_recv() {
+        req.resolve(Err(CivError::Gone));
+    }
+    alive.store(false, Ordering::Relaxed);
+}
+
+/// The in-memory fake IC-9700 the engine + daemon tests drive — kept out of `mod tests`
+/// so the broker's end-to-end test reuses it.
+#[cfg(test)]
+pub(crate) mod tests_support {
+    use super::super::frame::{bcd_to_freq, freq_to_bcd, Frame, CONTROLLER};
+    use std::collections::VecDeque;
+    use std::io::{self, Read, Write};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    /// The fake rig's REGISTER FILE, shared out via [`FakeRadio::regs`] so a
+    /// test can assert what the wire ACTUALLY did after the radio has been
+    /// moved into the engine. Models the IC-9700's dual-band reality: Main and
+    /// Sub each hold a frequency and a mode; `07 D0/D1` moves the selection;
+    /// `03/05/04/06` act on the SELECTED band; and — deliberately — `25 01`
+    /// writes the unselected VFO *of the current band*, a register nothing else
+    /// reads, because that is exactly where the parity batch's uplink went.
+    #[derive(Debug)]
+    pub struct Regs {
+        pub main_hz: u64,
+        pub sub_hz: u64,
+        /// Selected band: false = Main, true = Sub (`07 D0`/`07 D1`).
+        pub sel_sub: bool,
+        /// Satellite mode (`16 5A`) — TX fixed on Sub, full duplex.
+        pub satmode: bool,
+        /// Same-band A/B split (`0F 01`) — cross-band on a 9700 is NOT this.
+        pub split: bool,
+        /// The unselected VFO of the CURRENT band (`25 01`). See above.
+        pub unselected_hz: u64,
+        /// CI-V mode bytes per band (`06` on the selected band).
+        pub main_mode: u8,
+        pub sub_mode: u8,
+        /// The mode of the UNSELECTED VFO of the current band (`26 01`) — its
+        /// OWN register, which is the whole point: `06` cannot reach it, so a
+        /// split TX VFO keeps whatever mode was last put here.
+        pub unselected_mode: u8,
+        /// DATA mode (`1A 06`) — the rear-jack/soundcard flag that turns USB into USB-D and
+        /// FM into FM-D. Separate from the mode byte on a real Icom, and separate here, which
+        /// is the whole point: "FM" and "FM-D" differ ONLY in this bit.
+        pub data_mode: bool,
+        /// NAK `16 5A` like a single-band rig (IC-7300) — honest "no such mode".
+        pub no_satmode: bool,
+        /// Fault injection — NAK the next N Main selects (`07 D0`): the
+        /// failed-restore case, which strands the selection on Sub.
+        pub nak_main_select: u32,
+        /// Fault injection — NAK the next N `16 5A` SETs (a satmode change
+        /// the rig refuses to take).
+        pub nak_satmode_set: u32,
+        /// Fault injection — swallow the next N `16 5A` READ replies: a lost
+        /// CI-V reply (the request times out while the rig's state stands).
+        pub drop_satmode_reads: u32,
+        /// Every command frame received, as (cmd, data) — lets a test assert a
+        /// verb was NOT sent (e.g. "no `0F` under the satellite-mode contract").
+        pub log: Vec<(u8, Vec<u8>)>,
+    }
+
+    /// Pseudo-reply cmd meaning "say NOTHING" (a lost reply on the wire).
+    /// Deliberately not a real CI-V command byte.
+    const SILENT: u8 = 0xFF;
+
+    /// An in-memory fake IC-9700: scripted replies keyed by (cmd, first data byte).
+    /// Reads time out when nothing is queued, like a real serial port.
+    pub struct FakeRadio {
+        addr: u8,
+        outgoing: VecDeque<u8>,
+        /// Unsolicited bytes injected before the next read (transceive, scope).
+        push_next: Arc<Mutex<Vec<u8>>>,
+        /// The register file — see [`Regs`]; share it out with [`FakeRadio::regs`].
+        regs: Arc<Mutex<Regs>>,
+        /// When true, drop every command silently (a dead radio).
+        pub mute: bool,
+        /// When true, every read/write fails hard (a yanked cable) — the engine
+        /// classifies it Fatal and exits, driving `is_alive()` false.
+        pub dead: bool,
+    }
+    impl FakeRadio {
+        pub fn new(addr: u8) -> (Self, Arc<Mutex<Vec<u8>>>) {
+            let push = Arc::new(Mutex::new(Vec::new()));
+            (
+                FakeRadio {
+                    addr,
+                    outgoing: VecDeque::new(),
+                    push_next: push.clone(),
+                    regs: Arc::new(Mutex::new(Regs {
+                        main_hz: 145_000_000,
+                        sub_hz: 435_000_000,
+                        sel_sub: false,
+                        satmode: false,
+                        split: false,
+                        unselected_hz: 0,
+                        main_mode: 0x01, // USB
+                        sub_mode: 0x05,  // FM — the 9700's Sub-band default
+                        // LSB, and deliberately: the field report's TX VFO was
+                        // left in LSB by an earlier inverting linear pass.
+                        unselected_mode: 0x00,
+                        data_mode: false,
+                        no_satmode: false,
+                        nak_main_select: 0,
+                        nak_satmode_set: 0,
+                        drop_satmode_reads: 0,
+                        log: Vec::new(),
+                    })),
+                    mute: false,
+                    dead: false,
+                },
+                push,
+            )
+        }
+        /// Clone out the register handle BEFORE moving the radio into the engine.
+        pub fn regs(&self) -> Arc<Mutex<Regs>> {
+            self.regs.clone()
+        }
+        fn reply(&mut self, cmd: u8, data: &[u8]) {
+            let f = Frame {
+                to: CONTROLLER,
+                from: self.addr,
+                cmd,
+                data: data.to_vec(),
+            };
+            self.outgoing.extend(f.to_bytes());
+        }
+        fn ack(&mut self) {
+            self.reply(0xFB, &[]);
+        }
+    }
+    impl Write for FakeRadio {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if self.dead {
+                return Err(io::Error::new(io::ErrorKind::BrokenPipe, "dead"));
+            }
+            // FrameSplitter drops controller-originated frames as "echo", so parse raw.
+            let mut raw = Vec::new();
+            let mut cur = Vec::new();
+            for &b in buf {
+                cur.push(b);
+                if b == 0xFD {
+                    raw.push(std::mem::take(&mut cur));
+                }
+            }
+            for bytes in raw {
+                let Some(f) = Frame::parse(&bytes) else {
+                    continue;
+                };
+                if self.mute {
+                    continue;
+                }
+                let action = {
+                    // Poison-tolerant: a test asserting under the regs lock may
+                    // panic; the engine thread must not cascade after it.
+                    let mut r = self
+                        .regs
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    r.log.push((f.cmd, f.data.clone()));
+                    // Decide the reply under the register lock, emit after.
+                    match (f.cmd, f.data.first().copied()) {
+                        (0x03, _) => {
+                            let hz = if r.sel_sub { r.sub_hz } else { r.main_hz };
+                            Some((0x03, freq_to_bcd(hz).to_vec()))
+                        }
+                        (0x05, _) => {
+                            let hz = bcd_to_freq(&f.data);
+                            if r.sel_sub {
+                                r.sub_hz = hz;
+                            } else {
+                                r.main_hz = hz;
+                            }
+                            None // ack
+                        }
+                        (0x04, _) => {
+                            let m = if r.sel_sub { r.sub_mode } else { r.main_mode };
+                            Some((0x04, vec![m, 0x01]))
+                        }
+                        (0x06, _) => {
+                            let m = f.data[0];
+                            if r.sel_sub {
+                                r.sub_mode = m;
+                            } else {
+                                r.main_mode = m;
+                            }
+                            None
+                        }
+                        // [MAIN/SUB] band selection; the A/B forms just ack.
+                        (0x07, Some(0xD0)) => {
+                            if r.nak_main_select > 0 {
+                                r.nak_main_select -= 1;
+                                Some((0xFA, Vec::new()))
+                            } else {
+                                r.sel_sub = false;
+                                None
+                            }
+                        }
+                        (0x07, Some(0xD1)) => {
+                            r.sel_sub = true;
+                            None
+                        }
+                        (0x07, Some(0x00 | 0x01)) => None,
+                        // Same-band split / duplex — the 9700 accepts these.
+                        (0x0F, Some(v @ (0x00 | 0x01))) => {
+                            r.split = v != 0;
+                            None
+                        }
+                        (0x0F, _) => None, // duplex shift
+                        // The unselected VFO of the CURRENT band — write-only here.
+                        (0x25, Some(0x01)) if f.data.len() >= 6 => {
+                            r.unselected_hz = bcd_to_freq(&f.data[1..]);
+                            None
+                        }
+                        // …and its MODE (`26 01 <mode> <data>`), a register of
+                        // its own. Separate from `main_mode`/`sub_mode` here for
+                        // the same reason it is separate on the radio: that is
+                        // exactly what made an unwritten TX VFO keep the last
+                        // pass's sideband.
+                        (0x26, Some(0x01)) if f.data.len() >= 2 => {
+                            r.unselected_mode = f.data[1];
+                            None
+                        }
+                        // Satellite mode: read (1-byte data) / set (2-byte data).
+                        (0x16, Some(0x5A)) if !r.no_satmode => match f.data.get(1) {
+                            Some(&v) => {
+                                if r.nak_satmode_set > 0 {
+                                    r.nak_satmode_set -= 1;
+                                    Some((0xFA, Vec::new()))
+                                } else {
+                                    r.satmode = v != 0;
+                                    None
+                                }
+                            }
+                            None => {
+                                if r.drop_satmode_reads > 0 {
+                                    r.drop_satmode_reads -= 1;
+                                    Some((SILENT, Vec::new()))
+                                } else {
+                                    Some((0x16, vec![0x5A, u8::from(r.satmode)]))
+                                }
+                            }
+                        },
+                        // DATA mode set (`1A 06 <on> <filter>`) / read (`1A 06`). A real
+                        // IC-7300/9700 answers both; without them this fake NAKed every
+                        // DATA-submode set, so `M PKTUSB`/`M PKTFM` could not be tested at
+                        // all against it — the daemon's `set_mode` requires the DATA ack.
+                        (0x1A, Some(0x06)) => match f.data.get(1) {
+                            Some(&on) => {
+                                r.data_mode = on != 0;
+                                None // ack
+                            }
+                            None => Some((0x1A, vec![0x06, u8::from(r.data_mode), 0x01])),
+                        },
+                        (0x15, Some(0x02)) => Some((0x15, vec![0x02, 0x01, 0x20])), // raw 120 = S9
+                        (0x27, _) => None,             // scope enable/disable
+                        _ => Some((0xFA, Vec::new())), // NAK anything unknown
+                    }
+                };
+                match action {
+                    None => self.ack(),
+                    Some((SILENT, _)) => {} // lost reply — the request times out
+                    Some((0xFA, _)) => self.reply(0xFA, &[]),
+                    Some((cmd, data)) => self.reply(cmd, &data),
+                }
+            }
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    impl Read for FakeRadio {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if self.dead {
+                return Err(io::Error::new(io::ErrorKind::BrokenPipe, "dead"));
+            }
+            if let Ok(mut p) = self.push_next.lock() {
+                if !p.is_empty() {
+                    self.outgoing.extend(p.drain(..));
+                }
+            }
+            if self.outgoing.is_empty() {
+                std::thread::sleep(Duration::from_millis(2));
+                return Err(io::Error::new(io::ErrorKind::TimedOut, "no data"));
+            }
+            let n = buf.len().min(self.outgoing.len());
+            for (i, b) in self.outgoing.drain(..n).enumerate() {
+                buf[i] = b;
+            }
+            Ok(n)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::commands::{read_freq, read_smeter, set_freq};
+    use super::super::frame::{freq_to_bcd, Frame};
+    use super::tests_support::FakeRadio;
+    use super::*;
+
+    #[test]
+    fn transact_read_and_set_against_a_fake_radio() {
+        let (radio, _push) = FakeRadio::new(0xA2);
+        let eng = CivEngine::start(Box::new(radio), 0xA2);
+        let h = eng.handle();
+        // Read the frequency.
+        let f = h
+            .transact(
+                read_freq(0xA2),
+                Expect::Reply {
+                    cmd: 0x03,
+                    sub: None,
+                },
+            )
+            .expect("freq read");
+        assert_eq!(super::super::commands::parse_freq(&f), Some(145_000_000));
+        // Set a new one (ack), read it back.
+        h.transact(set_freq(0xA2, 144_200_000), Expect::Ack)
+            .expect("freq set acked");
+        let f = h
+            .transact(
+                read_freq(0xA2),
+                Expect::Reply {
+                    cmd: 0x03,
+                    sub: None,
+                },
+            )
+            .expect("freq re-read");
+        assert_eq!(super::super::commands::parse_freq(&f), Some(144_200_000));
+        // The engine folded replies into the shared state too.
+        assert_eq!(h.state().freq_hz, Some(144_200_000));
+    }
+
+    #[test]
+    fn sub_commanded_read_matches_on_the_sub_byte() {
+        let (radio, _push) = FakeRadio::new(0xA2);
+        let eng = CivEngine::start(Box::new(radio), 0xA2);
+        let f = eng
+            .handle()
+            .transact(
+                read_smeter(0xA2),
+                Expect::Reply {
+                    cmd: 0x15,
+                    sub: Some(0x02),
+                },
+            )
+            .expect("smeter read");
+        assert_eq!(super::super::commands::parse_smeter_raw(&f), Some(120));
+    }
+
+    #[test]
+    fn a_dead_radio_times_out_instead_of_wedging() {
+        let (mut radio, _push) = FakeRadio::new(0xA2);
+        radio.mute = true;
+        let eng = CivEngine::start(Box::new(radio), 0xA2);
+        let t0 = Instant::now();
+        let r = eng.handle().transact(
+            read_freq(0xA2),
+            Expect::Reply {
+                cmd: 0x03,
+                sub: None,
+            },
+        );
+        assert_eq!(r.unwrap_err(), CivError::Timeout);
+        assert!(t0.elapsed() < Duration::from_secs(3), "bounded, not wedged");
+        // And the engine still answers later requests (a NAK-ing radio here).
+        // (mute stays on — a second request also times out but doesn't panic.)
+        let r = eng.handle().transact(
+            read_freq(0xA2),
+            Expect::Reply {
+                cmd: 0x03,
+                sub: None,
+            },
+        );
+        assert_eq!(r.unwrap_err(), CivError::Timeout);
+    }
+
+    #[test]
+    fn unsolicited_transceive_folds_into_state_without_a_request() {
+        let (radio, push) = FakeRadio::new(0xA2);
+        let eng = CivEngine::start(Box::new(radio), 0xA2);
+        // The operator turns the knob: the radio pushes cmd 00 with the new freq.
+        let f = Frame {
+            to: 0x00, // transceive broadcasts to address 00
+            from: 0xA2,
+            cmd: 0x00,
+            data: freq_to_bcd(146_520_000).to_vec(),
+        };
+        push.lock().unwrap().extend(f.to_bytes());
+        // Wait for the engine to pick it up.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if eng.handle().state().freq_hz == Some(146_520_000) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "transceive folded into state");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn nak_resolves_as_nak_not_timeout() {
+        let (radio, _push) = FakeRadio::new(0xA2);
+        let eng = CivEngine::start(Box::new(radio), 0xA2);
+        // The fake NAKs unknown commands — 0x1C PTT isn't scripted.
+        let r = eng
+            .handle()
+            .transact(super::super::commands::set_ptt(0xA2, true), Expect::Ack);
+        assert_eq!(r.unwrap_err(), CivError::Nak);
+    }
+}

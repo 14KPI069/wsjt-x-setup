@@ -1,0 +1,2734 @@
+//! Opening Detection v2 — anomaly/onset + mode classifier + false-positive
+//! rejection. The substance the ported `detector.rs` lacked: a real baseline/
+//! onset anomaly score, operator-anchored two-way reciprocity, a rule-ordered
+//! Es/F2-TEP/Aurora/Tropo classifier (geometry + space weather), and an
+//! anti-flap state machine with cold-start seeding for honest onset alerting.
+//!
+//! Everything here is **pure** — `now` is always a parameter (no wall clock) so
+//! the whole pipeline is deterministic and unit-testable with synthetic spots.
+//!
+//! Data-availability constraints that shape v1 (verified against the live feed):
+//! - The PSK Reporter MQTT feed is **topic-only → `snr: None`** for every spot,
+//!   so all SNR-derived features and the aurora *decode* signature are Phase 2.
+//!   v1 classifies on **geometry + space weather** only.
+//! - The feed is **operator-centric** (own-call topic filters), so every spot has
+//!   the operator on one end. Features are **operator-relative** ("open *for me*
+//!   to EU"), not a band-wide census; a regional/global feed is a Phase-2 fork.
+
+use std::collections::{HashMap, HashSet};
+
+use serde::{Deserialize, Serialize};
+
+use crate::geo::{
+    bearing_deg, compass_octant, geomagnetic_lat_deg, grid_distance_km, maidenhead_to_latlon,
+};
+use crate::model::{Band, PathSpot, PropMode, Side, SpaceWx};
+
+#[inline]
+fn clamp01(x: f32) -> f32 {
+    x.clamp(0.0, 1.0)
+}
+
+/// Tunable thresholds for the detector. All values are research-seeded starting
+/// points (`[TUNE]`); calibrate against a labeled corpus in Phase 3.
+#[derive(Debug, Clone)]
+pub struct OpeningConfig {
+    /// Short ("now") window for the onset rate, seconds.
+    pub short_w: i64,
+    /// Baseline window (the short window + the prior bins it is judged against).
+    pub base_w: i64,
+    /// Enter threshold: anomaly z at/above which a band is "raw open".
+    pub z_open: f32,
+    /// Exit threshold: a band stays "warm" (won't close) while z ≥ this.
+    pub z_close: f32,
+    /// Floor on the baseline scale (1.4826·MAD) so a dead-quiet band can't
+    /// divide to ∞.
+    pub sigma_floor: f32,
+    /// Min distinct far receivers (who-heard-me) to clear the gate (OR side A).
+    pub min_far_rx: usize,
+    /// Min distinct far transmitters (who-I-heard) to clear the gate (OR side B).
+    pub min_far_tx: usize,
+    /// VHF DX distance (km): on VHF, an operator-anchored path beyond this is genuine
+    /// DX rather than routine troposcatter, so `vhf_dx_stations` of them open the band
+    /// (one on 2 m/4 m, two on 6 m — see that fn). Research-set to 700 km — past the
+    /// everyday 2m troposcatter ceiling (~500–700 km even for a strong station) and at
+    /// the floor of the enhancement modes (sporadic-E / tropo-ducting / aurora all
+    /// ≥~800 km). Only applies on VHF.
+    pub vhf_dx_km: f64,
+    /// VHF short-lift distance (km): the floor of the tropo-enhancement ambiguity zone
+    /// and of single-hop sporadic-E (500–700 km). Two readers, two bars, because they
+    /// are asking different questions (see [`BandFeatures::raw_open`]):
+    /// - `op_gate`'s short rung, STANDING ALONE, needs TWO distinct stations at/beyond
+    ///   this at once — a strong station's routine scatter can reach here, so one path
+    ///   proves nothing by itself. Plus the rate anomaly, that is a corroborated short
+    ///   tropo lift, catching the quick 500–700 km openings the 700 km rung would miss.
+    /// - the regional gate's distance term needs ONE, because four census conditions
+    ///   have already done the corroborating and all it has to establish is that the
+    ///   surge left the neighbourhood — a distance one station cannot fabricate.
+    pub vhf_short_km: f64,
+    /// Onset-slope reference (Δ rate, spots/min/window). Reserved as a rising-edge
+    /// / terminator-ramp tuning knob — NOT a hard gate (see `raw_open`), since a
+    /// plateauing opening has slope≈0 after its rising edge.
+    pub slope_min: f32,
+    /// Kp at/above which aurora is gated on (≥5 at high geomag latitude).
+    pub kp_aurora: f32,
+    /// SFI at/above which F2/TEP is plausible.
+    pub sfi_tep: f32,
+    /// Skip-zone inner boundary (km): an Es hole shows few spots inside this.
+    pub d_near_km: f64,
+    /// Skip-hole ratio: near-count ≤ this × far-count (and enough far) ⇒ a hole.
+    pub skip_ratio: f64,
+    /// Min far-side (≥ d_near) spots required before a skip hole can be declared.
+    pub min_far_for_skip: usize,
+    /// Consecutive raw-open windows required to ENTER the open state.
+    pub enter_windows: u32,
+    /// Consecutive cold (below z_close) windows required to EXIT.
+    pub exit_windows: u32,
+    /// Geomagnetic |lat| (deg) at/above which a far end is "auroral-zone".
+    pub auroral_lat: f64,
+    /// Phase 2: consider near-region (neither-end-is-operator) spots in the open
+    /// gate. Default false → operator-anchored v1 behavior, bit-identical.
+    pub regional_scope: bool,
+    /// Min distinct participating stations for a REGIONAL open (Phase 2).
+    pub min_regional_stations: usize,
+    /// Min two-way pairs for a regional open — rejects one loud station heard by many.
+    pub min_regional_reciprocal: usize,
+    /// Min DISTINCT near-the-operator receivers for a regional open. The
+    /// anti-superstation rule: one tall-tower station hearing twelve DX is a
+    /// single endpoint, not a regional opening — the gate demands a collection
+    /// of spots across MULTIPLE local endpoints before believing the band.
+    pub min_regional_near_rx: usize,
+    /// "Near the operator" radius (km) for the endpoint census above.
+    pub region_near_km: f64,
+    /// Min cross-band share for a regional open — rejects a uniform contest/Es surge
+    /// lifting every band (a real opening is band-specific).
+    pub min_regional_cross_band_share: f32,
+    /// Baseline hold-out: exclude the most-recent N bins (the current episode +
+    /// its rising edge) from the anomaly baseline so z survives a plateau.
+    pub gap_bins: usize,
+    /// Hard ceiling on how long an opening can stay latched open (a backstop so a
+    /// perpetually-"warm" band can't pin the latch forever).
+    pub max_dwell_secs: i64,
+}
+
+impl Default for OpeningConfig {
+    fn default() -> Self {
+        Self {
+            short_w: 600, // 10 min
+            base_w: 7200, // 2 h (12 × 10-min bins) — long enough that an
+            // opening occupying the recent ~30 min is a small fraction of the
+            // baseline, so a *sustained* opening's anomaly z stays elevated for
+            // its duration instead of normalising within a couple of polls.
+            z_open: 4.0,
+            z_close: 2.0,
+            sigma_floor: 0.05, // spots/min
+            min_far_rx: 5,
+            min_far_tx: 3,
+            vhf_dx_km: 700.0,
+            vhf_short_km: 500.0,
+            slope_min: 0.0, // any positive onset; tune up to reject ramps
+            kp_aurora: 6.0,
+            sfi_tep: 150.0,
+            d_near_km: 550.0,
+            skip_ratio: 0.15,
+            min_far_for_skip: 4,
+            enter_windows: 2,
+            exit_windows: 3,
+            auroral_lat: 55.0,
+            regional_scope: false, // v1 default: operator-anchored gate only
+            min_regional_stations: 12,
+            min_regional_reciprocal: 2,
+            min_regional_cross_band_share: 0.3,
+            min_regional_near_rx: 3,
+            region_near_km: 800.0,
+            gap_bins: 3, // hold out the recent ~30 min (the episode + rising edge)
+            max_dwell_secs: 6 * 3600, // 6 h backstop
+        }
+    }
+}
+
+/// Per-band features computed over a window of operator-relative path spots.
+/// Public so classifier/tracker tests can construct them directly.
+#[derive(Debug, Clone)]
+pub struct BandFeatures {
+    pub band: Band,
+    pub spot_count: usize,
+    /// Distinct far receivers across `Side::HeardMe` spots ("who heard me").
+    pub unique_far_rx: usize,
+    /// Distinct far transmitters across `Side::IHeard` spots ("who I heard").
+    pub unique_far_tx: usize,
+    /// Distinct operator-anchored far stations (heard me OR I heard) whose path is
+    /// beyond `vhf_dx_km` — genuine VHF DX, past the routine troposcatter ceiling. On
+    /// VHF a single one opens the band (2m tropo/Es/aurora openings are often one
+    /// distant station; see [`BandFeatures::raw_open`]).
+    pub unique_far_dx: usize,
+    /// Distinct operator-anchored far stations beyond `vhf_short_km` (the 500 km
+    /// single-hop-Es / tropo-enhancement floor). Read by two gates at two bars, and
+    /// they are asking different questions — see [`BandFeatures::raw_open`]:
+    /// `op_gate`'s short rung needs **2** (standing alone, one 500–700 km station is
+    /// within a strong station's routine scatter, so it needs corroboration), while
+    /// the regional gate's distance term needs **1** (behind four census conditions
+    /// that have already done the corroborating; there it only has to prove the surge
+    /// left the neighbourhood).
+    pub unique_far_short_dx: usize,
+    /// Distinct RECEIVERS within `region_near_km` of the operator copying a path of
+    /// `vhf_dx_km`+ (700 km) length between OTHER stations — the receive-only
+    /// sentinel: your neighbors' ears prove a VHF opening even when you're not on the
+    /// band at all. `regional_dx_gate`, which is this field STANDING ALONE, requires
+    /// **2** independent ears (anti-superstation: one tall-tower receiver is a single
+    /// endpoint, not a region).
+    pub unique_near_dx_rx: usize,
+    /// As [`Self::unique_near_dx_rx`] at the SHORT floor: near ears copying a far↔far
+    /// path of `vhf_short_km`+ (500 km). A superset of it, and used only by the
+    /// regional gate's distance term, which needs **1**.
+    ///
+    /// It exists because 500–700 km is a real single-hop Es opening on 6 m and the
+    /// 700 km set could not see one: the term was reading `unique_near_dx_rx` while
+    /// its own comment promised "ONE ≥500 km path is enough here", so twelve far↔far
+    /// paths of 540–583 km through three near ears — a textbook short-skip Es burst —
+    /// earned neither anchor and the gate stayed shut (2026-08-05). The sentinel keeps
+    /// the 700 km bar, because there one field IS the whole gate.
+    pub unique_near_short_dx_rx: usize,
+    /// Far stations confirmed BOTH ways with the operator (me→X and X→me).
+    pub reciprocal_pairs: usize,
+    /// Distinct stations participating on EITHER end of ALL spots — the regional
+    /// density census (Phase 2). On the own-call feed this ≈ `unique_far_*` + 1.
+    pub unique_stations: usize,
+    /// Distinct unordered call-pairs {A,B} confirmed both ways (regional two-way),
+    /// not just those involving the operator (Phase 2). Superset of `reciprocal_pairs`.
+    pub reciprocal_pairs_regional: usize,
+    /// Distinct RECEIVER endpoints within `region_near_km` of the operator among
+    /// far↔far spots — the anti-superstation census (multiple local ears).
+    pub unique_near_rx: usize,
+    pub median_km: f64,
+    pub max_km: f64,
+    pub min_km: f64,
+    pub p10_km: f64,
+    /// A skip-zone hole (few spots inside `d_near`, many beyond) — Es signature.
+    pub skip_hole: bool,
+    pub bearing_mean_deg: f64,
+    /// Circular resultant length of path bearings, 0 (isotropic) … 1 (one dir).
+    pub bearing_concentration: f64,
+    /// Fraction of paths within ±20° of N–S (TEP geometry input).
+    pub ns_fraction: f64,
+    /// Fraction of far ends whose geomagnetic-lat sign opposes the operator's
+    /// (a centered-dipole proxy for crossing the geomagnetic equator — TEP).
+    pub equator_crossing_frac: f64,
+    /// Fraction of far ends at auroral geomagnetic latitudes.
+    pub auroral_frac: f64,
+    /// Spots/min in the most-recent short window.
+    pub rate_short: f32,
+    /// Median spots/min over the (held-out) baseline bins — the robust "normal".
+    pub rate_base: f32,
+    /// Onset anomaly: (rate_short − median_baseline) / max(1.4826·MAD, σ_floor).
+    pub anomaly_z: f32,
+    /// Δ rate vs the previous bin (spots/min) — positive = rising onset.
+    pub onset_slope: f32,
+    /// Short-window rate (spots/min) counting ONLY getting-out (`HeardMe`) + far↔far
+    /// (`Neither`) evidence — the cross-band-share DENOMINATOR input. Excludes the
+    /// operator's own `IHeard` receive-firehose (every station their radio decodes on
+    /// the band they're parked on), so a busy own-band QSO session can't dilute a
+    /// genuine single-band opening's share. See [`detect`].
+    pub share_rate_short: f32,
+    /// This band's short-window share of total cross-band activity (localization;
+    /// a uniform all-band surge — contest — drives every band's share down).
+    pub cross_band_share: f32,
+    /// SNR features — Phase 2 (`None` on the topic-only MQTT feed).
+    pub median_snr: Option<f32>,
+    pub snr_var: Option<f32>,
+}
+
+/// How many DISTINCT stations beyond `vhf_dx_km` (700 km) one rung of the VHF
+/// open gate needs — see [`BandFeatures::raw_open`].
+///
+/// **2 m / 4 m: 1.** The 700 km figure was researched for 2 m, where everyday
+/// troposcatter tops out around 500–700 km. Past it there is no *common*
+/// single-station mechanism, so one path is unambiguous enhancement and holding
+/// out for a second would lose the short tropo/Es/aurora openings that are
+/// frequently one distant station.
+///
+/// **6 m: 2.** The same number is wrong here, and this is the operator's
+/// "too liberal" report (2026-08-05: "misfiring on openings where I tune and
+/// hear nothing. True openings only."). On 6 m, 700–1400 km is squarely the
+/// METEOR-scatter and aircraft-scatter regime — one station pinging three times
+/// in two minutes is a rock, not an opening, and [`classify`] already declines
+/// to surface meteor scatter as a mode while the gate opened the band under it
+/// anyway. Real 6 m Es does not arrive as one station; it arrives as a wall.
+/// (Measured on the modelled true positive in
+/// `a_real_six_metre_es_opening_still_opens`: 14 distinct stations, 13 of them
+/// ≥ 700 km, z = 56 against a threshold of 4 — a 6× margin over this rung. So
+/// asking for a second distinct station costs a genuine opening nothing and
+/// removes the entire single-ping class.)
+fn vhf_dx_stations(band: Band) -> usize {
+    match band {
+        Band::B6 => 2,
+        _ => 1,
+    }
+}
+
+impl BandFeatures {
+    /// A zeroed feature set for a band with no activity (used as a test base and
+    /// for the closed-band path).
+    pub fn empty(band: Band) -> Self {
+        Self {
+            band,
+            spot_count: 0,
+            unique_far_rx: 0,
+            unique_far_tx: 0,
+            unique_far_dx: 0,
+            unique_far_short_dx: 0,
+            unique_near_dx_rx: 0,
+            unique_near_short_dx_rx: 0,
+            reciprocal_pairs: 0,
+            unique_stations: 0,
+            reciprocal_pairs_regional: 0,
+            unique_near_rx: 0,
+            median_km: 0.0,
+            max_km: 0.0,
+            min_km: 0.0,
+            p10_km: 0.0,
+            skip_hole: false,
+            bearing_mean_deg: 0.0,
+            bearing_concentration: 0.0,
+            ns_fraction: 0.0,
+            equator_crossing_frac: 0.0,
+            auroral_frac: 0.0,
+            rate_short: 0.0,
+            rate_base: 0.0,
+            anomaly_z: 0.0,
+            onset_slope: 0.0,
+            share_rate_short: 0.0,
+            cross_band_share: 0.0,
+            median_snr: None,
+            snr_var: None,
+        }
+    }
+
+    /// Does this band clear the generic opening gate at the enter threshold?
+    /// Anomaly ≥ z_open AND the band's evidence rung (HF: a station census;
+    /// VHF: DX distance — see the body). Onset slope is NOT
+    /// a hard gate here: a sustained (plateauing) opening has slope≈0 after its
+    /// rising edge, so gating on slope would make `raw_open` true for only one
+    /// window and defeat the ≥`enter_windows` enter requirement. Slope is kept as
+    /// a feature (a rising-edge / terminator-ramp signal) for confidence + Phase-2
+    /// tuning, not as the open gate.
+    pub fn raw_open(&self, cfg: &OpeningConfig) -> bool {
+        if self.anomaly_z < cfg.z_open {
+            return false;
+        }
+        let vhf = self.band.is_vhf();
+        // Operator-anchored gate (v1). The two sides are different questions:
+        //
+        // HF — a station CENSUS. An F2 opening's signature is VOLUME (5 receivers
+        // or 3 transmitters), and its paths are continent-scale by construction,
+        // so a distance term would add nothing.
+        //
+        // VHF/Es (6/4/2 m) — a DISTANCE test. These bands open suddenly with few
+        // stations and no cross-band breadth, so the HF census bar could never
+        // surface them; but "few stations" must not degrade into "any stations".
+        // Rungs (research-set, see vhf_dx_km/vhf_short_km docs):
+        //   • `vhf_dx_stations` distinct stations ≥ 700 km — unambiguous DX, past
+        //     any routine-scatter reach (1 on 2 m/4 m, 2 on 6 m — see the fn);
+        //   • 2 distinct stations ≥ 500 km — a corroborated SHORT tropo lift (one
+        //     alone is within a strong station's everyday scatter; two at once with
+        //     a rate anomaly is enhancement — catches the quick 500–700 km openings).
+        //
+        // The DISTANCE-BLIND rungs were removed here 2026-08-05 (operator: "the 6m
+        // opening detection is too liberal… misfiring on openings where I tune and
+        // hear nothing"). `unique_far_rx`/`unique_far_tx` are a plain census — the
+        // "far" in their names is a lie, they collect every station on either end
+        // regardless of distance — and loosening them to 3/2 for VHF made "I heard
+        // two stations on 6 m" the entire test. Two decodes at 111 km and 199 km
+        // (groundwave) opened the band, and the anomaly gate could not stop it:
+        // with `sigma_floor` 0.05 spots/min a dead band scores z = 2 × (spots in
+        // the last 10 min), so those same two spots put z at exactly z_open.
+        // The census fields are untouched — `project_opening` still displays them.
+        //
+        // On VHF that now holds for the WHOLE gate, not just this branch: every one
+        // of the three rungs below carries a ≥500/700 km path, `regional_gate`
+        // included (it did not until 2026-08-05, and the claim that it did was
+        // written here while it was false). HF is unchanged — an F2 census needs no
+        // distance term, its paths are continent-scale by construction.
+        //
+        // The anomaly-z gate above still applies to every rung, so routine scatter
+        // (baseline, no spike) can't fabricate an open even at DX distance.
+        let op_gate = if vhf {
+            self.unique_far_dx >= vhf_dx_stations(self.band) || self.unique_far_short_dx >= 2
+        } else {
+            self.unique_far_rx >= cfg.min_far_rx || self.unique_far_tx >= cfg.min_far_tx
+        };
+        // Regional gate (Phase 2, opt-in): a band-wide surge near the operator.
+        // Multi-condition so neither a single loud station (needs two-way pairs)
+        // nor a uniform contest/Es lifting every band (needs band-specificity)
+        // can fabricate an opening. Band-agnostic: the cross-band-share denominator
+        // is now computed over getting-out + far↔far evidence only (see `detect` /
+        // `share_rate_short`), so the operator's own IHeard receive-firehose on a
+        // busy band no longer dilutes a genuine single-band opening's share. That is
+        // a DENOMINATOR fix, not a threshold relax — a uniform contest surge still
+        // drives every band's share below `min_regional_cross_band_share`, so contest
+        // rejection is preserved and this gate is left as-is.
+        //
+        // …except for the DISTANCE term on VHF, added 2026-08-05. Every condition
+        // above is a census — how many stations, how many local ears, how many
+        // two-way pairs, how band-specific — and not one of them asks how far anything
+        // was. On HF that is right. On VHF it made a busy evening of local 6 m FT8
+        // among a dozen neighbours indistinguishable from an Es opening, which is the
+        // same "I tune and hear nothing" the operator reported and the same defect the
+        // census rungs were removed from `op_gate` for. It is read from the
+        // 10-minute-fresh gate sets, so it cannot be satisfied by a stale sample.
+        //
+        // **ONE path, at 500 km, and both halves of that are rulings, not defaults.**
+        //
+        // ONE, and it does not weaken the anti-superstation rule, because that rule is
+        // not this term's job and never was. A superstation fabricates COUNTS — it is
+        // one tall tower hearing everybody, so it inflates any station census — and it
+        // is refused here by `unique_near_rx >= min_regional_near_rx`: three DISTINCT
+        // local ears, plus two-way pairs and band-specificity. What one station cannot
+        // fabricate is GREAT-CIRCLE DISTANCE; that is geometry, not signal strength or
+        // antenna height. Asking for two anchors would ask the corroboration question a
+        // second time, and charge a real 500-700 km Es burst for the privilege.
+        //
+        // 500 km, because that is `vhf_short_km` — the floor this file already uses for
+        // "a path that did not stay local", set where routine scatter ends and
+        // single-hop Es begins on 6 m. Single-hop is bounded at the OTHER end by the
+        // 2400 km `vhf_max_terrestrial_km`, so 500-700 km is the short end of a real
+        // one-hop span, not outside it. The operator asked for "true openings only" AND
+        // a short-skip Es opening is a true opening he wants; those pull against each
+        // other only if this term is doing the corroborating, which it is not. Reading
+        // `unique_near_dx_rx` (700 km) here contradicted the promise for one release:
+        // twelve far↔far paths of 540-583 km through three near ears — a textbook
+        // single-hop Es burst, and the regression fixture below — earned neither anchor
+        // and the gate stayed shut.
+        //
+        // Either anchor counts: operator-anchored (`unique_far_short_dx`) or a near ear
+        // copying a 500 km+ far↔far path (`unique_near_short_dx_rx`), which is the
+        // receive-only case where the operator isn't on the band at all.
+        let vhf_regional_distance =
+            !vhf || self.unique_far_short_dx >= 1 || self.unique_near_short_dx_rx >= 1;
+        let regional_gate = cfg.regional_scope
+            && vhf_regional_distance
+            && self.unique_stations >= cfg.min_regional_stations
+            && self.unique_near_rx >= cfg.min_regional_near_rx
+            && self.reciprocal_pairs_regional >= cfg.min_regional_reciprocal
+            && self.cross_band_share >= cfg.min_regional_cross_band_share;
+        // Receive-only VHF sentinel (regional feed only): ≥2 DISTINCT receivers near
+        // the operator each copying a ≥ vhf_dx_km path between OTHER stations. Your
+        // neighbors' ears prove the opening even when you're parked on another band
+        // and transmitting nothing — the case where the alert matters most.
+        //
+        // Here — and this is the difference from the distance term above — the field IS
+        // the whole gate: no station census, no two-way pairs, no band-specificity
+        // stands behind it. So it does the anti-superstation work itself and keeps BOTH
+        // of its bars: TWO independent ears (one big-antenna station can't fabricate a
+        // region alone) at the 700 km DX floor (not the 500 km short floor, which on
+        // 2 m is everyday troposcatter). The full 6m-scale regional_gate above stays
+        // for band-wide surges. Gated on regional_scope like the regional gate: only
+        // the PSK Reporter near-region feed carries trustworthy far↔far receive reports.
+        let regional_dx_gate = cfg.regional_scope && vhf && self.unique_near_dx_rx >= 2;
+        op_gate || regional_gate || regional_dx_gate
+    }
+
+    /// Is the band still "warm" (above the exit threshold)?
+    pub fn warm(&self, cfg: &OpeningConfig) -> bool {
+        self.anomaly_z >= cfg.z_close
+    }
+}
+
+/// One band's per-window signal: features + classification + raw open/warm flags.
+#[derive(Debug, Clone)]
+pub struct BandSignal {
+    pub band: Band,
+    pub features: BandFeatures,
+    pub mode: PropMode,
+    /// Combined honest confidence in [0, 1].
+    pub confidence: f32,
+    pub raw_open: bool,
+    pub warm: bool,
+}
+
+/// Operator-anchored two-way reciprocity: distinct far stations X for which BOTH
+/// `me→X` (X heard me) AND `X→me` (I heard X) exist in the window. Keyed by far
+/// **callsign** (two stations in the same grid count separately). On the v1
+/// own-call feed one end is always the operator; the unordered-pair form keeps it
+/// forward-compatible with a Phase-2 far↔far feed.
+pub fn reciprocity(spots: &[PathSpot], me_call: &str, now: i64, window: i64) -> usize {
+    let cutoff = now - window;
+    let mut heard_me: HashSet<String> = HashSet::new();
+    let mut i_heard: HashSet<String> = HashSet::new();
+    for s in spots.iter().filter(|s| s.time >= cutoff) {
+        match s.side(me_call) {
+            Side::HeardMe => {
+                if let Some(c) = s.far_call(me_call) {
+                    heard_me.insert(c.to_uppercase());
+                }
+            }
+            Side::IHeard => {
+                if let Some(c) = s.far_call(me_call) {
+                    i_heard.insert(c.to_uppercase());
+                }
+            }
+            Side::Neither => {}
+        }
+    }
+    heard_me.intersection(&i_heard).count()
+}
+
+/// Regional two-way reciprocity: distinct unordered call-pairs {A,B} for which
+/// BOTH directions exist (A heard B AND B heard A) in the window — NOT just pairs
+/// involving the operator. The operator-anchored [`reciprocity`] is the special
+/// case where one end is `me`. Keyed by callsign (matching the far-call contract).
+pub fn reciprocity_regional(spots: &[PathSpot], now: i64, window: i64) -> usize {
+    let cutoff = now - window;
+    let mut directed: HashSet<(String, String)> = HashSet::new();
+    for s in spots.iter().filter(|s| s.time >= cutoff) {
+        directed.insert((
+            s.tx_call.to_ascii_uppercase(),
+            s.rx_call.to_ascii_uppercase(),
+        ));
+    }
+    let mut pairs: HashSet<(String, String)> = HashSet::new();
+    for (a, b) in &directed {
+        if directed.contains(&(b.clone(), a.clone())) {
+            // Canonicalize the unordered pair (smaller call first) to dedupe mirrors.
+            let key = if a <= b {
+                (a.clone(), b.clone())
+            } else {
+                (b.clone(), a.clone())
+            };
+            pairs.insert(key);
+        }
+    }
+    pairs.len()
+}
+
+/// The FARTHER of two candidate grids from `me` (for folding a near-region
+/// neither-end-is-operator spot into the me-anchored geometry — one symmetric far
+/// sample). `None` if neither grid resolves a distance.
+fn farther_grid<'a>(me: &str, a: Option<&'a str>, b: Option<&'a str>) -> Option<&'a str> {
+    let da = a.and_then(|g| grid_distance_km(me, g));
+    let db = b.and_then(|g| grid_distance_km(me, g));
+    match (da, db) {
+        (Some(x), Some(y)) => {
+            if x >= y {
+                a
+            } else {
+                b
+            }
+        }
+        (Some(_), None) => a,
+        (None, Some(_)) => b,
+        (None, None) => None,
+    }
+}
+
+/// Percentile (0..1) of an ascending-sorted slice (linear interpolation).
+fn percentile(sorted: &[f64], p: f64) -> f64 {
+    if sorted.is_empty() {
+        return 0.0;
+    }
+    if sorted.len() == 1 {
+        return sorted[0];
+    }
+    let idx = p.clamp(0.0, 1.0) * (sorted.len() - 1) as f64;
+    let lo = idx.floor() as usize;
+    let hi = idx.ceil() as usize;
+    if lo == hi {
+        return sorted[lo];
+    }
+    let f = idx - lo as f64;
+    sorted[lo] * (1.0 - f) + sorted[hi] * f
+}
+
+/// Compute the onset anomaly: bin the base window into `short_w`-sized bins
+/// ending at `now`; bin 0 is the "now" window, bins 1.. are the baseline.
+/// Returns (rate_short, rate_base_mean, anomaly_z, onset_slope) in spots/min.
+fn anomaly(times: &[i64], now: i64, cfg: &OpeningConfig) -> (f32, f32, f32, f32) {
+    let bin_secs = cfg.short_w.max(1);
+    let n_bins = (cfg.base_w / bin_secs).max(2) as usize;
+    let mut bins = vec![0u32; n_bins];
+    for &t in times {
+        let age = now - t;
+        if age < 0 || age >= cfg.base_w {
+            continue;
+        }
+        let b = (age / bin_secs) as usize;
+        if b < n_bins {
+            bins[b] += 1;
+        }
+    }
+    let per_min = (bin_secs as f32) / 60.0;
+    let rate = |count: u32| count as f32 / per_min;
+    let rate_short = rate(bins[0]);
+    let rate_prev = if n_bins > 1 { rate(bins[1]) } else { 0.0 };
+    // Baseline = the OLDER bins, holding out the most-recent `gap_bins` (the
+    // current episode + its rising edge). Without the hold-out the opening's own
+    // hot bins age into the baseline within a window or two and collapse z, so a
+    // *sustained* (plateauing) opening would stop registering after one poll.
+    // The hold-out keeps z high for the bins where the baseline is still the
+    // pre-onset norm (~the opening's first hour); a multi-hour opening eventually
+    // becomes "the new normal" and z decays — a known v1 limitation (a true
+    // persistent-opening latch using absolute activity is Phase 2).
+    let gap = cfg.gap_bins.clamp(1, n_bins.saturating_sub(1)).max(1);
+    let base: Vec<f32> = bins[gap..].iter().map(|&c| rate(c)).collect();
+    // Robust baseline: median + MAD, NOT mean/σ. As a sustained opening ages, its
+    // hot bins leak into the baseline one at a time; with mean/σ a single hot bin
+    // inflates σ and collapses z within a couple of polls (the plateau would stop
+    // registering). The median/MAD ignore a minority of hot bins, so z stays
+    // elevated for the opening's duration until it occupies >½ the baseline.
+    let (med, mad) = median_mad(&base);
+    let scale = (1.4826 * mad).max(cfg.sigma_floor); // 1.4826·MAD ≈ σ for normal data
+    let z = (rate_short - med) / scale;
+    let slope = rate_short - rate_prev;
+    (rate_short, med, z, slope)
+}
+
+/// Median of a slice (copies + sorts; returns 0 for empty).
+fn median(xs: &[f32]) -> f32 {
+    if xs.is_empty() {
+        return 0.0;
+    }
+    let mut v = xs.to_vec();
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let n = v.len();
+    if n % 2 == 1 {
+        v[n / 2]
+    } else {
+        (v[n / 2 - 1] + v[n / 2]) / 2.0
+    }
+}
+
+/// Median and median-absolute-deviation (robust location + scale).
+fn median_mad(xs: &[f32]) -> (f32, f32) {
+    if xs.is_empty() {
+        return (0.0, 0.0);
+    }
+    let med = median(xs);
+    let dev: Vec<f32> = xs.iter().map(|x| (x - med).abs()).collect();
+    (med, median(&dev))
+}
+
+/// Compute features for one band from operator-relative spots already filtered to
+/// that band. `me_grid` anchors the path geometry. `cross_band_share` is filled
+/// later by [`detect_bands`].
+pub fn band_features(
+    band: Band,
+    band_spots: &[&PathSpot],
+    me_call: &str,
+    me_grid: &str,
+    now: i64,
+    cfg: &OpeningConfig,
+) -> BandFeatures {
+    let mut bf = BandFeatures::empty(band);
+    bf.spot_count = band_spots.len();
+    if band_spots.is_empty() {
+        return bf;
+    }
+
+    let mut far_rx: HashSet<String> = HashSet::new();
+    let mut far_tx: HashSet<String> = HashSet::new();
+    // Operator-anchored far stations beyond the VHF DX distance (genuine DX, not
+    // routine troposcatter) — the single-station VHF open signal.
+    let mut far_dx: HashSet<String> = HashSet::new();
+    // …and beyond the short-lift floor (500 km): two at once = corroborated tropo for
+    // `op_gate`; one is the regional gate's distance term (see `raw_open`).
+    let mut far_short_dx: HashSet<String> = HashSet::new();
+    // Near-me receivers copying DX-length far↔far paths (the receive-only sentinel).
+    let mut near_dx_rx: HashSet<String> = HashSet::new();
+    // …and the same at the SHORT floor (500 km), for the regional gate's distance
+    // term: a 500-700 km far↔far path a neighbour is copying is single-hop Es.
+    let mut near_short_dx_rx: HashSet<String> = HashSet::new();
+    let mut near_rx: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut all_stations: HashSet<String> = HashSet::new();
+    let mut dists: Vec<f64> = Vec::new();
+    let mut bearings: Vec<f64> = Vec::new();
+    let mut snrs: Vec<f64> = Vec::new(); // SNRs (dB) from the MQTT payload, when present
+    let me_geomag = maidenhead_to_latlon(me_grid).map(|(la, lo)| geomagnetic_lat_deg(la, lo));
+    let me_ll = maidenhead_to_latlon(me_grid);
+    let mut equator_cross = 0usize;
+    let mut auroral = 0usize;
+    let mut geo_far = 0usize; // far ends with a usable grid (denominator for fracs)
+    let times: Vec<i64> = band_spots.iter().map(|s| s.time).collect();
+    // Cross-band-share denominator input: count only getting-out (HeardMe) + far↔far
+    // (Neither) spots in the SAME short window `rate_short` uses. Excluding the
+    // operator's IHeard receive-firehose keeps a busy own-band QSO session from
+    // inflating the cross-band denominator (see `detect`).
+    let short_cutoff = now - cfg.short_w;
+    let mut share_short_count = 0usize;
+    // On VHF the OPEN-GATE evidence must be NOW.
+    //
+    // `raw_open`'s VHF rungs describe a live Es/tropo lift, which lives for
+    // MINUTES — but this function's window is `base_w` (2 h), so a station heard
+    // ninety minutes ago and gone since was still satisfying the DX rung while
+    // `anomaly_z` (which only ever looks at the last `short_w`) was being spiked
+    // by something else entirely. The gate's two halves were reading different
+    // clocks. Measured (operator 2026-08-05): three 90-minute-old ≥700 km decodes
+    // plus two fresh local ones opened a dead 6 m band and latched it for the
+    // tracker's full 6 h `max_dwell`.
+    //
+    // HF deliberately keeps the whole window: an F2 opening is an hours-long
+    // phenomenon whose evidence is a census, not an instant, and narrowing the
+    // 5-receiver / 3-transmitter bar to 10 minutes would drop real HF openings.
+    //
+    // Scope is the FOUR sets a VHF gate actually reads: `far_dx` + `far_short_dx`
+    // (`op_gate`'s VHF rungs), `near_dx_rx` (`regional_dx_gate`) and
+    // `near_short_dx_rx` (the regional gate's distance term).
+    //
+    // `far_rx`/`far_tx` are deliberately NOT confined, and that is not an oversight:
+    // on VHF `op_gate` never reads them (it takes the distance branch), so narrowing
+    // them bought the gate nothing and cost the DISPLAY everything — they are the
+    // census `project_opening` shows and the `peak_stations` the openings journal
+    // records — and that journal is `unique_far_rx + unique_far_tx`, so confining both
+    // halves scales the recorded figure by the fraction of an episode that fits in one
+    // 10-minute window: a 40-minute Es episode with 30 stations each way, never more
+    // than 8 of them at once, journals ~16 in place of ~60. That is the operator's own
+    // before/after instrument. On HF they ARE gate inputs, and there `gate_fresh` is
+    // always true, so nothing changes.
+    // `near_rx`, `all_stations` and the geometry pools are likewise untouched: they
+    // feed the `regional_gate` census and the classifier, which are about the shape of
+    // the last two hours, not about whether the band is open this minute.
+    let vhf = band.is_vhf();
+
+    for s in band_spots {
+        // Is this spot fresh enough to be VHF gate evidence? (Always true on HF.)
+        let gate_fresh = !vhf || (s.time > short_cutoff && s.time <= now);
+        // Regional density census: every distinct station on either end.
+        all_stations.insert(s.tx_call.to_ascii_uppercase());
+        all_stations.insert(s.rx_call.to_ascii_uppercase());
+        if let Some(snr) = s.snr {
+            snrs.push(snr as f64);
+        }
+        let side = s.side(me_call);
+        if s.time > short_cutoff && s.time <= now && side != Side::IHeard {
+            share_short_count += 1;
+        }
+        // The single grid to fold into the operator-anchored geometry pools:
+        // operator spots → the far end (bit-identical to the old far_grid path);
+        // a near-region (Neither) spot → its FARTHER end from me (one symmetric
+        // sample, NOT both — folding both would inject a spurious short leg and
+        // suppress the very skip-hole it should drive).
+        let geo_grid: Option<&str> = match side {
+            Side::HeardMe => {
+                if let Some(c) = s.far_call(me_call) {
+                    let cu = c.to_ascii_uppercase();
+                    // The far station here is the RECEIVER that heard me → its own grid.
+                    let d = s
+                        .rx_grid
+                        .as_deref()
+                        .and_then(|g| grid_distance_km(me_grid, g));
+                    // Gate rungs only: fresh on VHF, whole window on HF.
+                    if gate_fresh {
+                        if d.is_some_and(|d| d >= cfg.vhf_dx_km) {
+                            far_dx.insert(cu.clone());
+                        }
+                        if d.is_some_and(|d| d >= cfg.vhf_short_km) {
+                            far_short_dx.insert(cu.clone());
+                        }
+                    }
+                    // Census: the whole window on every band (display + journal).
+                    far_rx.insert(cu);
+                }
+                s.rx_grid.as_deref()
+            }
+            Side::IHeard => {
+                if let Some(c) = s.far_call(me_call) {
+                    let cu = c.to_ascii_uppercase();
+                    // The far station here is the TRANSMITTER I heard → its own grid.
+                    let d = s
+                        .tx_grid
+                        .as_deref()
+                        .and_then(|g| grid_distance_km(me_grid, g));
+                    // Gate rungs only — see the HeardMe arm.
+                    if gate_fresh {
+                        if d.is_some_and(|d| d >= cfg.vhf_dx_km) {
+                            far_dx.insert(cu.clone());
+                        }
+                        if d.is_some_and(|d| d >= cfg.vhf_short_km) {
+                            far_short_dx.insert(cu.clone());
+                        }
+                    }
+                    // Census: the whole window on every band (display + journal).
+                    far_tx.insert(cu);
+                }
+                s.tx_grid.as_deref()
+            }
+            Side::Neither => {
+                // Anti-superstation census: which DISTINCT local receivers (within
+                // region_near_km) are independently copying this band?
+                if let Some(rxg) = s.rx_grid.as_deref() {
+                    if let Some(d) = grid_distance_km(me_grid, rxg) {
+                        if d <= cfg.region_near_km {
+                            near_rx.insert(s.rx_call.to_ascii_uppercase());
+                            // Receive-only sentinel: this local ear is copying a
+                            // DX-length path (tx↔rx ≥ vhf_dx_km) — the band is open
+                            // in the operator's region whether or not they're on it.
+                            // The short set is the same question at the single-hop-Es
+                            // floor; both are gate rungs, so both are `gate_fresh`.
+                            let path = s
+                                .tx_grid
+                                .as_deref()
+                                .and_then(|txg| grid_distance_km(txg, rxg));
+                            if gate_fresh {
+                                if path.is_some_and(|p| p >= cfg.vhf_dx_km) {
+                                    near_dx_rx.insert(s.rx_call.to_ascii_uppercase());
+                                }
+                                if path.is_some_and(|p| p >= cfg.vhf_short_km) {
+                                    near_short_dx_rx.insert(s.rx_call.to_ascii_uppercase());
+                                }
+                            }
+                        }
+                    }
+                }
+                farther_grid(me_grid, s.tx_grid.as_deref(), s.rx_grid.as_deref())
+            }
+        };
+        if let Some(fg) = geo_grid {
+            if let Some(d) = grid_distance_km(me_grid, fg) {
+                dists.push(d);
+            }
+            if let (Some(me), Some((fla, flo))) = (me_ll, maidenhead_to_latlon(fg)) {
+                bearings.push(bearing_deg(me, (fla, flo)));
+                geo_far += 1;
+                let fg_geomag = geomagnetic_lat_deg(fla, flo);
+                if let Some(mg) = me_geomag {
+                    if mg.signum() != fg_geomag.signum() {
+                        equator_cross += 1;
+                    }
+                }
+                if fg_geomag.abs() >= cfg.auroral_lat {
+                    auroral += 1;
+                }
+            }
+        }
+    }
+
+    bf.unique_far_rx = far_rx.len();
+    bf.unique_far_tx = far_tx.len();
+    bf.unique_far_dx = far_dx.len();
+    bf.unique_far_short_dx = far_short_dx.len();
+    bf.unique_near_dx_rx = near_dx_rx.len();
+    bf.unique_near_short_dx_rx = near_short_dx_rx.len();
+    bf.unique_near_rx = near_rx.len();
+    bf.unique_stations = all_stations.len();
+    let owned: Vec<PathSpot> = band_spots.iter().map(|s| (*s).clone()).collect();
+    bf.reciprocal_pairs = reciprocity(&owned, me_call, now, cfg.base_w);
+    bf.reciprocal_pairs_regional = reciprocity_regional(&owned, now, cfg.base_w);
+
+    dists.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    if !dists.is_empty() {
+        bf.min_km = dists[0];
+        bf.max_km = *dists.last().unwrap();
+        bf.median_km = percentile(&dists, 0.5);
+        bf.p10_km = percentile(&dists, 0.10);
+        // Skip-hole is an Es signature and only meaningful on the Es-capable
+        // bands (10/6/4/2 m), where short ground/tropo contacts normally exist so
+        // their absence beyond a dead zone is notable. On lower HF a long-haul
+        // cluster trivially has no near spots — that's normal DX, not a skip hole
+        // — so leaving skip_hole false there lets the long-haul F2 path classify.
+        if matches!(band, Band::B10 | Band::B6 | Band::B4 | Band::B2) {
+            let near = dists.iter().filter(|&&d| d < cfg.d_near_km).count();
+            let far = dists.len() - near;
+            bf.skip_hole =
+                far >= cfg.min_far_for_skip && (near as f64) <= cfg.skip_ratio * (far as f64);
+        }
+    }
+
+    // SNR distribution (now that the MQTT payload carries `rp`): the median is a band
+    // "how loud" signal and the variance distinguishes a steady opening from a flutter-y
+    // (aurora/scatter) one. Populated as features for confidence/diagnostics; gating the
+    // open/aurora decision on them is a separate tuning pass (kept Phase-2).
+    if !snrs.is_empty() {
+        snrs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        bf.median_snr = Some(percentile(&snrs, 0.5) as f32);
+        let mean = snrs.iter().sum::<f64>() / snrs.len() as f64;
+        let var = snrs.iter().map(|x| (x - mean) * (x - mean)).sum::<f64>() / snrs.len() as f64;
+        bf.snr_var = Some(var as f32);
+    }
+
+    if !bearings.is_empty() {
+        let (mut sx, mut sy) = (0.0f64, 0.0f64);
+        let mut ns = 0usize;
+        for &b in &bearings {
+            let r = b.to_radians();
+            sx += r.cos();
+            sy += r.sin();
+            // within ±20° of due N (0/360) or due S (180)
+            let d_n = ((b + 180.0) % 360.0 - 180.0).abs();
+            let d_s = ((b - 180.0 + 540.0) % 360.0 - 180.0).abs();
+            if d_n <= 20.0 || d_s <= 20.0 {
+                ns += 1;
+            }
+        }
+        let n = bearings.len() as f64;
+        bf.bearing_mean_deg = (sy.atan2(sx).to_degrees() + 360.0) % 360.0;
+        bf.bearing_concentration = ((sx / n).powi(2) + (sy / n).powi(2)).sqrt();
+        bf.ns_fraction = ns as f64 / n;
+    }
+    if geo_far > 0 {
+        bf.equator_crossing_frac = equator_cross as f64 / geo_far as f64;
+        bf.auroral_frac = auroral as f64 / geo_far as f64;
+    }
+
+    let (rate_short, rate_base, z, slope) = anomaly(&times, now, cfg);
+    bf.rate_short = rate_short;
+    bf.rate_base = rate_base;
+    bf.anomaly_z = z;
+    bf.onset_slope = slope;
+    // Same per-minute unit as `rate_short` (short_w-sized bin), but over the
+    // getting-out + far↔far spots only — the un-inflated cross-band denominator.
+    bf.share_rate_short = share_short_count as f32 / (cfg.short_w.max(1) as f32 / 60.0);
+    bf
+}
+
+/// Rule-ordered mode classifier. Returns `(mode, geom_fit, sw_fit)` where the two
+/// fits are 0..1 confidence factors for the chosen mode (SNR is omitted in v1).
+/// Order clears Es's signatures before claiming F2/TEP so a multi-hop Es 2nd lobe
+/// (2800–4500 km, often during high SFI) is not mislabeled F2.
+pub fn classify(
+    bf: &BandFeatures,
+    band: Band,
+    wx: &SpaceWx,
+    cfg: &OpeningConfig,
+) -> (PropMode, f32, f32) {
+    let kp = wx.kp;
+    let sfi = wx.sfi;
+    // Aurora can fire at Kp ≥ 5 when the operator's own paths are auroral-zone.
+    let kp_au = if bf.auroral_frac >= 0.5 {
+        cfg.kp_aurora - 1.0
+    } else {
+        cfg.kp_aurora
+    };
+
+    // TROPO — 2 m, geomagnetically quiet, continuous (no skip hole), 500–1600 km,
+    // directional corridor. SW-flat. The 500 km floor matches the corroborated
+    // short-lift open rung (vhf_short_km): a quick 500–700 km lift that opened the
+    // band should read "Tropo", not "Unknown". The mode only SURFACES on bands the
+    // gate opened, so the gate's evidence bar (2 distinct ≥500 km stations + the
+    // rate anomaly) carries the honesty. (70 cm "≥ 2 m" loss test is Phase 2.)
+    if band == Band::B2
+        && kp < 4.0
+        && !bf.skip_hole
+        && (500.0..=1600.0).contains(&bf.median_km)
+        && bf.bearing_concentration > 0.5
+    {
+        let geom = clamp01(bf.bearing_concentration as f32);
+        return (PropMode::Tropo, geom, 1.0); // SW-flat ⇒ always consistent
+    }
+
+    // AURORA — VHF, Kp-gated, far ends in the auroral zone (poleward scatter).
+    // skip_hole discriminates: aurora is oval SCATTER (no skip zone), while Es has
+    // one — a strong poleward Es opening during a Kp≥6 storm must classify Es, not
+    // aurora (the Phase-2 SNR/decode-quality signature isn't available yet, so the
+    // geometry signature carries the discrimination). auroral_frac 0.55: nearly
+    // half the far ends sub-auroral is not an aurora picture.
+    if matches!(band, Band::B6 | Band::B4 | Band::B2)
+        && kp >= kp_au
+        && bf.auroral_frac >= 0.55
+        && bf.max_km <= 2200.0
+        && !bf.skip_hole
+    {
+        let geom = clamp01(bf.auroral_frac as f32);
+        let sw = clamp01((kp - kp_au + 1.0) / 3.0);
+        return (PropMode::Aurora, geom, sw);
+    }
+
+    // F2 / TEP — HF…6 m, high SFI, geomagnetically quiet-ish, no skip hole, long
+    // N–S / equator-crossing paths.
+    if sfi >= cfg.sfi_tep
+        && kp < 5.0
+        && !bf.skip_hole
+        && (bf.equator_crossing_frac > 0.3 || bf.ns_fraction > 0.5)
+        && (2500.0..=6800.0).contains(&bf.median_km)
+    {
+        let geom = clamp01((bf.equator_crossing_frac.max(bf.ns_fraction)) as f32);
+        let sw = clamp01((sfi - cfg.sfi_tep) / 80.0 + 0.4);
+        return (PropMode::F2, geom, sw);
+    }
+
+    // Plain long-haul F2 — geometry-free, very long, no skip hole, high SFI. This
+    // is the documented Es-vs-F2 hard boundary (a long single/multi-hop path with
+    // no skip-hole and no equator-crossing geometry), so it is held to low
+    // confidence (≤ Marginal) — an honest "long-haul F2, low certainty", not a
+    // confident classification.
+    if bf.max_km > 4500.0 && !bf.skip_hole && sfi >= cfg.sfi_tep {
+        return (PropMode::F2, 0.25, 0.4);
+    }
+
+    // SPORADIC-E — 10/6/4/2 m, a skip hole OR isotropic-without-equator-crossing,
+    // single/multi-hop distances. SW-independent.
+    if matches!(band, Band::B10 | Band::B6 | Band::B4 | Band::B2)
+        && (640.0..=4500.0).contains(&bf.median_km)
+        && (bf.skip_hole || (bf.bearing_concentration < 0.4 && bf.equator_crossing_frac < 0.2))
+    {
+        let geom = if bf.skip_hole {
+            0.9
+        } else {
+            clamp01(0.8 - bf.bearing_concentration as f32)
+        };
+        return (PropMode::SporadicE, geom, 1.0);
+    }
+
+    (PropMode::Unknown, 0.3, 0.5)
+}
+
+/// Combine the confidence factors into one honest 0..1 score. SNR is structurally
+/// absent in v1 so it contributes no factor. Tropo is capped at Marginal.
+fn confidence_score(
+    bf: &BandFeatures,
+    mode: PropMode,
+    geom: f32,
+    sw: f32,
+    cfg: &OpeningConfig,
+) -> f32 {
+    let conf_anom = clamp01(bf.anomaly_z / (2.0 * cfg.z_open));
+    // Localization: a band-specific opening has a high cross-band share; a uniform
+    // all-band surge (contest) drives shares down. Floor so a lone-active band
+    // (share≈1) isn't penalised and a missing total doesn't zero it out.
+    let conf_local = clamp01(0.3 + 0.7 * bf.cross_band_share);
+    let factors = [conf_anom, clamp01(geom), clamp01(sw), conf_local];
+    // Geometric mean of the present factors (reads more sensibly than a raw
+    // product of four sub-unity terms).
+    let prod: f32 = factors.iter().copied().map(|f| f.max(1e-4)).product();
+    let mut score = prod.powf(1.0 / factors.len() as f32);
+    if mode == PropMode::Tropo {
+        score = score.min(0.5); // Tropo: never above Marginal (geometry-only v1)
+    }
+    clamp01(score).max(0.05)
+}
+
+/// Build a [`BandSignal`] from features + the live space weather.
+pub fn classify_signal(bf: BandFeatures, wx: &SpaceWx, cfg: &OpeningConfig) -> BandSignal {
+    let band = bf.band;
+    let (mode, geom, sw) = classify(&bf, band, wx, cfg);
+    let confidence = confidence_score(&bf, mode, geom, sw, cfg);
+    let raw_open = bf.raw_open(cfg);
+    let warm = bf.warm(cfg);
+    BandSignal {
+        band,
+        features: bf,
+        mode,
+        confidence,
+        raw_open,
+        warm,
+    }
+}
+
+/// Detect openings end-to-end with the real space weather: features → classify →
+/// signal, for each band. (Wraps [`band_features`] + [`classify_signal`] so the
+/// caller threads the actual `wx`.)
+pub fn detect(
+    spots: &[PathSpot],
+    me_call: &str,
+    me_grid: &str,
+    now: i64,
+    wx: &SpaceWx,
+    cfg: &OpeningConfig,
+    bands: &[Band],
+) -> Vec<BandSignal> {
+    let cutoff = now - cfg.base_w;
+    let mut by_band: HashMap<Band, Vec<&PathSpot>> = HashMap::new();
+    for s in spots.iter().filter(|s| s.time >= cutoff) {
+        by_band.entry(s.band).or_default().push(s);
+    }
+    let mut feats: Vec<BandFeatures> = bands
+        .iter()
+        .map(|&b| {
+            let empty = Vec::new();
+            let bs = by_band.get(&b).unwrap_or(&empty);
+            band_features(b, bs, me_call, me_grid, now, cfg)
+        })
+        .collect();
+    // Cross-band localization share. Denominator = Σ `share_rate_short`
+    // (getting-out + far↔far evidence), NOT Σ `rate_short`: on the operator-centric
+    // feed the operator's own IHeard receive-firehose on a busy band (e.g. a 20 m FT8
+    // run) would otherwise inflate the denominator and dilute a genuine single-band
+    // (6 m Es) opening below the regional cross-band gate. It stays a RELATIVE share,
+    // so a uniform multi-band contest surge still drives every band's share down —
+    // contest rejection is preserved (no threshold relaxed). See `share_rate_short`.
+    let total_share: f32 = feats.iter().map(|f| f.share_rate_short).sum();
+    for f in &mut feats {
+        f.cross_band_share = if total_share > 0.0 {
+            f.share_rate_short / total_share
+        } else {
+            0.0
+        };
+    }
+    feats
+        .into_iter()
+        .map(|bf| classify_signal(bf, wx, cfg))
+        .collect()
+}
+
+// --- The anti-flap state machine -------------------------------------------
+
+#[derive(Debug, Clone)]
+struct OpeningState {
+    open: bool,
+    open_windows: u32,
+    closed_windows: u32,
+    onset_time: i64,
+    /// False when the opening was seeded (already live at startup / within the
+    /// grace window) — its true onset is unknown, so `onset_secs` is reported 0.
+    onset_known: bool,
+    mode: PropMode,
+    /// Episode peaks, tracked while open so the close can journal an honest
+    /// summary of how good the opening got (not just its dying window).
+    peak_z: f32,
+    peak_km: f64,
+    peak_stations: u32,
+    peak_bearing_deg: f64,
+}
+
+/// One completed opening episode — the persistent openings-log record. Serialized
+/// to disk (camelCase, mirrored in ui/src/types.ts), so new fields need
+/// `#[serde(default)]` for back-compat with older log files.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpeningEpisode {
+    /// Band label ("6m", "2m", …).
+    pub band: String,
+    /// Propagation-mode label ("Tropo", "Sporadic-E", "Aurora", …) — the latest
+    /// confident classification while the episode was open.
+    pub mode: String,
+    pub started_utc: i64,
+    pub ended_utc: i64,
+    pub duration_secs: i64,
+    /// False when the opening was already live at startup (seeded) — the true
+    /// start is unknown and `duration_secs` under-counts.
+    pub onset_known: bool,
+    /// Peak onset-anomaly z over the episode.
+    pub peak_z: f32,
+    /// Longest operator-anchored path seen (km).
+    pub max_km: f64,
+    /// Most distinct stations seen in one window.
+    pub peak_stations: u32,
+    /// Mean path bearing at the peak-distance window.
+    pub bearing_deg: f64,
+    /// Compass octant of `bearing_deg` ("NE", …).
+    pub octant: String,
+}
+
+/// A surfaced opening event from the tracker.
+#[derive(Debug, Clone)]
+pub struct OpeningEvent {
+    pub band: Band,
+    pub open: bool,
+    /// True only on the update where a genuine closed→open transition occurred
+    /// (never on cold-start/grace seeding) — drives the one-shot alert.
+    pub is_new: bool,
+    /// Seconds since onset, or 0 for a seeded opening (true onset unknown).
+    pub onset_secs: i64,
+    pub mode: PropMode,
+    pub confidence: f32,
+    pub features: BandFeatures,
+}
+
+/// Stateful hysteresis + startup seeding over successive [`detect`] passes.
+/// The ONLY stateful piece; `update` is pure given its state + `now`.
+///
+/// **Startup grace:** for the first `base_w` after the tracker's first update
+/// (the time the buffer/baseline needs to become representative — a partial
+/// buffer makes z unreliable and everything look "open"), an opening is *seeded*
+/// into the open state WITHOUT `is_new`/alert. Genuine closed→open transitions
+/// observed AFTER the grace window fire `is_new` exactly once. This is a
+/// time-based grace (not a global flag), so a band that comes alive mid-session
+/// after grace still alerts, while a pre-existing opening that takes a few polls
+/// to register at startup does NOT false-alert.
+pub struct OpeningTracker {
+    cfg: OpeningConfig,
+    states: HashMap<Band, OpeningState>,
+    start_time: Option<i64>,
+    /// Episodes closed since the last [`Self::drain_closed`] — the openings-log feed.
+    closed: Vec<OpeningEpisode>,
+}
+
+impl Default for OpeningTracker {
+    fn default() -> Self {
+        Self::new(OpeningConfig::default())
+    }
+}
+
+impl OpeningTracker {
+    pub fn new(cfg: OpeningConfig) -> Self {
+        Self {
+            cfg,
+            states: HashMap::new(),
+            start_time: None,
+            closed: Vec::new(),
+        }
+    }
+
+    /// Build the journal record for a closing episode from its tracked peaks.
+    fn episode_of(band: Band, st: &OpeningState, ended: i64) -> OpeningEpisode {
+        OpeningEpisode {
+            band: band.label().to_string(),
+            mode: st.mode.label().to_string(),
+            started_utc: st.onset_time,
+            ended_utc: ended,
+            duration_secs: (ended - st.onset_time).max(0),
+            onset_known: st.onset_known,
+            peak_z: st.peak_z,
+            max_km: st.peak_km,
+            peak_stations: st.peak_stations,
+            bearing_deg: st.peak_bearing_deg,
+            octant: compass_octant(st.peak_bearing_deg).to_string(),
+        }
+    }
+
+    /// Take the episodes closed since the last call (the openings-log feed).
+    pub fn drain_closed(&mut self) -> Vec<OpeningEpisode> {
+        std::mem::take(&mut self.closed)
+    }
+
+    /// Close every still-open episode at `now` and return ALL pending episodes
+    /// (previously closed + the just-flushed). For app exit, so an opening in
+    /// progress when the operator quits still reaches the openings log.
+    pub fn close_all(&mut self, now: i64) -> Vec<OpeningEpisode> {
+        let mut flushed = std::mem::take(&mut self.closed);
+        for (band, st) in self.states.iter_mut() {
+            if st.open {
+                st.open = false;
+                flushed.push(Self::episode_of(*band, st, now));
+            }
+        }
+        flushed
+    }
+
+    fn min_dwell(mode: PropMode) -> i64 {
+        match mode {
+            PropMode::Tropo => 1800,
+            PropMode::F2 => 900,
+            PropMode::Aurora => 600,
+            _ => 600, // Es / MeteorScatter / Unknown
+        }
+    }
+
+    /// Advance the state machine one window and return events for all OPEN bands.
+    pub fn update(&mut self, now: i64, signals: &[BandSignal]) -> Vec<OpeningEvent> {
+        let cfg = self.cfg.clone();
+        let start = *self.start_time.get_or_insert(now);
+        // Within the grace window, z is not yet trustworthy (partial baseline), so
+        // openings are seeded silently rather than alerted.
+        let in_grace = now < start + cfg.base_w;
+
+        // Union of bands seen this window and bands we already track (so an
+        // open band that vanishes from the feed still ages toward exit).
+        let mut by_band: HashMap<Band, &BandSignal> = HashMap::new();
+        for s in signals {
+            by_band.insert(s.band, s);
+        }
+        // BTreeSet: events are pushed in canonical band order, so the stable
+        // confidence sort below cannot inherit a per-poll HashSet order — exact
+        // confidence ties are reachable BY CONSTRUCTION (the weak floor pins to
+        // 0.05, Tropo to 0.5, vanished bands to 0.0).
+        let mut bands: std::collections::BTreeSet<Band> = by_band.keys().copied().collect();
+        bands.extend(self.states.keys().copied());
+
+        let mut events = Vec::new();
+        for band in bands {
+            let sig = by_band.get(&band);
+            let raw_open = sig.map(|s| s.raw_open).unwrap_or(false);
+            let warm = sig.map(|s| s.warm).unwrap_or(false);
+            let mode = sig.map(|s| s.mode).unwrap_or(PropMode::Unknown);
+            let confidence = sig.map(|s| s.confidence).unwrap_or(0.0);
+            let features = sig
+                .map(|s| s.features.clone())
+                .unwrap_or_else(|| BandFeatures::empty(band));
+
+            let st = self.states.entry(band).or_insert(OpeningState {
+                open: false,
+                open_windows: 0,
+                closed_windows: 0,
+                onset_time: now,
+                onset_known: false,
+                mode,
+                peak_z: 0.0,
+                peak_km: 0.0,
+                peak_stations: 0,
+                peak_bearing_deg: 0.0,
+            });
+
+            // Update the consecutive-window counters.
+            if raw_open {
+                st.open_windows = st.open_windows.saturating_add(1);
+                st.closed_windows = 0;
+            } else if warm {
+                // Hold: neither opening nor closing.
+                st.closed_windows = 0;
+            } else {
+                st.closed_windows = st.closed_windows.saturating_add(1);
+                st.open_windows = 0;
+            }
+
+            let mut is_new = false;
+            if !st.open {
+                if in_grace && raw_open {
+                    // Seed a pre-existing opening silently (onset unknown).
+                    st.open = true;
+                    st.onset_time = now;
+                    st.onset_known = false;
+                    st.mode = mode;
+                    st.peak_z = 0.0;
+                    st.peak_km = 0.0;
+                    st.peak_stations = 0;
+                    st.peak_bearing_deg = 0.0;
+                } else if !in_grace && st.open_windows >= cfg.enter_windows {
+                    // Genuine in-session onset → alert once.
+                    st.open = true;
+                    st.onset_time = now;
+                    st.onset_known = true;
+                    st.mode = mode;
+                    st.peak_z = 0.0;
+                    st.peak_km = 0.0;
+                    st.peak_stations = 0;
+                    st.peak_bearing_deg = 0.0;
+                    is_new = true;
+                }
+            } else {
+                // Already open — close after the exit count AND min dwell, or once
+                // the hard max-dwell backstop is hit (so a perpetually-"warm" band
+                // can't pin the latch forever).
+                let age = now - st.onset_time;
+                let dwell_ok = age >= Self::min_dwell(st.mode);
+                let max_hit = age >= cfg.max_dwell_secs;
+                if (st.closed_windows >= cfg.exit_windows && dwell_ok) || max_hit {
+                    st.open = false;
+                    st.open_windows = 0;
+                    st.closed_windows = 0;
+                    // Journal the completed episode for the openings log.
+                    let ep = Self::episode_of(band, st, now);
+                    self.closed.push(ep);
+                }
+            }
+
+            if st.open {
+                // Track episode peaks (an honest "how good did it get" summary) and
+                // keep the latched mode current with the latest confident
+                // classification — the logged mode matches what the UI showed.
+                st.peak_z = st.peak_z.max(features.anomaly_z);
+                st.peak_stations = st
+                    .peak_stations
+                    .max((features.unique_far_rx + features.unique_far_tx) as u32);
+                if features.max_km > st.peak_km {
+                    st.peak_km = features.max_km;
+                    st.peak_bearing_deg = features.bearing_mean_deg;
+                }
+                if mode != PropMode::Unknown {
+                    st.mode = mode;
+                }
+            }
+
+            if st.open {
+                events.push(OpeningEvent {
+                    band,
+                    open: true,
+                    is_new,
+                    onset_secs: if st.onset_known {
+                        (now - st.onset_time).max(0)
+                    } else {
+                        0
+                    },
+                    mode: if mode == PropMode::Unknown {
+                        st.mode
+                    } else {
+                        mode
+                    },
+                    confidence,
+                    features,
+                });
+            }
+        }
+
+        events.sort_by(|a, b| {
+            b.confidence
+                .partial_cmp(&a.confidence)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                // Deterministic final tiebreak: higher band first, the better DX bet.
+                .then_with(|| b.band.cmp(&a.band))
+        });
+        events
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const NOW: i64 = 1_700_000_000;
+    const ME: &str = "KD9TAW";
+    const ME_GRID: &str = "EN52";
+
+    #[test]
+    fn vhf_gate_opens_on_few_stations_where_hf_would_not() {
+        // A modest real 6m Es burst: anomaly is up, and the operator has heard
+        // just 2 far stations (typical of a fresh opening). On 6m this must OPEN
+        // (loosened VHF gate); the identical evidence on 20m must NOT (HF needs 3
+        // tx / 5 rx). This is the fix for "I see 6m open but get no alert."
+        //
+        // The fixture sets `unique_far_short_dx` alongside the census count, i.e.
+        // both stations are genuinely ≥500 km — which is what "2 far stations" in
+        // the assertion below always meant. It used to set `unique_far_tx` alone;
+        // that field carries no distance, and relying on it here was the same
+        // blindness that let two groundwave decodes at 111/199 km open 6m (see
+        // `two_local_stations_do_not_open_six_metres` and `raw_open`).
+        let cfg = OpeningConfig::default();
+        let mut six = BandFeatures::empty(Band::B6);
+        six.anomaly_z = cfg.z_open + 1.0;
+        six.unique_far_tx = 2; // I heard 2 far stations on 6m…
+        six.unique_far_short_dx = 2; // …and "far" means ≥ vhf_short_km (500 km)
+        assert!(
+            six.raw_open(&cfg),
+            "6m should open on 2 far stations during an anomaly"
+        );
+
+        let mut twenty = BandFeatures::empty(Band::B20);
+        twenty.anomaly_z = cfg.z_open + 1.0;
+        twenty.unique_far_tx = 2; // same evidence on HF
+        twenty.unique_far_short_dx = 2;
+        assert!(
+            !twenty.raw_open(&cfg),
+            "20m must NOT open on only 2 far stations (HF needs the full gate)"
+        );
+    }
+
+    fn heard_me(far: &str, fg: &str, band: Band, dt: i64) -> PathSpot {
+        PathSpot {
+            time: NOW - dt,
+            tx_call: ME.into(),
+            tx_grid: Some(ME_GRID.into()),
+            rx_call: far.into(),
+            rx_grid: Some(fg.into()),
+            band,
+            mode: Some("FT8".into()),
+            snr: None,
+            freq_mhz: None,
+        }
+    }
+    fn i_heard(far: &str, fg: &str, band: Band, dt: i64) -> PathSpot {
+        PathSpot {
+            time: NOW - dt,
+            tx_call: far.into(),
+            tx_grid: Some(fg.into()),
+            rx_call: ME.into(),
+            rx_grid: Some(ME_GRID.into()),
+            band,
+            mode: Some("FT8".into()),
+            snr: None,
+            freq_mhz: None,
+        }
+    }
+
+    // ---- reciprocity -------------------------------------------------------
+    #[test]
+    fn reciprocity_is_operator_anchored_by_far_call() {
+        let spots = vec![
+            heard_me("DL1AAA", "JN58", Band::B20, 10), // DL1AAA heard me
+            i_heard("DL1AAA", "JN58", Band::B20, 12),  // I heard DL1AAA  → reciprocal
+            i_heard("DL2BBB", "JN58", Band::B20, 14),  // one-way only
+            heard_me("DL3CCC", "JN58", Band::B20, 16), // one-way only
+        ];
+        // Only DL1AAA is two-way.
+        assert_eq!(reciprocity(&spots, ME, NOW, 5400), 1);
+    }
+
+    #[test]
+    fn reciprocity_distinguishes_same_grid_stations() {
+        // Two stations in the SAME grid, each two-way → two reciprocal pairs.
+        let spots = vec![
+            heard_me("W1AAA", "FN42", Band::B6, 10),
+            i_heard("W1AAA", "FN42", Band::B6, 11),
+            heard_me("W1BBB", "FN42", Band::B6, 12),
+            i_heard("W1BBB", "FN42", Band::B6, 13),
+        ];
+        assert_eq!(reciprocity(&spots, ME, NOW, 5400), 2);
+    }
+
+    // ---- features ----------------------------------------------------------
+    #[test]
+    fn or_gate_fires_on_one_directional_opening() {
+        // Many stations hear ME, I hear none — a one-directional opening that an
+        // AND gate would miss. Cluster them in the most-recent bin for a spike.
+        let mut spots = Vec::new();
+        let grids = ["FN42", "FN31", "FM18", "EM73", "EL96", "FN20", "EN61"];
+        for (i, g) in grids.iter().enumerate() {
+            spots.push(heard_me(&format!("W{i}XX"), g, Band::B6, (i as i64) * 5));
+        }
+        let cfg = OpeningConfig::default();
+        let bs: Vec<&PathSpot> = spots.iter().collect();
+        let bf = band_features(Band::B6, &bs, ME, ME_GRID, NOW, &cfg);
+        assert_eq!(bf.unique_far_tx, 0, "I heard nobody");
+        assert!(bf.unique_far_rx >= cfg.min_far_rx, "many heard me");
+        assert!(
+            bf.unique_far_rx >= cfg.min_far_rx || bf.unique_far_tx >= cfg.min_far_tx,
+            "OR gate side satisfied"
+        );
+    }
+
+    #[test]
+    fn band_features_computes_snr_median_and_variance_from_payload() {
+        let cfg = OpeningConfig::default();
+        let snrs = [-20.0f32, -10.0, 0.0]; // sorted median -10; mean -10; pop var 66.67
+        let mut spots = Vec::new();
+        for (i, &snr) in snrs.iter().enumerate() {
+            let mut s = heard_me(&format!("W{i}SN"), "FN42", Band::B20, (i as i64) * 5);
+            s.snr = Some(snr);
+            spots.push(s);
+        }
+        let bs: Vec<&PathSpot> = spots.iter().collect();
+        let bf = band_features(Band::B20, &bs, ME, ME_GRID, NOW, &cfg);
+        assert_eq!(bf.median_snr, Some(-10.0));
+        let var = bf.snr_var.expect("variance present");
+        assert!(
+            (var - 66.667).abs() < 0.1,
+            "population variance ~66.67: {var}"
+        );
+    }
+
+    #[test]
+    fn band_features_leaves_snr_none_without_payload_snrs() {
+        let cfg = OpeningConfig::default();
+        let spots = [heard_me("W0XX", "FN42", Band::B20, 5)]; // snr None (topic-only)
+        let bs: Vec<&PathSpot> = spots.iter().collect();
+        let bf = band_features(Band::B20, &bs, ME, ME_GRID, NOW, &cfg);
+        assert_eq!(bf.median_snr, None);
+        assert_eq!(bf.snr_var, None);
+    }
+
+    #[test]
+    fn anomaly_z_spikes_on_a_burst_against_a_quiet_baseline() {
+        let cfg = OpeningConfig::default();
+        // Quiet baseline: a trickle spread across the older bins; then a burst in
+        // the most-recent 10 min.
+        let mut spots = Vec::new();
+        for k in 1..9 {
+            // one spot per older bin (~quiet)
+            spots.push(i_heard("W0BASE", "FN42", Band::B6, (k as i64) * 600 + 30));
+        }
+        for i in 0..20 {
+            spots.push(heard_me(
+                &format!("W{i}NOW"),
+                "FN42",
+                Band::B6,
+                (i as i64) * 5,
+            ));
+        }
+        let bs: Vec<&PathSpot> = spots.iter().collect();
+        let bf = band_features(Band::B6, &bs, ME, ME_GRID, NOW, &cfg);
+        assert!(
+            bf.anomaly_z >= cfg.z_open,
+            "burst z={} should exceed z_open",
+            bf.anomaly_z
+        );
+        assert!(bf.onset_slope > 0.0, "rising onset");
+    }
+
+    #[test]
+    fn skip_hole_detected_with_far_cluster_and_empty_inside() {
+        let cfg = OpeningConfig::default();
+        // Far grids ~1500 km, none inside the skip zone → a hole.
+        let far = ["FN42", "FM18", "EL96", "EM73", "FN20", "FM07"];
+        let spots: Vec<PathSpot> = far
+            .iter()
+            .enumerate()
+            .map(|(i, g)| heard_me(&format!("W{i}",), g, Band::B6, (i as i64) * 5))
+            .collect();
+        let bs: Vec<&PathSpot> = spots.iter().collect();
+        let bf = band_features(Band::B6, &bs, ME, ME_GRID, NOW, &cfg);
+        assert!(bf.min_km > cfg.d_near_km, "all far (min {})", bf.min_km);
+        assert!(bf.skip_hole, "should detect skip hole");
+    }
+
+    // ---- classifier --------------------------------------------------------
+    fn feats(band: Band) -> BandFeatures {
+        let mut f = BandFeatures::empty(band);
+        f.anomaly_z = 5.0;
+        f.cross_band_share = 0.8;
+        f.unique_far_rx = 8;
+        f.onset_slope = 1.0;
+        f
+    }
+
+    #[test]
+    fn classifies_sporadic_e_from_skip_hole() {
+        let cfg = OpeningConfig::default();
+        let mut f = feats(Band::B6);
+        f.median_km = 1500.0;
+        f.max_km = 1900.0;
+        f.skip_hole = true;
+        let calm = SpaceWx {
+            sfi: 95.0,
+            kp: 1.0,
+            ..Default::default()
+        };
+        let (mode, _, _) = classify(&f, Band::B6, &calm, &cfg);
+        assert_eq!(mode, PropMode::SporadicE);
+    }
+
+    #[test]
+    fn multi_hop_es_2nd_lobe_not_mislabeled_f2_under_high_sfi() {
+        let cfg = OpeningConfig::default();
+        let mut f = feats(Band::B6);
+        f.median_km = 3200.0; // 2nd-hop Es lobe
+        f.max_km = 4200.0;
+        f.skip_hole = true; // Es has a skip hole; F2 must not claim it
+        f.equator_crossing_frac = 0.0;
+        let high = SpaceWx {
+            sfi: 180.0,
+            kp: 2.0,
+            ..Default::default()
+        };
+        let (mode, _, _) = classify(&f, Band::B6, &high, &cfg);
+        assert_eq!(
+            mode,
+            PropMode::SporadicE,
+            "skip-hole must keep it Es, not F2"
+        );
+    }
+
+    #[test]
+    fn classifies_f2_tep_from_equator_crossing_geometry() {
+        let cfg = OpeningConfig::default();
+        let mut f = feats(Band::B6);
+        f.median_km = 5000.0;
+        f.max_km = 6000.0;
+        f.skip_hole = false;
+        f.equator_crossing_frac = 0.7; // crosses the geomagnetic equator
+        let high = SpaceWx {
+            sfi: 175.0,
+            kp: 2.0,
+            ..Default::default()
+        };
+        let (mode, _, _) = classify(&f, Band::B6, &high, &cfg);
+        assert_eq!(mode, PropMode::F2);
+    }
+
+    #[test]
+    fn classifies_aurora_from_kp_and_geomag_latitude() {
+        let cfg = OpeningConfig::default();
+        let mut f = feats(Band::B6);
+        f.median_km = 1400.0;
+        f.max_km = 1700.0;
+        f.auroral_frac = 0.8; // far ends in the auroral zone
+        let storm = SpaceWx {
+            sfi: 110.0,
+            kp: 7.0,
+            ..Default::default()
+        };
+        let (mode, _, _) = classify(&f, Band::B6, &storm, &cfg);
+        assert_eq!(mode, PropMode::Aurora);
+    }
+
+    #[test]
+    fn skip_hole_discriminates_es_from_aurora_during_a_storm() {
+        // A poleward 6m opening WITH a skip zone during Kp 7 is sporadic-E, not
+        // aurora — aurora is oval scatter and produces no skip hole. (The Phase-2
+        // SNR/decode-quality signature isn't available; geometry carries this.)
+        let cfg = OpeningConfig::default();
+        let mut f = feats(Band::B6);
+        f.median_km = 1400.0;
+        f.max_km = 1700.0;
+        f.auroral_frac = 0.8;
+        f.skip_hole = true; // the Es signature
+        let storm = SpaceWx {
+            sfi: 110.0,
+            kp: 7.0,
+            ..Default::default()
+        };
+        let (mode, _, _) = classify(&f, Band::B6, &storm, &cfg);
+        assert_ne!(
+            mode,
+            PropMode::Aurora,
+            "skip hole ⇒ not aurora, got {mode:?}"
+        );
+    }
+
+    #[test]
+    fn classifies_tropo_on_2m_capped_marginal() {
+        let cfg = OpeningConfig::default();
+        let mut f = feats(Band::B2);
+        f.median_km = 1100.0;
+        f.max_km = 1400.0;
+        f.skip_hole = false;
+        f.bearing_concentration = 0.8; // a corridor
+        let calm = SpaceWx {
+            sfi: 100.0,
+            kp: 1.0,
+            ..Default::default()
+        };
+        let (mode, geom, sw) = classify(&f, Band::B2, &calm, &cfg);
+        assert_eq!(mode, PropMode::Tropo);
+        let score = confidence_score(&f, mode, geom, sw, &cfg);
+        assert!(score <= 0.5, "tropo capped at Marginal: {score}");
+    }
+
+    #[test]
+    fn meteor_scatter_is_not_surfaced() {
+        // Short ground distance, low everything → not a sustained opening; the
+        // classifier returns Unknown (MS is intentionally dropped in v2) and the
+        // gate/tracker suppress it.
+        let cfg = OpeningConfig::default();
+        let mut f = feats(Band::B6);
+        f.median_km = 300.0;
+        f.max_km = 1000.0;
+        let calm = SpaceWx {
+            sfi: 100.0,
+            kp: 1.0,
+            ..Default::default()
+        };
+        let (mode, _, _) = classify(&f, Band::B6, &calm, &cfg);
+        assert_ne!(mode, PropMode::MeteorScatter);
+    }
+
+    // ---- tracker -----------------------------------------------------------
+    fn open_sig(band: Band, mode: PropMode) -> BandSignal {
+        let mut f = BandFeatures::empty(band);
+        f.anomaly_z = 6.0;
+        f.unique_far_rx = 8;
+        f.onset_slope = 1.0;
+        BandSignal {
+            band,
+            features: f,
+            mode,
+            confidence: 0.8,
+            raw_open: true,
+            warm: true,
+        }
+    }
+    fn closed_sig(band: Band) -> BandSignal {
+        let f = BandFeatures::empty(band);
+        BandSignal {
+            band,
+            features: f,
+            mode: PropMode::Unknown,
+            confidence: 0.0,
+            raw_open: false,
+            warm: false,
+        }
+    }
+
+    // The startup grace window = base_w (default 7200s); genuine in-session
+    // onsets must occur AFTER it to alert.
+    const GRACE: i64 = 7200;
+
+    #[test]
+    fn tracker_requires_sustained_windows_then_flags_new_once() {
+        let mut t = OpeningTracker::default();
+        // First update at NOW starts the grace clock; stay quiet through grace.
+        let e0 = t.update(NOW, &[closed_sig(Band::B6)]);
+        assert!(e0.is_empty());
+        t.update(NOW + GRACE / 2, &[closed_sig(Band::B6)]);
+        let g = NOW + GRACE; // past the grace window → genuine onsets alert
+                             // window 1 open (enter_windows=2 → not yet)
+        let e1 = t.update(g, &[open_sig(Band::B6, PropMode::SporadicE)]);
+        assert!(e1.is_empty(), "one window shouldn't open");
+        // window 2 open → opens, is_new once
+        let e2 = t.update(g + 600, &[open_sig(Band::B6, PropMode::SporadicE)]);
+        assert_eq!(e2.len(), 1);
+        assert!(e2[0].is_new, "genuine onset flags is_new");
+        // window 3 still open → is_new false now
+        let e3 = t.update(g + 1200, &[open_sig(Band::B6, PropMode::SporadicE)]);
+        assert_eq!(e3.len(), 1);
+        assert!(!e3[0].is_new, "no re-alert while still open");
+        assert!(e3[0].onset_secs >= 600);
+    }
+
+    #[test]
+    fn cold_start_seeds_open_band_without_alert() {
+        let mut t = OpeningTracker::default();
+        // The very first update sees an already-open band (within grace) → seeded
+        // open, no is_new, and onset reported as unknown (0).
+        let e = t.update(NOW, &[open_sig(Band::B6, PropMode::SporadicE)]);
+        assert_eq!(e.len(), 1, "still reported as open");
+        assert!(e[0].open);
+        assert!(
+            !e[0].is_new,
+            "cold-start must NOT alert for a pre-existing opening"
+        );
+        assert_eq!(e[0].onset_secs, 0, "seeded onset is unknown");
+    }
+
+    #[test]
+    fn onset_within_grace_does_not_alert() {
+        let mut t = OpeningTracker::default();
+        t.update(NOW, &[closed_sig(Band::B6)]);
+        // Two consecutive raw-open windows but still INSIDE the grace window →
+        // seeded silently, never is_new (avoids startup carpet-alerting).
+        t.update(NOW + 600, &[open_sig(Band::B6, PropMode::SporadicE)]);
+        let e = t.update(NOW + 1200, &[open_sig(Band::B6, PropMode::SporadicE)]);
+        assert!(e[0].open, "seeded open during grace");
+        assert!(!e[0].is_new, "no alert inside the grace window");
+    }
+
+    #[test]
+    fn tracker_closes_after_exit_windows_and_dwell() {
+        let mut t = OpeningTracker::default();
+        let g = NOW + GRACE;
+        t.update(NOW, &[closed_sig(Band::B6)]);
+        t.update(g, &[open_sig(Band::B6, PropMode::SporadicE)]);
+        let e = t.update(g + 600, &[open_sig(Band::B6, PropMode::SporadicE)]);
+        assert!(e[0].open && e[0].is_new);
+        // Now go cold for exit_windows(3) updates, past the Es min dwell (600s).
+        t.update(g + 1200, &[closed_sig(Band::B6)]);
+        t.update(g + 1800, &[closed_sig(Band::B6)]);
+        let e_end = t.update(g + 2400, &[closed_sig(Band::B6)]);
+        assert!(
+            e_end.is_empty(),
+            "should have closed after exit windows + dwell"
+        );
+    }
+
+    #[test]
+    fn open_band_vanishing_from_feed_still_closes() {
+        let mut t = OpeningTracker::default();
+        let g = NOW + GRACE;
+        t.update(NOW, &[closed_sig(Band::B6)]);
+        t.update(g, &[open_sig(Band::B6, PropMode::SporadicE)]);
+        t.update(g + 600, &[open_sig(Band::B6, PropMode::SporadicE)]);
+        // Band disappears entirely from later updates (no signal at all).
+        t.update(g + 1200, &[]);
+        t.update(g + 1800, &[]);
+        let e = t.update(g + 2400, &[]);
+        assert!(e.is_empty(), "vanished open band must age out to closed");
+    }
+
+    // ---- end-to-end detect -------------------------------------------------
+    #[test]
+    fn detect_flags_a_six_meter_burst_and_classifies() {
+        let cfg = OpeningConfig::default();
+        // Baseline trickle on 6m, then a wide burst (many far stations both ways).
+        let grids = [
+            "FN42", "FM18", "EL96", "EM73", "FN20", "FM07", "EN61", "FN31",
+        ];
+        let mut spots = Vec::new();
+        for k in 1..9 {
+            spots.push(i_heard("W0BASE", "FN42", Band::B6, (k as i64) * 600 + 30));
+        }
+        for (i, g) in grids.iter().enumerate() {
+            spots.push(heard_me(&format!("W{i}A"), g, Band::B6, (i as i64) * 6));
+            spots.push(i_heard(&format!("W{i}A"), g, Band::B6, (i as i64) * 6 + 2));
+        }
+        let calm = SpaceWx {
+            sfi: 100.0,
+            kp: 1.0,
+            ..Default::default()
+        };
+        let sigs = detect(&spots, ME, ME_GRID, NOW, &calm, &cfg, &[Band::B6, Band::B2]);
+        let six = sigs.iter().find(|s| s.band == Band::B6).unwrap();
+        assert!(
+            six.raw_open,
+            "6m burst should be raw_open (z={})",
+            six.features.anomaly_z
+        );
+        assert_eq!(six.mode, PropMode::SporadicE);
+        assert!(six.features.reciprocal_pairs >= 5, "two-way paths counted");
+        let two = sigs.iter().find(|s| s.band == Band::B2).unwrap();
+        assert!(!two.raw_open, "quiet 2m not open");
+    }
+
+    #[test]
+    fn cross_band_share_denominator_excludes_own_band_ihear_firehose() {
+        // The DENOMINATOR-dilution bug: a genuine single-band 6 m opening (the
+        // operator getting out to many far stations) is drowned in the cross-band
+        // share because a busy 20 m FT8 run floods the operator-centric feed with
+        // own-call IHeard decodes. The fix computes the share over getting-out
+        // (HeardMe) + far↔far evidence only, so the 6 m opening keeps a healthy
+        // share while the OLD (all-sides) denominator would dilute it below the 0.3
+        // regional gate.
+        let cfg = OpeningConfig::default();
+        let mut spots = Vec::new();
+        // 6 m: a real getting-out burst — 10 distinct far stations hear ME
+        // (HeardMe), all in the most-recent short window, empty 6 m baseline.
+        for i in 0..10 {
+            spots.push(heard_me(
+                &format!("W{i}SIX"),
+                "FN42",
+                Band::B6,
+                (i as i64) * 20,
+            ));
+        }
+        // 20 m: a busy own-band QSO run — the operator DECODES 40 stations (the
+        // IHeard receive-firehose, own-call traffic) and is heard back by only a few.
+        for i in 0..40 {
+            spots.push(i_heard(
+                &format!("D{i}TW"),
+                "JN58",
+                Band::B20,
+                (i as i64) * 10,
+            ));
+        }
+        for i in 0..4 {
+            spots.push(heard_me(
+                &format!("D{i}HM"),
+                "JN58",
+                Band::B20,
+                (i as i64) * 10,
+            ));
+        }
+        let calm = SpaceWx {
+            sfi: 100.0,
+            kp: 1.0,
+            ..Default::default()
+        };
+        let sigs = detect(
+            &spots,
+            ME,
+            ME_GRID,
+            NOW,
+            &calm,
+            &cfg,
+            &[Band::B20, Band::B6],
+        );
+        let six_sig = sigs.iter().find(|s| s.band == Band::B6).unwrap();
+        let six = &six_sig.features;
+        let twenty = &sigs.iter().find(|s| s.band == Band::B20).unwrap().features;
+
+        // OLD denominator (Σ rate_short over ALL sides) would dilute 6 m below the gate.
+        let old_share = six.rate_short / (six.rate_short + twenty.rate_short);
+        assert!(
+            old_share < 0.3,
+            "old all-sides share dilutes the 6 m opening: {old_share}"
+        );
+        // NEW denominator (getting-out + far↔far only): 6 m keeps a healthy share.
+        assert!(
+            six.cross_band_share >= 0.3,
+            "6 m share survives the own-band firehose post-fix: {}",
+            six.cross_band_share
+        );
+        assert!(six_sig.raw_open, "the genuine 6 m opening is still flagged");
+    }
+
+    #[test]
+    fn cross_band_share_still_diluted_by_a_uniform_multi_band_surge() {
+        // Contest / uniform-Es lift: equal getting-out on every band. The new
+        // (getting-out) denominator is still a RELATIVE share, so no single band
+        // clears the 0.3 regional cross-band gate — contest rejection is preserved.
+        let cfg = OpeningConfig::default();
+        let bands = [
+            Band::B20,
+            Band::B15,
+            Band::B12,
+            Band::B10,
+            Band::B6,
+            Band::B4,
+            Band::B2,
+        ];
+        let mut spots = Vec::new();
+        for &b in &bands {
+            for i in 0..8 {
+                spots.push(heard_me(&format!("W{i}X"), "FN42", b, (i as i64) * 20));
+            }
+        }
+        let calm = SpaceWx {
+            sfi: 100.0,
+            kp: 1.0,
+            ..Default::default()
+        };
+        let sigs = detect(&spots, ME, ME_GRID, NOW, &calm, &cfg, &bands);
+        for s in &sigs {
+            assert!(
+                s.features.cross_band_share < 0.3,
+                "{:?} share must stay diluted under a uniform surge: {}",
+                s.band,
+                s.features.cross_band_share
+            );
+        }
+    }
+
+    /// The regression that the prior single-window-slope gate would fail: a
+    /// SUSTAINED (plateauing) opening, driven through the REAL pipeline
+    /// (band_features → detect → classify_signal → tracker) across several polls,
+    /// must stay open and fire `is_new` exactly once.
+    #[test]
+    fn sustained_plateau_opening_via_real_pipeline_fires_is_new_once() {
+        let cfg = OpeningConfig::default();
+        let onset = NOW + GRACE; // genuine onset AFTER the grace window
+        let grids = [
+            "FN42", "FM18", "EL96", "EM73", "FN20", "FM07", "EN61", "FN31", "DM79", "EM73", "FN30",
+            "FM19",
+        ];
+        let mk = |far: &str, fg: &str, t: i64, me_tx: bool| PathSpot {
+            time: t,
+            tx_call: if me_tx { ME.into() } else { far.into() },
+            tx_grid: Some(if me_tx { ME_GRID.into() } else { fg.into() }),
+            rx_call: if me_tx { far.into() } else { ME.into() },
+            rx_grid: Some(if me_tx { fg.into() } else { ME_GRID.into() }),
+            band: Band::B6,
+            mode: Some("FT8".into()),
+            snr: None,
+            freq_mhz: None,
+        };
+        let mut spots = Vec::new();
+        // Quiet baseline: a trickle across the 2 h before onset.
+        let mut tb = NOW + 600;
+        while tb < onset {
+            spots.push(mk("W0BASE", "FN42", tb, false));
+            tb += 600;
+        }
+        // Sustained opening: a fresh batch of distinct stations (both ways) every
+        // ~3 min from onset onward — a steady high rate (a plateau, not a spike).
+        let mut to = onset;
+        while to <= onset + 2400 {
+            for (i, g) in grids.iter().enumerate() {
+                spots.push(mk(&format!("W{i}P"), g, to + (i as i64) * 5, false));
+                spots.push(mk(&format!("W{i}P"), g, to + (i as i64) * 5 + 2, true));
+            }
+            to += 180;
+        }
+        let wx = SpaceWx {
+            sfi: 100.0,
+            kp: 1.0,
+            ..Default::default()
+        };
+        let mut t = OpeningTracker::new(cfg.clone());
+        // Start the grace clock at NOW (quiet).
+        t.update(
+            NOW,
+            &detect(&spots, ME, ME_GRID, NOW, &wx, &cfg, &[Band::B6]),
+        );
+
+        let mut new_count = 0;
+        let mut last_open = false;
+        for p in [onset + 600, onset + 1200, onset + 1800, onset + 2400] {
+            let sigs = detect(&spots, ME, ME_GRID, p, &wx, &cfg, &[Band::B6]);
+            let six = sigs.iter().find(|s| s.band == Band::B6).unwrap();
+            assert!(
+                six.raw_open,
+                "plateau must stay raw_open at poll {p} (z={})",
+                six.features.anomaly_z
+            );
+            let evs = t.update(p, &sigs);
+            if let Some(e) = evs.iter().find(|e| e.band == Band::B6) {
+                last_open = e.open;
+                if e.is_new {
+                    new_count += 1;
+                }
+            }
+        }
+        assert!(
+            last_open,
+            "sustained opening should still be open after 40 min"
+        );
+        assert_eq!(new_count, 1, "is_new must fire exactly once for the onset");
+    }
+
+    // ---- Phase 2: near-region generalization -------------------------------
+    fn far_far(tx: &str, txg: &str, rx: &str, rxg: &str, band: Band, dt: i64) -> PathSpot {
+        PathSpot {
+            time: NOW - dt,
+            tx_call: tx.into(),
+            tx_grid: Some(txg.into()),
+            rx_call: rx.into(),
+            rx_grid: Some(rxg.into()),
+            band,
+            mode: Some("FT8".into()),
+            snr: None,
+            freq_mhz: None,
+        }
+    }
+
+    #[test]
+    fn reciprocity_regional_counts_far_far_pairs() {
+        // A<->B both ways, NEITHER is the operator → 1 regional pair; the
+        // operator-anchored reciprocity sees none.
+        let spots = vec![
+            far_far("DL1AAA", "JN58", "G3XYZ", "IO91", Band::B6, 10),
+            far_far("G3XYZ", "IO91", "DL1AAA", "JN58", Band::B6, 12), // reciprocal
+            far_far("F5ABC", "JN12", "DL1AAA", "JN58", Band::B6, 14), // one-way only
+        ];
+        assert_eq!(reciprocity_regional(&spots, NOW, 7200), 1);
+        assert_eq!(reciprocity(&spots, ME, NOW, 7200), 0);
+    }
+
+    #[test]
+    fn band_features_counts_neither_into_census_and_far_geometry() {
+        let cfg = OpeningConfig::default();
+        let grids = ["FN42", "EM12", "FM18", "DM79", "EN90", "FM07"];
+        let spots: Vec<PathSpot> = grids
+            .iter()
+            .enumerate()
+            .map(|(i, g)| {
+                far_far(
+                    &format!("A{i}"),
+                    g,
+                    &format!("B{i}"),
+                    "FN31",
+                    Band::B6,
+                    (i as i64) * 5,
+                )
+            })
+            .collect();
+        let bs: Vec<&PathSpot> = spots.iter().collect();
+        let bf = band_features(Band::B6, &bs, ME, ME_GRID, NOW, &cfg);
+        assert_eq!(bf.unique_far_rx, 0);
+        assert_eq!(bf.unique_far_tx, 0, "no operator-side spots");
+        assert!(bf.unique_stations >= 6, "regional census counts both ends");
+        assert!(
+            bf.min_km > cfg.d_near_km,
+            "single farther endpoint folded; none near"
+        );
+        assert!(bf.skip_hole, "a near-region Es burst drives skip_hole");
+        assert!(
+            (640.0..=4500.0).contains(&bf.median_km),
+            "Es-window distance"
+        );
+    }
+
+    #[test]
+    fn neither_single_far_endpoint_does_not_suppress_skip_hole() {
+        // Each Neither spot has a NEAR end (EN61 ~200 km) + a FAR end. Folding only
+        // the FARTHER end means the near end never fills the sub-d_near bucket, so
+        // skip_hole stays true (the bug a dual-endpoint fold would cause).
+        let cfg = OpeningConfig::default();
+        let far = ["FN42", "EM12", "FM18", "DM79", "EN90", "FM07"];
+        let spots: Vec<PathSpot> = far
+            .iter()
+            .enumerate()
+            .map(|(i, g)| {
+                far_far(
+                    &format!("N{i}"),
+                    "EN61",
+                    &format!("F{i}"),
+                    g,
+                    Band::B6,
+                    (i as i64) * 5,
+                )
+            })
+            .collect();
+        let bs: Vec<&PathSpot> = spots.iter().collect();
+        let bf = band_features(Band::B6, &bs, ME, ME_GRID, NOW, &cfg);
+        assert!(bf.skip_hole, "near end must not be folded");
+        assert!(
+            bf.min_km > cfg.d_near_km,
+            "no near sample despite a near end present"
+        );
+    }
+
+    #[test]
+    fn regional_gate_is_multi_condition_and_opt_in() {
+        let mut cfg = OpeningConfig::default();
+        let mut f = BandFeatures::empty(Band::B6);
+        f.anomaly_z = 6.0;
+        f.unique_stations = 15;
+        f.unique_near_rx = 4; // a real collection of local endpoints
+        f.reciprocal_pairs_regional = 4;
+        f.cross_band_share = 0.7;
+        // …and the surge reaches past 500 km, which the VHF regional gate now requires.
+        f.unique_far_short_dx = 1;
+        // v1 default (regional_scope off): regional spots can't open (no op far counts).
+        assert!(
+            !f.raw_open(&cfg),
+            "regional spots don't open under the v1 default"
+        );
+        cfg.regional_scope = true;
+        assert!(f.raw_open(&cfg), "opens with the regional gate enabled");
+        // ONE ≥500 km path is the VHF distance term, and it is a REQUIREMENT: the
+        // four census conditions alone describe a busy evening of local 6 m FT8
+        // among a dozen neighbours just as well as they describe an Es opening.
+        let mut all_local = f.clone();
+        all_local.unique_far_short_dx = 0;
+        assert!(
+            !all_local.raw_open(&cfg),
+            "a regional surge with no path past 500 km is not an opening"
+        );
+        // Either anchor satisfies it — including the receive-only one, where the
+        // operator is parked on another band and a near ear is copying the path. The
+        // near-ear anchor is read at the SHORT floor here (500 km, single-hop Es on
+        // 6 m), not at the sentinel's 700 km: this gate has four censuses behind it,
+        // `regional_dx_gate` has nothing behind it.
+        let mut near_ear = all_local.clone();
+        near_ear.unique_near_short_dx_rx = 1;
+        assert!(near_ear.raw_open(&cfg));
+        // …and a near ear at 700 km+ is in that set too, since it is a superset.
+        let mut near_dx_ear = all_local.clone();
+        near_dx_ear.unique_near_dx_rx = 1;
+        near_dx_ear.unique_near_short_dx_rx = 1;
+        assert!(near_dx_ear.raw_open(&cfg));
+        // ONE ear at 700 km with no short-floor accounting is not representable — the
+        // sets are computed together — but a lone 700 km ear must still not open the
+        // band through `regional_dx_gate`, which needs two.
+        let mut one_dx_ear = BandFeatures::empty(Band::B6);
+        one_dx_ear.anomaly_z = 6.0;
+        one_dx_ear.unique_near_dx_rx = 1;
+        one_dx_ear.unique_near_short_dx_rx = 1;
+        assert!(
+            !one_dx_ear.raw_open(&cfg),
+            "one ear alone, with no census behind it, is a superstation risk"
+        );
+        // HF is untouched: an F2 census's paths are continent-scale by construction,
+        // so the same distance-free surge still opens 20 m.
+        let mut hf = BandFeatures::empty(Band::B20);
+        hf.anomaly_z = 6.0;
+        hf.unique_stations = 15;
+        hf.unique_near_rx = 4;
+        hf.reciprocal_pairs_regional = 4;
+        hf.cross_band_share = 0.7;
+        assert!(
+            hf.raw_open(&cfg),
+            "the VHF distance term must not reach the HF census"
+        );
+        // One loud station heard by many: many stations, but no two-way pairs.
+        let mut one_loud = f.clone();
+        one_loud.reciprocal_pairs_regional = 0;
+        assert!(
+            !one_loud.raw_open(&cfg),
+            "one-way (no reciprocity) must not open"
+        );
+        // Contest: every band up → low cross-band share.
+        let mut contest = f.clone();
+        contest.cross_band_share = 0.1;
+        assert!(
+            !contest.raw_open(&cfg),
+            "uniform multi-band surge must not open"
+        );
+        // SUPERSTATION: one tall-tower receiver hearing 14 DX — plenty of
+        // "stations", but a single local endpoint. Must NOT open.
+        let mut superstation = f.clone();
+        superstation.unique_near_rx = 1;
+        assert!(
+            !superstation.raw_open(&cfg),
+            "one big local receiver must not fabricate a regional opening"
+        );
+    }
+
+    #[test]
+    fn a_single_distant_vhf_station_opens_the_band() {
+        let cfg = OpeningConfig::default();
+        // 2m with a real anomaly and ONE operator-anchored DX station (path ≥ 700 km):
+        // opens, even though the 6m-tuned multi-station bar is unmet. The fix for
+        // missed single-station 2m tropo/Es/aurora openings.
+        let mut dx = BandFeatures::empty(Band::B2);
+        dx.anomaly_z = 6.0;
+        dx.unique_far_dx = 1;
+        assert!(
+            dx.raw_open(&cfg),
+            "one genuine-DX 2m station opens the band"
+        );
+
+        // A single NON-DX station (local / routine troposcatter, no far_dx) below the
+        // multi-station bar stays closed — distance is what makes it an opening.
+        let mut local = BandFeatures::empty(Band::B2);
+        local.anomaly_z = 6.0;
+        local.unique_far_tx = 1; // heard one station, but not beyond vhf_dx_km
+        assert!(
+            !local.raw_open(&cfg),
+            "a single near/scatter 2m station must NOT open the band"
+        );
+
+        // A DX-distance station with NO anomaly (routine scatter is baseline) → closed.
+        let mut quiet = BandFeatures::empty(Band::B2);
+        quiet.anomaly_z = 0.0;
+        quiet.unique_far_dx = 1;
+        assert!(
+            !quiet.raw_open(&cfg),
+            "a DX-distance station with no anomaly must NOT open"
+        );
+
+        // The single-DX-station path is VHF-only: on HF one distant station is routine.
+        let mut hf = BandFeatures::empty(Band::B20);
+        hf.anomaly_z = 6.0;
+        hf.unique_far_dx = 1;
+        assert!(!hf.raw_open(&cfg), "the single-DX-station path is VHF-only");
+    }
+
+    #[test]
+    fn two_short_lift_stations_open_but_one_does_not() {
+        let cfg = OpeningConfig::default();
+        // ONE station at 500–700 km is within a strong station's routine scatter —
+        // must NOT open (the false-positive the operator wants avoided).
+        let mut one = BandFeatures::empty(Band::B2);
+        one.anomaly_z = 6.0;
+        one.unique_far_short_dx = 1;
+        one.unique_far_tx = 1;
+        assert!(
+            !one.raw_open(&cfg),
+            "a single 500–700 km station is ambiguous"
+        );
+        // TWO distinct stations ≥500 km at once + the anomaly = a corroborated
+        // short tropo lift → open (the quick-lift catch).
+        let mut two = one.clone();
+        two.unique_far_short_dx = 2;
+        two.unique_far_tx = 2;
+        assert!(
+            two.raw_open(&cfg),
+            "two corroborating short-lift stations open"
+        );
+    }
+
+    // ---- 6 m false-alert regressions ---------------------------------------
+    //
+    // REGRESSION (operator 2026-08-05): "the 6m opening detection is too liberal…
+    // In a large opening it's working great, but it's misfiring on openings where
+    // I tune and hear nothing. True openings only."
+    //
+    // Each of the three below reproduces one admitted-on-nothing case end-to-end
+    // through the REAL feature path (`band_features` → `raw_open`), not by poking
+    // fields — the fields were exactly what hid these. Every distance is the true
+    // great-circle from EN52 (`grid_distance_km`), quoted inline. The fourth test
+    // is the true positive all three fixes must leave untouched.
+
+    /// The simplest misfire: two stations decoded on 6 m at 111 km and 199 km.
+    /// That is groundwave/local tropo, on a band that is doing nothing.
+    ///
+    /// It got in through `unique_far_tx >= 2` — a rung with **no distance term at
+    /// all** (`far_tx` collects every station the operator heard, near or far), so
+    /// on 6 m "I heard two stations" was the whole test. The anomaly gate stopped
+    /// nothing: with `sigma_floor` 0.05 spots/min a dead band's baseline is
+    /// median 0 / MAD 0, so z = 2 × (spots in the last 10 min) and those same two
+    /// spots put z at exactly 4.0 = `z_open`.
+    #[test]
+    fn two_local_stations_do_not_open_six_metres() {
+        let cfg = OpeningConfig::default();
+        let spots = [
+            i_heard("W9AAA", "EN53", Band::B6, 60), // 111 km
+            i_heard("W9BBB", "EN61", Band::B6, 30), // 199 km
+        ];
+        let bs: Vec<&PathSpot> = spots.iter().collect();
+        let bf = band_features(Band::B6, &bs, ME, ME_GRID, NOW, &cfg);
+        assert!(
+            bf.anomaly_z >= cfg.z_open,
+            "two spots on a dead band already clear z_open (z={}) — the anomaly \
+             gate is not what holds this line",
+            bf.anomaly_z
+        );
+        assert!(
+            !bf.raw_open(&cfg),
+            "111 km + 199 km is groundwave, not a 6 m opening"
+        );
+    }
+
+    /// Stale but REAL DX: three distinct stations at 820–1316 km, decoded 90
+    /// minutes ago and gone since, plus two fresh local decodes to supply the
+    /// rate anomaly. The band is dead NOW — this is the operator tuning across
+    /// silence while the alert is up.
+    ///
+    /// It got in because `band_features` counts the operator-anchored station
+    /// sets over the whole `base_w` (2 h) window while `anomaly_z` looks only at
+    /// the last `short_w` (10 min): the gate's two halves were reading different
+    /// clocks, so an hour-and-a-half-old roster satisfied the DX rung forever.
+    #[test]
+    fn stale_dx_evidence_does_not_open_six_metres() {
+        let cfg = OpeningConfig::default();
+        let spots = [
+            i_heard("W5DDD", "EM12", Band::B6, 5400), // 1316 km, 90 min ago
+            i_heard("N4EEE", "EM74", Band::B6, 5460), //  955 km, 91 min ago
+            i_heard("VE3FFF", "FN03", Band::B6, 5520), //  820 km, 92 min ago
+            i_heard("W9AAA", "EN53", Band::B6, 60),   //  111 km, now
+            i_heard("W9BBB", "EN61", Band::B6, 30),   //  199 km, now
+        ];
+        let bs: Vec<&PathSpot> = spots.iter().collect();
+        let bf = band_features(Band::B6, &bs, ME, ME_GRID, NOW, &cfg);
+        assert!(
+            bf.anomaly_z >= cfg.z_open,
+            "the two fresh locals still spike z"
+        );
+        assert!(
+            !bf.raw_open(&cfg),
+            "DX heard 90 minutes ago is not evidence the band is open now"
+        );
+    }
+
+    /// One station, three pings inside two minutes at 1316 km — a meteor burst.
+    /// The operator ruled that out of scope by name ("true openings only"), and
+    /// the classifier already refuses to surface meteor scatter as a *mode*; the
+    /// gate was opening the band under it anyway via `unique_far_dx >= 1`.
+    ///
+    /// That rung was researched for **2 m**, where routine troposcatter tops out
+    /// ~500–700 km so a single ≥700 km path is unambiguous. On **6 m** the same
+    /// distance is the middle of the meteor- and aircraft-scatter regime. The 2 m
+    /// behaviour is asserted here too, so tightening 6 m cannot silently take it.
+    #[test]
+    fn one_meteor_scatter_station_does_not_open_six_metres() {
+        let cfg = OpeningConfig::default();
+        let spots = [
+            i_heard("W5DDD", "EM12", Band::B6, 20), // 1316 km
+            i_heard("W5DDD", "EM12", Band::B6, 70),
+            i_heard("W5DDD", "EM12", Band::B6, 130),
+        ];
+        let bs: Vec<&PathSpot> = spots.iter().collect();
+        let six = band_features(Band::B6, &bs, ME, ME_GRID, NOW, &cfg);
+        assert_eq!(six.unique_far_dx, 1, "one distinct station, three pings");
+        assert!(
+            !six.raw_open(&cfg),
+            "a single 6 m station at meteor-scatter distance is not an opening"
+        );
+
+        // …and the SAME evidence on 2 m still opens: one ≥700 km path there is
+        // genuine tropo/Es enhancement with no common single-station mechanism
+        // above it (`a_single_distant_vhf_station_opens_the_band`).
+        let two_m: Vec<PathSpot> = spots
+            .iter()
+            .map(|s| PathSpot {
+                band: Band::B2,
+                ..s.clone()
+            })
+            .collect();
+        let bs2: Vec<&PathSpot> = two_m.iter().collect();
+        let two = band_features(Band::B2, &bs2, ME, ME_GRID, NOW, &cfg);
+        assert!(
+            two.raw_open(&cfg),
+            "2 m keeps its single-DX-station rung — the 6 m tightening is 6 m only"
+        );
+    }
+
+    /// THE TRUE POSITIVE. A real 6 m Es opening: fourteen distinct stations both
+    /// directions, 674–2163 km, all inside ten minutes. This is what "in a large
+    /// opening it's working great" means, and no tightening above may cost it.
+    ///
+    /// The margins are the whole point of choosing the numbers that were chosen —
+    /// real Es on 6 m does not arrive as one station, it arrives as a wall.
+    #[test]
+    fn a_real_six_metre_es_opening_still_opens() {
+        let cfg = OpeningConfig::default();
+        // 674–2163 km from EN52, every one past `vhf_short_km` (500).
+        let grids = [
+            "EM28", "EN90", "FN03", "EM85", "EM74", "EM63", "FM18", "FN20", "FM29", "EM12", "FN31",
+            "DN70", "FN42", "DM43",
+        ];
+        let mut spots = Vec::new();
+        for (i, g) in grids.iter().enumerate() {
+            let dt = (i as i64) * 20; // all inside the 10-minute short window
+            spots.push(i_heard(&format!("W{i}ES"), g, Band::B6, dt));
+            spots.push(heard_me(&format!("W{i}ES"), g, Band::B6, dt + 5));
+        }
+        let bs: Vec<&PathSpot> = spots.iter().collect();
+        let bf = band_features(Band::B6, &bs, ME, ME_GRID, NOW, &cfg);
+        assert!(bf.raw_open(&cfg), "a real 6 m Es opening must still open");
+        // The margins, so a future tightening can see what it would be spending.
+        assert!(bf.anomaly_z >= 8.0 * cfg.z_open, "z={}", bf.anomaly_z);
+        assert!(bf.unique_far_dx >= 12, "far_dx={}", bf.unique_far_dx);
+        assert!(bf.unique_far_short_dx >= 13, "{}", bf.unique_far_short_dx);
+    }
+
+    /// THE TRUE POSITIVE for the regional gate's VHF distance term: a genuine
+    /// SHORT-SKIP Es opening must still open the band, and a purely local surge — the
+    /// thing that reads identically to every one of the four census conditions — must
+    /// not.
+    ///
+    /// **Both halves go through `detect` → `raw_open`, the real gate.** The version
+    /// this replaces asserted a feature COUNT and never called the gate at all, and
+    /// that is why it could not see the defect it was written to guard: measured on its
+    /// own fixture (`near_dx_rx=3`, `far_short_dx=0`, `stations=9`, `recip=0`),
+    /// `regional_dx_gate` opened the band regardless and `regional_gate` could not fire
+    /// under any config, so the assertion distinguished nothing.
+    ///
+    /// The fixture is chosen so the regional gate's distance term is the ONLY thing
+    /// that can decide the outcome, and the test measures that rather than assuming it:
+    /// every spot is far↔far (so `op_gate` has no operator-anchored evidence at all)
+    /// and every path is under `vhf_dx_km` (so `regional_dx_gate`'s 700 km sentinel
+    /// cannot fire either).
+    ///
+    /// Geometry is real great-circle from EN52 (`grid_distance_km`), quoted inline.
+    #[test]
+    fn a_real_regional_es_burst_earns_the_vhf_distance_term_a_local_one_does_not() {
+        let cfg = OpeningConfig {
+            regional_scope: true, // the PSK Reporter near-region feed is flowing
+            ..Default::default()
+        };
+        let calm = SpaceWx {
+            sfi: 100.0,
+            kp: 1.0,
+            ..Default::default()
+        };
+        // Three distinct ears near EN52 — EN61 199 km, EN50 222 km, EM59 334 km — each
+        // copying four transmitters whose path to that ear is 540-583 km. That is
+        // single-hop sporadic-E on 6 m: below `vhf_short_km` (500) it would be
+        // ground/tropo scatter, and single-hop runs to `vhf_max_terrestrial_km` (2400)
+        // at the far end, so this sits at the SHORT end of a real Es opening. It is
+        // exactly what a 6 m operator wants an alert for, and the 700 km near-ear
+        // anchor could not see it.
+        let ears = ["EN61", "EN50", "EM59"];
+        let es_paths: [(&str, usize); 12] = [
+            ("EM39", 0), // 554 km to EN61
+            ("EN33", 0), // 540
+            ("EN45", 0), // 549
+            ("EM66", 0), // 556
+            ("EM45", 1), // 583 km to EN50
+            ("EM55", 1), // 556
+            ("EM65", 1), // 583
+            ("EM76", 1), // 565
+            ("EM54", 2), // 556 km to EM59
+            ("EM75", 2), // 568
+            ("EM87", 2), // 567
+            ("EN21", 2), // 554
+        ];
+        let mut es = Vec::new();
+        for (i, (fg, ear)) in es_paths.iter().enumerate() {
+            es.push(far_far(
+                &format!("W{i}DX"),
+                fg,
+                &format!("N{ear}RX"),
+                ears[*ear],
+                Band::B6,
+                (i as i64) * 20,
+            ));
+        }
+        // Two of those paths are worked BOTH ways — the regional two-way pairs the
+        // gate demands (`min_regional_reciprocal` = 2).
+        es.push(far_far("N0RX", ears[0], "W0DX", "EM39", Band::B6, 260));
+        es.push(far_far("N1RX", ears[1], "W4DX", "EM45", Band::B6, 280));
+
+        let sigs = detect(&es, ME, ME_GRID, NOW, &calm, &cfg, &[Band::B6]);
+        let six = sigs.iter().find(|s| s.band == Band::B6).unwrap();
+        let f = &six.features;
+        // WHICH gate is under test — measured, not assumed.
+        assert_eq!(f.unique_far_dx, 0, "no operator-anchored evidence at all");
+        assert_eq!(f.unique_far_short_dx, 0);
+        assert_eq!(
+            f.unique_near_dx_rx, 0,
+            "every path is under 700 km, so the receive-only sentinel cannot fire"
+        );
+        // …and the four census conditions the regional gate also demands are met, so a
+        // refusal here could only come from the distance term.
+        assert!(f.anomaly_z >= cfg.z_open, "z={}", f.anomaly_z);
+        assert!(f.unique_stations >= cfg.min_regional_stations);
+        assert!(f.unique_near_rx >= cfg.min_regional_near_rx);
+        assert!(f.reciprocal_pairs_regional >= cfg.min_regional_reciprocal);
+        assert!(f.cross_band_share >= cfg.min_regional_cross_band_share);
+        assert!(
+            f.unique_near_short_dx_rx >= 1,
+            "the 500 km near-ear anchor is what a short-skip Es burst earns: {}",
+            f.unique_near_short_dx_rx
+        );
+        assert!(
+            six.raw_open,
+            "a 540-583 km Es opening through three near ears must OPEN the band"
+        );
+        // …and the distance term is genuinely load-bearing on this fixture: strip the
+        // one anchor it can reach and the same evidence closes. (Without this, a fixture
+        // that opened for some other reason would still pass the assertion above.)
+        let mut no_anchor = f.clone();
+        no_anchor.unique_near_short_dx_rx = 0;
+        assert!(
+            !no_anchor.raw_open(&cfg),
+            "the distance term, not another rung, is what admitted this"
+        );
+
+        // The same shape of traffic, entirely local: a busy 6 m FT8 evening among
+        // neighbours. Every census condition the regional gate asks about looks the
+        // same — same three ears, same station count, same two-way pairs, same
+        // band-specificity, same anomaly — and every path is under 500 km.
+        let local_paths: [(&str, usize); 12] = [
+            ("EN53", 0), // 276 km to EN61
+            ("EN62", 0), // 111
+            ("EN51", 0), // 167
+            ("EN60", 0), // 111
+            ("EM58", 1), // 222 km to EN50
+            ("EM69", 1), // 203
+            ("EN42", 1), // 278
+            ("EN43", 1), // 372
+            ("EN63", 2), // 475 km to EM59
+            ("EN71", 2), // 405
+            ("EM49", 2), // 172
+            ("EM48", 2), // 206
+        ];
+        let mut local = Vec::new();
+        for (i, (fg, ear)) in local_paths.iter().enumerate() {
+            local.push(far_far(
+                &format!("W{i}LOC"),
+                fg,
+                &format!("N{ear}RX"),
+                ears[*ear],
+                Band::B6,
+                (i as i64) * 20,
+            ));
+        }
+        local.push(far_far("N0RX", ears[0], "W0LOC", "EN53", Band::B6, 260));
+        local.push(far_far("N1RX", ears[1], "W4LOC", "EM58", Band::B6, 280));
+
+        let sigs = detect(&local, ME, ME_GRID, NOW, &calm, &cfg, &[Band::B6]);
+        let six = sigs.iter().find(|s| s.band == Band::B6).unwrap();
+        let f = &six.features;
+        // The censuses are indistinguishable from the Es burst's…
+        assert!(f.anomaly_z >= cfg.z_open);
+        assert!(f.unique_stations >= cfg.min_regional_stations);
+        assert!(f.unique_near_rx >= cfg.min_regional_near_rx);
+        assert!(f.reciprocal_pairs_regional >= cfg.min_regional_reciprocal);
+        assert!(f.cross_band_share >= cfg.min_regional_cross_band_share);
+        // …and only the distance is not.
+        assert_eq!(f.unique_near_dx_rx, 0, "no DX-length path anywhere");
+        assert_eq!(f.unique_near_short_dx_rx, 0, "…nor any 500 km one");
+        assert_eq!(f.unique_far_short_dx, 0, "…and none operator-anchored");
+        assert!(
+            !six.raw_open,
+            "a surge that never left the neighbourhood is not an opening"
+        );
+    }
+
+    /// REGRESSION (2026-08-05, the same day's own fix): confining the VHF gate's
+    /// evidence to the last ten minutes must not shrink the DISPLAY census.
+    ///
+    /// `far_rx`/`far_tx` are what `project_opening` shows and what the openings
+    /// journal records as `peak_stations` — and on VHF `op_gate` never reads them, it
+    /// takes the distance branch. Confining them therefore bought the gate nothing
+    /// and made a 40-minute Es episode journal about a quarter of the stations it had
+    /// journalled, which is exactly the instrument the operator was offered for
+    /// checking this work.
+    #[test]
+    fn the_vhf_freshness_window_narrows_the_gate_not_the_display_census() {
+        let cfg = OpeningConfig::default();
+        // A 40-minute 6 m episode: twelve distinct stations, of which only the last
+        // two fall inside the 10-minute gate window.
+        let grids = [
+            "FN42", "FM18", "DM43", "EM12", "FN31", "DN70", "EM28", "EN90", "FN03", "EM85", "EM74",
+            "EM63",
+        ];
+        let spots: Vec<PathSpot> = grids
+            .iter()
+            .enumerate()
+            .map(|(i, g)| i_heard(&format!("W{i}ES"), g, Band::B6, 2400 - (i as i64) * 200))
+            .collect();
+        let bs: Vec<&PathSpot> = spots.iter().collect();
+        let bf = band_features(Band::B6, &bs, ME, ME_GRID, NOW, &cfg);
+        assert_eq!(
+            bf.unique_far_tx,
+            grids.len(),
+            "the display census counts the whole window"
+        );
+        // …while the gate's own rungs see only what is live now (measured: 2 of 12).
+        assert_eq!(
+            bf.unique_far_dx, 2,
+            "the DX rung stays confined to the short window"
+        );
+        assert_eq!(bf.unique_far_short_dx, 2);
+        // HF reads far_tx as a GATE input, and there nothing is confined at all.
+        let hf: Vec<PathSpot> = grids
+            .iter()
+            .enumerate()
+            .map(|(i, g)| i_heard(&format!("W{i}F2"), g, Band::B20, 2400 - (i as i64) * 200))
+            .collect();
+        let bs: Vec<&PathSpot> = hf.iter().collect();
+        let bf = band_features(Band::B20, &bs, ME, ME_GRID, NOW, &cfg);
+        assert_eq!(bf.unique_far_tx, grids.len());
+    }
+
+    #[test]
+    fn neighbor_ears_open_a_vhf_band_without_operator_participation() {
+        let mut cfg = OpeningConfig {
+            regional_scope: true, // the PSKR near-region feed is flowing
+            ..Default::default()
+        };
+        // The operator is parked on another band: NO operator-anchored evidence at
+        // all — but two distinct local receivers each copy a ≥700 km 2m path. (A
+        // ≥700 km path is ≥500 km too, so the short set carries them as well; the
+        // fields are set together because `band_features` computes them together.)
+        let mut ears = BandFeatures::empty(Band::B2);
+        ears.anomaly_z = 6.0;
+        ears.unique_near_dx_rx = 2;
+        ears.unique_near_short_dx_rx = 2;
+        assert!(
+            ears.raw_open(&cfg),
+            "two neighbor ears open the band receive-only"
+        );
+        // One ear alone = possibly a superstation — must NOT open. Note this is the
+        // ONLY place the near-ear count carries the anti-superstation rule by itself:
+        // the regional gate's distance term needs one such ear, because there three
+        // distinct local ears (`min_regional_near_rx`) plus two-way pairs and
+        // band-specificity have already established the region.
+        let mut one_ear = ears.clone();
+        one_ear.unique_near_dx_rx = 1;
+        one_ear.unique_near_short_dx_rx = 1;
+        assert!(!one_ear.raw_open(&cfg), "a single local ear must not open");
+        // Without the regional feed the sentinel stays off (no trustworthy far↔far
+        // receive reports) — HF unaffected regardless.
+        let mut no_feed = ears.clone();
+        assert!(no_feed.raw_open(&cfg));
+        cfg.regional_scope = false;
+        no_feed.anomaly_z = 6.0;
+        assert!(
+            !no_feed.raw_open(&cfg),
+            "sentinel requires the regional feed"
+        );
+    }
+
+    /// Helper: a raw-open BandSignal with the given peaks (tracker unit input).
+    fn open_sig_peaks(band: Band, mode: PropMode, z: f32, max_km: f64, far: usize) -> BandSignal {
+        let mut f = BandFeatures::empty(band);
+        f.anomaly_z = z;
+        f.max_km = max_km;
+        f.bearing_mean_deg = 45.0;
+        f.unique_far_tx = far;
+        BandSignal {
+            band,
+            features: f,
+            mode,
+            confidence: 0.8,
+            raw_open: true,
+            warm: false,
+        }
+    }
+
+    #[test]
+    fn tracker_journals_a_closed_episode_with_peaks() {
+        let cfg = OpeningConfig::default();
+        let mut tr = OpeningTracker::new(cfg);
+        // Arm the grace clock, then jump past it so the onset is genuine.
+        tr.update(0, &[]);
+        tr.update(
+            8_000,
+            &[open_sig_peaks(Band::B2, PropMode::Tropo, 5.0, 900.0, 1)],
+        );
+        let evs = tr.update(
+            8_600,
+            &[open_sig_peaks(Band::B2, PropMode::Tropo, 6.0, 1200.0, 2)],
+        );
+        assert!(
+            evs.iter().any(|e| e.band == Band::B2 && e.is_new),
+            "opens with is_new"
+        );
+        tr.update(
+            9_200,
+            &[open_sig_peaks(Band::B2, PropMode::Tropo, 5.0, 1500.0, 1)],
+        );
+        // Three consecutive closed windows past min-dwell → close + journal.
+        for t in [9_800, 10_400, 11_000] {
+            tr.update(t, &[]);
+        }
+        let eps = tr.drain_closed();
+        assert_eq!(eps.len(), 1, "one journaled episode");
+        let ep = &eps[0];
+        assert_eq!(ep.band, "2m");
+        assert_eq!(ep.mode, "Tropo");
+        assert_eq!(ep.started_utc, 8_600);
+        assert_eq!(ep.ended_utc, 11_000);
+        assert_eq!(ep.duration_secs, 2_400);
+        assert!(ep.onset_known);
+        assert_eq!(ep.peak_z, 6.0, "peak z, not the dying window's");
+        assert_eq!(ep.max_km, 1500.0, "longest path over the whole episode");
+        assert_eq!(ep.octant, "NE");
+        assert!(tr.drain_closed().is_empty(), "drain empties the journal");
+    }
+
+    #[test]
+    fn close_all_flushes_an_in_progress_episode_at_exit() {
+        let mut tr = OpeningTracker::new(OpeningConfig::default());
+        tr.update(0, &[]);
+        tr.update(
+            8_000,
+            &[open_sig_peaks(
+                Band::B6,
+                PropMode::SporadicE,
+                5.0,
+                1400.0,
+                3,
+            )],
+        );
+        tr.update(
+            8_600,
+            &[open_sig_peaks(
+                Band::B6,
+                PropMode::SporadicE,
+                7.0,
+                1800.0,
+                5,
+            )],
+        );
+        let eps = tr.close_all(9_000);
+        assert_eq!(eps.len(), 1, "the live episode is flushed at exit");
+        assert_eq!(eps[0].band, "6m");
+        assert_eq!(eps[0].mode, "Sporadic-E");
+        assert_eq!(eps[0].ended_utc, 9_000);
+        assert!(
+            tr.close_all(9_100).is_empty(),
+            "nothing left open after the flush"
+        );
+    }
+}

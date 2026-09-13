@@ -1,0 +1,703 @@
+# Tempo CI — headless Rust workspace tests/clippy + the web UI build.
+#
+# Scope: Linux-hosted gates — the simulation-only Rust tests/clippy, the web UI
+# build + Vitest, AND a Windows cross-COMPILE of the desktop app (compile/link
+# only, to catch src-tauri breakage the Linux tests can't see). It does NOT bundle
+# the NSIS installer or download the WebView2/Hamlib runtimes — that full packaging
+# is produced out-of-band by scripts/build-windows.sh (native MSYS2 UCRT64),
+# scripts/build-windows.ps1 (PowerShell wrapper), and scripts/build-windows-cross.sh
+# (the same Linux/WSL2 cross toolchain, with --bundles nsis) — see WINDOWS.md.
+# Published Windows binaries are cross-compiled beta and are not bundled here.
+#
+# Toolchain: the Rust jobs pin an exact stable (dtolnay/rust-toolchain@master with
+# toolchain: 1.93.1) instead of floating @stable. A floating stable silently rolls
+# rustfmt/clippy forward and reformats/re-lints the whole tree the day a new Rust
+# ships — which is exactly what bit this repo. Bump the version below deliberately
+# to adopt newer lints. The MSRV job intentionally stays pinned at 1.91.0
+# (raised from 1.87 when the RUSTSEC-2026-0217 fix moved deepcw to tract 0.23,
+# whose own rust-version is 1.91 — a security bump outranks MSRV stability).
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  # Manual trigger — also the diagnostic lever for "why has CI never run".
+  workflow_dispatch:
+
+# Cancel superseded runs on the same ref to save CI minutes.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # Job 1 — Rust workspace: build the Fortran/C/C++ libtempo modem (via the
+  # tempo-fast-sys build.rs CMake project) and run the headless modem/engine/net/TempoDeep
+  # round-trip tests, then clippy across the whole workspace.
+  test:
+    name: Rust tests + clippy
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      # libtempo build deps. The native (host == target) CMake path locates the
+      # FFTW3 single-precision library via pkg-config (`pkg_check_modules(FFTW3F
+      # REQUIRED fftw3f)`) and Boost via `find_package(Boost REQUIRED)`:
+      #   - gfortran        : the 4-CPM turbo modem is Fortran (gfortran runtime).
+      #   - libfftw3-dev     : ships fftw3f.pc + libfftw3f + fftw3.f03 (FFTW3
+      #                        SINGLE precision — used by four2a.f90 / fftw3 module).
+      #   - libboost-dev     : ships <boost/crc.hpp> for the header-only CRC-14 in
+      #                        crc14.cpp (find_package(Boost) config).
+      #   - cmake, ninja-build : drive the libtempo CMake project.
+      #   - pkg-config       : required by find_package(PkgConfig REQUIRED).
+      - name: Install libtempo build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            gfortran \
+            libfftw3-dev \
+            libboost-dev \
+            cmake \
+            ninja-build \
+            pkg-config \
+            libasound2-dev \
+            libudev-dev \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libxdo-dev \
+            libssl-dev \
+            libsoup-3.0-dev \
+            libhamlib-utils
+
+      # libhamlib-utils above ships `rigctld`: the tempo-audio integration
+      # suite (tests/rigctld_dummy.rs) drives the REAL CAT client against a
+      # real Hamlib dummy rig (-m 1). Without rigctld those tests self-skip,
+      # so dropping the package silently removes the coverage — keep it.
+
+      - name: Set up Rust 1.93.1 toolchain (pinned — see header)
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.93.1
+          components: clippy, rustfmt
+
+      - name: Cache cargo registry and build artifacts
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: cargo fmt --check
+        run: cargo fmt --all --check
+
+      - name: cargo test --workspace
+        run: cargo test --workspace
+
+      - name: cargo clippy (deny warnings)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      # The real-radio path (cpal audio + serial PTT) is feature-gated out of the
+      # default build. Lint AND run its tests here — the Transport reconfig
+      # decisions, the WSJT-X/PSK emit builders, and the rigctld round-trip — so
+      # service.rs/device.rs can't silently rot or regress on the air.
+      - name: cargo clippy tempo-audio --features device,serial
+        run: cargo clippy -p tempo-audio --features device,serial --all-targets -- -D warnings
+
+      - name: cargo test tempo-audio --features device,serial
+        run: cargo test -p tempo-audio --features device,serial
+
+      # `--workspace` uses DEFAULT features, so the propagation `live` tests —
+      # including the seven that assert QRZ/ClubLog/LoTW credentials are never
+      # sent over plain HTTP or echoed into an error — compiled in NO job and
+      # never ran (measured: 326 vs 364 tests). The MSRV job's `cargo check`
+      # doesn't even type-check test code (`--all-targets` is what would).
+      - name: cargo clippy propagation --features live
+        run: cargo clippy -p propagation --features live --all-targets -- -D warnings
+
+      - name: cargo test propagation --features live
+        run: cargo test -p propagation --features live
+
+      # The DeepCW inference bridge: compiled by no other Linux job (the model
+      # file is gitignored, so only compile coverage is possible here — see the
+      # documented silent-lobotomy trap in the release runbook).
+      - name: cargo check tempo-audio --features device,serial,ai-cw
+        run: cargo check -p tempo-audio --features device,serial,ai-cw --all-targets
+
+      # src-tauri is its OWN workspace root (empty `[workspace]` table in its
+      # Cargo.toml), so `--workspace` above does NOT reach it — verified by
+      # planting a type error in src-tauri and watching both `cargo test
+      # --workspace` and `cargo clippy --workspace -D warnings` exit CLEAN.
+      # Nothing else in CI type-checks it either: the Windows job only runs
+      # `cargo build --release`, which never compiles `#[cfg(test)] mod tests`.
+      #
+      # That left the ENTIRE Tauri command layer — every window label, the
+      # geometry store, and the multi-radio chain addressing whose whole job is
+      # to make a wrong-rig bug unrepresentable — with no automated gate at all.
+      # `--features radio` is required; src-tauri does not compile without it.
+      #
+      # This step ALSO needs the Tauri Linux system libraries (webkit2gtk, gtk-3,
+      # soup-3, appindicator, rsvg, xdo) in the install step above — they are what
+      # `glib-sys` and friends pkg-config for. They were missing when the gate was
+      # added, so it failed on `glib-2.0 was not found` on every run and this
+      # supposedly-closed hole was still wide open (caught 2026-07-25, after the
+      # 0.17.11 run finally got past a red fmt step and reached it).
+      - name: cargo test src-tauri --features radio
+        run: cargo test --manifest-path src-tauri/Cargo.toml --lib --features radio
+
+      # NOT `-D warnings`: src-tauri carries 15 pre-existing lints (MSRV, type
+      # complexity, redundant casts) precisely BECAUSE it was never linted, so
+      # denying crate-wide would fail on day one and burning that down is
+      # unrelated churn in a 10k-line lib.rs. Instead `chains.rs` denies warnings
+      # itself (`#![deny(warnings, clippy::all)]`), so a regression in the
+      # multi-radio addressing code is a hard error here while the backlog stays
+      # visible as warnings. Verified: planting a dead fn in chains.rs exits 101.
+      - name: cargo clippy src-tauri --features radio
+        run: cargo clippy --manifest-path src-tauri/Cargo.toml --lib --features radio
+
+  # Job 2 — Web UI (Vite + React + TypeScript). `npm run build` is `tsc -b &&
+  # vite build`, so this also type-checks the DTO contract that mirrors
+  # crates/tempo-app/src/dto.rs.
+  ui:
+    name: Web UI build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+
+      - name: Install UI dependencies
+        run: npm --prefix ui ci
+
+      - name: Build UI
+        run: npm --prefix ui run build
+
+      - name: Test UI (Vitest)
+        run: npm --prefix ui test
+
+      # Guardrail: no demo/mock/fabricated data may reach an operator. Greps the
+      # Rust + TS sources AND the just-built UI bundle for the deleted demo/mock
+      # fingerprints (propagation::demo, mockEngine, demoPropagation, …). Runs
+      # after the build so it also proves the mock tree-shook out of dist/.
+      - name: No demo/mock data guard
+        run: bash scripts/check-no-demo.sh
+
+      # The TLE-mirror generator runs unattended in its own workflow and
+      # publishes to every install, so its derivation and its sanity gates are
+      # tested HERE, on committed fixtures, where a regression blocks a merge
+      # rather than shipping a shortened bird list six hours later.
+      - name: Test the TLE mirror generator
+        run: node --test scripts/gen-tles.test.mjs
+
+      # The two doc generators, in --check mode: they write nothing, they exit 1
+      # when the committed page is behind the source it is derived from.
+      #
+      # WHY THEY ARE HERE. Both existed for weeks with nothing invoking them, and
+      # that is exactly how they failed. gen-wiki.mjs THREW on every run from
+      # a6097c92 (2026-08-09) onward — docs/install.md stopped containing the text
+      # one of its required replacements is keyed on — and three releases shipped
+      # over the top of a generator that could not run, because nobody ran it. A
+      # tool whose only trigger is somebody remembering is not a gate.
+      #
+      # Both are deterministic and offline. When one goes red the fix is to re-run
+      # it without --check and commit what moved, or to repair the rule it names.
+      - name: docs/guide/settings-reference.md is generated from the registry
+        run: node scripts/gen-settings-reference.mjs --check
+
+      - name: docs/launch/wiki/ is generated from docs/
+        run: node scripts/gen-wiki.mjs --check
+
+      # docs/shipped.json is read by the WEBSITE, in another repo, to check that its
+      # features page still lists everything Nexus ships. A stale manifest there is a
+      # website that quietly under-claims — which is how PSK31 went four releases and
+      # FT2 two without appearing on the page whose job is listing them.
+      - name: docs/shipped.json is generated from the app's own lists
+        run: node scripts/gen-shipped.mjs --check
+
+  # The downloadable manual's EPUB must stay valid — a doc change that breaks it should go
+  # red here, on the push, not be discovered on a Kindle after release. Builds the EPUB only
+  # (no Chrome/PDF) and runs the official W3C epubcheck, which exits non-zero on any error.
+  # Its own first ship failed epubcheck with 89 errors (broken cross-links, missing images),
+  # so this gate is not hypothetical.
+  manual-epub:
+    name: Manual EPUB validates (epubcheck)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Tools (pandoc + pillow; Java is preinstalled)
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends pandoc
+          python3 -m pip install --quiet pillow
+      - name: Build the EPUB
+        run: |
+          set -euo pipefail
+          ver=$(grep -m1 '"version"' src-tauri/tauri.conf.json | sed -E 's/.*"version": *"([^"]+)".*/\1/')
+          python3 scripts/build-manual-epub.py --version "$ver" --out /tmp/Nexus-Manual.epub
+      - name: Validate with W3C epubcheck
+        run: |
+          set -euo pipefail
+          EC=5.3.0
+          curl -fsSL "https://github.com/w3c/epubcheck/releases/download/v${EC}/epubcheck-${EC}.zip" -o /tmp/ec.zip
+          python3 -c "import zipfile; zipfile.ZipFile('/tmp/ec.zip').extractall('/tmp')"
+          java -jar "/tmp/epubcheck-${EC}/epubcheck.jar" /tmp/Nexus-Manual.epub
+
+  # Job 3 — MSRV: the workspace must compile on the pinned minimum toolchain
+  # (Cargo.toml [workspace.package] rust-version = "1.91"). Build-only check,
+  # incl. the propagation `live` feature (the heaviest dep set).
+  msrv:
+    name: MSRV (1.91) check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install libtempo build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            gfortran libfftw3-dev libboost-dev cmake ninja-build pkg-config
+
+      - name: Set up Rust 1.91 toolchain
+        uses: dtolnay/rust-toolchain@1.91.0
+
+      - name: Cache cargo registry and build artifacts
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-msrv-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-msrv-
+
+      - name: cargo check --workspace (MSRV)
+        run: cargo check --workspace --all-targets
+
+      - name: cargo check propagation --features live (MSRV)
+        run: cargo check -p propagation --features live
+
+  # Job 4 — Supply chain: RustSec advisories, license allow-list, sources, bans.
+  deny:
+    name: cargo-deny (supply chain + licenses)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: cargo-deny
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories bans sources licenses
+
+      # src-tauri is its OWN workspace root with its OWN Cargo.lock (see the
+      # planted-error note above): the job above never scans the 281 packages
+      # that ship ONLY in the desktop shell, and the two lockfiles can pin
+      # different versions of shared deps — so CI tested a different dependency
+      # set than shipped (45 divergences measured). Do NOT "fix" this by making
+      # src-tauri a workspace member; it needs a WebView toolchain Linux lacks.
+      - name: cargo-deny (src-tauri lockfile)
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories bans sources licenses
+          manifest-path: src-tauri/Cargo.toml
+
+      # Shared deps must resolve identically in both lockfiles where semver
+      # allows it, or CI tests a different dependency set than ships (measured
+      # before this gate: 45 divergences, including the tract inference stack
+      # the AI CW decoder actually runs on). Incompatible-major pairs (the
+      # tauri stack legitimately requires newer majors than the workspace) are
+      # REPORTED, not failed — they cannot align. KNOWN_BLOCKED names the pairs
+      # where BOTH directions are wedged by hard requirements, each with the
+      # blocker recorded; new compatible drift fails until aligned with
+      # `cargo update -p <name> --precise <ver>`.
+      - name: lockfile divergence (workspace vs src-tauri)
+        run: |
+          python3 - <<'PY'
+          import re, sys
+          # Pairs wedged on BOTH sides by hard requirements go here, each with
+          # the blocking requirement named. (The time family lived here until
+          # the tract 0.23 bump dropped time from the workspace tree entirely.)
+          KNOWN_BLOCKED = set()
+          def pins(path):
+              d = {}
+              for n, v in re.findall(r'name = "([^"]+)"\nversion = "([^"]+)"', open(path).read()):
+                  d.setdefault(n, []).append(v)
+              return d
+          def ck(v):
+              p = v.split('+')[0].split('.')
+              return (p[0], p[1]) if p[0] == '0' else (p[0],)
+          ws, st = pins('Cargo.lock'), pins('src-tauri/Cargo.lock')
+          bad = []
+          for n in sorted(ws.keys() & st.keys()):
+              # A name can appear at SEVERAL majors in one lockfile (src-tauri
+              # holds reqwest 0.12 AND 0.13); compare per semver-compat range,
+              # where cargo guarantees a single resolved version per side.
+              a = {ck(v): v for v in ws[n]}
+              b = {ck(v): v for v in st[n]}
+              for key in sorted(a.keys() & b.keys()):
+                  if a[key] != b[key]:
+                      if n in KNOWN_BLOCKED:
+                          print(f"info: known-blocked {n}: {a[key]} vs {b[key]}")
+                      else:
+                          bad.append((n, a[key], b[key]))
+          for n, x, y in bad:
+              print(f"DIVERGED {n}: workspace {x} vs src-tauri {y}")
+          if bad:
+              print(f"{len(bad)} alignable shared dependencies resolve differently — "
+                    "`cargo update -p <name>@<ver> --precise <ver>` one side into line "
+                    "(or add to KNOWN_BLOCKED with the blocking requirement named).")
+              sys.exit(1)
+          print("lockfiles agree on all alignable shared dependencies")
+          PY
+
+  # Job 5 — Windows cross-compile. The desktop shell (src-tauri) is outside the
+  # workspace and needs a WebView/MinGW toolchain the Linux test job lacks, so
+  # `cargo test` never touches it. This job cross-compiles it to
+  # x86_64-pc-windows-gnu with the MinGW-w64 toolchain — proving the Tauri command
+  # surface, the feature-gated `radio` audio/CAT path, and the libtempo Fortran/C/C++
+  # modem all still LINK for Windows. It is a compile/link check, not the shipping
+  # installer: no NSIS bundle, no WebView2/Hamlib download (those run out-of-band
+  # via scripts/build-windows-cross.sh, which adds --bundles nsis).
+  windows-cross:
+    name: Windows cross-compile (src-tauri)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      # MinGW-w64 cross toolchain: gcc/g++/gfortran for the Fortran/C/C++ modem,
+      # cmake/ninja to drive the libtempo CMake project, and a host build-essential
+      # (cc/make) to cross-build FFTW3f for MinGW.
+      - name: Install MinGW-w64 cross toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            gcc-mingw-w64-x86-64 \
+            g++-mingw-w64-x86-64 \
+            gfortran-mingw-w64-x86-64 \
+            libboost-dev \
+            cmake \
+            ninja-build \
+            build-essential
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+
+      - name: Set up Rust 1.93.1 toolchain (pinned) + windows-gnu target
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.93.1
+          targets: x86_64-pc-windows-gnu
+
+      - name: Cache cargo, FFTW, and build artifacts
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+            src-tauri/target
+            target/fftw-mingw
+          key: ${{ runner.os }}-wincross-${{ hashFiles('Cargo.lock', 'src-tauri/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-wincross-
+
+      # Cross-build FFTW3f for MinGW + the libtempo modem self-test exes (win_smoke,
+      # roundtrip, …). Proves the native modem chain links for Windows and produces
+      # target/fftw-mingw, which tempo-fast-sys/build.rs reads on the src-tauri step below.
+      - name: Cross-build FFTW + libtempo modem exes
+        run: bash scripts/build-windows-cross.sh --no-gui
+
+      # src-tauri embeds the web UI via the custom-protocol feature. `cargo build`
+      # does NOT run Tauri's beforeBuildCommand, so build the dist explicitly first
+      # or the asset embed fails ("frontendDist does not exist").
+      - name: Build web UI (embedded assets)
+        run: |
+          npm --prefix ui ci
+          npm --prefix ui run build
+
+      # Compile/link the desktop app for Windows. NOT `cargo tauri build` — no NSIS
+      # bundle, no WebView2/Hamlib download — just prove src-tauri compiles clean.
+      - name: Cross-compile src-tauri (x86_64-pc-windows-gnu)
+        env:
+          FFTW_MINGW_PREFIX: ${{ github.workspace }}/target/fftw-mingw
+          # This job proves COMPILE/LINK, not shipping: the gitignored DeepCW
+          # model isn't staged here, and build.rs hard-fails a release-profile
+          # radio build without it (the silent-lobotomy gate). Allow it HERE
+          # only — release.yml stages + digest-verifies the real model.
+          NEXUS_ALLOW_MISSING_AICW: "1"
+          # Same reasoning for the bundled Hamlib: the .exe/.dll are gitignored and
+          # this job deliberately doesn't run scripts/fetch-hamlib.sh, so build.rs's
+          # CAT-dead gate would fail a release+radio Windows build. Allow it HERE
+          # only — the gate exists to stop a SHIPPING build (build-windows-cross.sh
+          # and any local `cargo tauri build`) going out with no CAT.
+          NEXUS_ALLOW_MISSING_HAMLIB: "1"
+        run: >
+          cargo build --release
+          --manifest-path src-tauri/Cargo.toml
+          --target x86_64-pc-windows-gnu
+          --features radio,custom-protocol
+
+  # Job 5b — macOS compile check (fast feedback; the SHIPPING mac build lives in release.yml).
+  #
+  # Since 1.5.0 macOS IS a supported platform: release.yml's `macos` job does the signed,
+  # notarized, statically-linked .dmg (and `smoke-macos` proves it on a clean runner). This
+  # job stays deliberately the same shape as `windows-cross` above — prove it LINKS on every
+  # push, ship nothing. No `cargo tauri build`, no signing secrets here; a compile check
+  # that needed secrets would stop running on forks and PRs, which is where it earns its keep.
+  #
+  # Unsigned and hardened-runtime-off is fine for a compile check. The SIGNED build needs
+  # `bundle.macOS.entitlements` with com.apple.security.device.audio-input, or the microphone
+  # is unreachable at runtime however good the Info.plist is — that lives in
+  # src-tauri/tauri.conf.json + Entitlements.plist (added 2026-08-17; this comment warned
+  # about the gap from the day the job was added, and the 1.5.x/1.6.0 DMGs shipped with it).
+  #
+  # NATIVE arch only (aarch64), not a universal binary and not x86_64. libtempo is a Fortran +
+  # FFTW + Boost CMake project, so a universal build means building that native tree twice and
+  # lipo-ing it; one architecture is enough to catch a darwin regression, which is all this is for.
+  # It must be the RUNNER's arch: macos-14 is Apple Silicon, and targeting x86_64 there means
+  # cross-compiling and then reaching for an Intel libgfortran that Homebrew's native gcc does not
+  # ship — which is exactly how the first run failed (`ld: library 'gfortran' not found`, after the
+  # Fortran itself had built fine). Apple Silicon is also what most Mac operators are on.
+  #
+  # (The "unproven until it first runs" caveat that stood here is retired: it has run many times,
+  # and the CMake/Homebrew failure it predicted was fixed rather than theoretical.)
+  macos-check:
+    name: macOS compile check (fast link check; the shipping build is in release.yml)
+    runs-on: macos-14
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      # gfortran (via gcc), cmake/ninja for the libtempo CMake project, fftw and boost
+      # for the modem — the darwin equivalents of the apt list the Linux job installs.
+      - name: Install build dependencies
+        run: |
+          brew install cmake ninja gcc fftw boost
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.93.1
+          targets: aarch64-apple-darwin
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+
+      # src-tauri embeds the built web assets, so the UI has to exist before it links.
+      - name: Build the web UI
+        run: |
+          npm --prefix ui ci
+          npm --prefix ui run build
+
+      # The DeepCW model is gitignored (AGPL-3.0 (c) e04) and absent here on purpose:
+      # build.rs offers NEXUS_ALLOW_MISSING_AICW for exactly this case, and its absence
+      # affects only the AI CW panel — nothing this job is trying to prove.
+      # Homebrew keeps libgfortran under the gcc formula's own lib dir, which is not on the
+      # default linker search path — the modem links `-lgfortran` and `-lfftw3f`, so both
+      # prefixes have to reach the linker or the build dies at the very last step. That is
+      # tempo-fast-sys/build.rs's job now (it probes gfortran and pkg-config); this step
+      # exists to prove the probe works on a runner with nothing pre-arranged.
+      - name: Compile src-tauri for macOS
+        env:
+          NEXUS_ALLOW_MISSING_AICW: 1
+        run: |
+          # NO LIBRARY_PATH export here, deliberately. It used to supply exactly the two directories
+          # tempo-fast-sys/build.rs now derives (gcc's lib/gcc/current and fftw's lib), which meant
+          # this job passed whether or not the probe worked -- green either way is not a test. Without
+          # it, the job IS the positive control for the probe: if the derivation breaks, the link
+          # fails here rather than on a contributor's Mac.
+          cargo build --release \
+            --manifest-path src-tauri/Cargo.toml \
+            --target aarch64-apple-darwin \
+            --features radio,custom-protocol
+
+  # Job 6 — Raspberry Pi .deb, one per live Pi OS base. Runs on GitHub's hosted
+  # arm64 runner (free for public repos), so the aarch64 build is NATIVE: the same
+  # image under QEMU on a dev box takes 45+ minutes and is 5-20x slower.
+  #
+  # Two bases, not one: Pi OS moved to Trixie (Debian 13) in late 2025 while a large
+  # installed base is still on Bookworm (12). Trixie bumps libc/GTK/webkit2gtk, so a
+  # .deb built on one will not reliably install on the other. This is a BUILD MATRIX,
+  # not a port — identical source, two runtimes.
+  #
+  # fail-fast is off deliberately: if Trixie breaks (its webkit is a different major
+  # version) the Bookworm .deb — the one most users need — must still be produced.
+  #
+  # NOTE: a green build proves the .deb COMPILES and PACKAGES. It does not prove the
+  # app RENDERS. The webview smoke test (waterfall, map/globe, Settings) still has to
+  # run on real hardware before a base is called supported — see tasks/pi-trixie-plan.md.
+  pi-deb:
+    name: Raspberry Pi .deb (${{ matrix.base }})
+    runs-on: ubuntu-24.04-arm
+    strategy:
+      fail-fast: false
+      matrix:
+        base: [bookworm, trixie]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      # The DeepCW AI CW model is AGPL-3.0 (c) e04 and is NOT committed (15 MB binary,
+      # gitignored — see src-tauri/resources/deepcw/README.md). A checkout therefore never
+      # has it, and Tauri's resource glob matches the directory regardless, so without this
+      # step the build silently produces a package ~14 MB lighter with no AI CW decoder and
+      # no error. build-linux.sh hard-fails if these are absent, so this step is load-bearing.
+      - name: Stage the DeepCW model (not committed — AGPL-3.0 (c) e04)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release download deepcw-model-v1 --repo "${{ github.repository }}" \
+            --pattern 'model.onnx*' --dir src-tauri/resources/deepcw --clobber
+          # Pin by digest: a silently-swapped model would change decode behaviour with no
+          # other visible signal.
+          echo "a7b3b4aa2610d3e88b8c7d4420eceee31be2d0ae595b3413264334f3ffb1eab5  src-tauri/resources/deepcw/model.onnx" | sha256sum -c -
+          echo "b4342157b90229ee7380e165f3d8036179b80d1e6ae02f2557388b7fcd558c01  src-tauri/resources/deepcw/model.onnx.json" | sha256sum -c -
+
+      # No QEMU/binfmt setup: the runner is already aarch64, so `--platform
+      # linux/arm64` selects the native architecture and the container runs at
+      # full speed. The Debian base image supplies every build dep, so nothing
+      # is installed on the runner itself.
+      #
+      # The WSJT-X-derived modem source is vendored in-tree at libtempo/vendor/wsjtx
+      # and is CMake's default WX, so the checkout is self-contained — no external
+      # tree to stage, which is what previously forced a dev-box path into the image.
+      - name: Build .deb in a debian:${{ matrix.base }} container
+        run: >
+          docker buildx build
+          --platform linux/arm64
+          -f scripts/Dockerfile.pi
+          --build-arg BASE=${{ matrix.base }}
+          --progress=plain
+          --target export
+          --output type=local,dest=pi-out/${{ matrix.base }}
+          .
+
+      # tauri names BOTH bases' output Nexus_<ver>_arm64.deb. Publishing them
+      # side by side without a suffix means one silently overwrites the other and
+      # a tester has no way to tell which OS their download was built for.
+      - name: Tag the artifact with its base, and verify it is genuinely arm64
+        run: |
+          set -euo pipefail
+          deb=$(find pi-out/${{ matrix.base }} -name '*.deb' -print -quit)
+          [ -n "$deb" ] || { echo "no .deb produced"; exit 1; }
+          ver=$(dpkg-deb -f "$deb" Version)
+          arch=$(dpkg-deb -f "$deb" Architecture)
+          echo "package: $(dpkg-deb -f "$deb" Package) / $ver / $arch"
+          [ "$arch" = "arm64" ] || { echo "expected arm64, got $arch"; exit 1; }
+          # Prove the payload is really ARM — an x86 binary with an arm64 filename
+          # installs cleanly and then fails to exec on the Pi.
+          dpkg-deb -x "$deb" /tmp/debcheck
+          bin=$(find /tmp/debcheck/usr/bin -type f -print -quit)
+          file "$bin" | tee /tmp/filetype
+          grep -q 'ARM aarch64' /tmp/filetype || { echo "payload is not ARM aarch64"; exit 1; }
+          # Assert the AI CW model actually made it INTO the package. The staging step and
+          # build-linux.sh both guard the inputs; this checks the output, because the failure
+          # this catches (a package that installs and runs with the decoder silently absent)
+          # is invisible to every other check. 2026-07-20: shipped exactly that, 14 MB light.
+          m=/tmp/debcheck/usr/lib/Nexus/resources/deepcw/model.onnx
+          [ -s "$m" ] || { echo "DeepCW model missing from the package"; exit 1; }
+          echo "a7b3b4aa2610d3e88b8c7d4420eceee31be2d0ae595b3413264334f3ffb1eab5  $m" | sha256sum -c -
+          mv "$deb" "pi-out/${{ matrix.base }}/Nexus_${ver}_pi_arm64_${{ matrix.base }}.deb"
+          sha256sum pi-out/${{ matrix.base }}/*.deb
+
+      - name: Upload .deb
+        uses: actions/upload-artifact@v4
+        with:
+          name: nexus-pi-${{ matrix.base }}
+          path: pi-out/${{ matrix.base }}/*.deb
+          if-no-files-found: error
+          retention-days: 30
+
+  # Job 7 — E2E smoke: launch the REAL app under WebDriver (tauri-driver →
+  # WebKitWebDriver → the built binary, headless via Xvfb) and prove what unit
+  # tests structurally cannot: the app starts, a fresh profile gets the setup
+  # wizard, the main UI mounts, and Settings OPENS (the class of the public
+  # crash-on-Settings incident). Flows live in e2e/smoke.mjs — zero npm deps.
+  e2e-linux:
+    name: E2E smoke (launch + wizard + Settings)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install build + driver dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            gfortran libfftw3-dev libboost-dev cmake ninja-build pkg-config \
+            libasound2-dev libudev-dev libwebkit2gtk-4.1-dev libgtk-3-dev \
+            libayatana-appindicator3-dev librsvg2-dev libxdo-dev libssl-dev \
+            libsoup-3.0-dev \
+            webkit2gtk-driver xvfb dbus
+
+      - name: Set up Rust 1.93.1 toolchain (pinned — see header)
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.93.1
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+
+      - name: Build the UI
+        run: |
+          npm --prefix ui ci
+          npm --prefix ui run build
+
+      - name: Build the app binary (debug, embedded assets)
+        # radio: src-tauri does not compile without it. The gitignored AI-CW
+        # model is absent in CI; debug builds only warn, but be explicit that
+        # this binary is knowingly model-less — it tests the SHELL, not decode.
+        env:
+          NEXUS_ALLOW_MISSING_AICW: "1"
+        run: >
+          cargo build
+          --manifest-path src-tauri/Cargo.toml
+          --features radio,custom-protocol
+
+      - name: Install tauri-driver
+        run: cargo install tauri-driver --locked
+
+      - name: Run the smoke flows
+        run: |
+          set -euo pipefail
+          FAKEHOME="$RUNNER_TEMP/e2e-home"
+          mkdir -p "$FAKEHOME"
+          xvfb-run -a dbus-run-session -- env \
+            HOME="$FAKEHOME" \
+            XDG_CONFIG_HOME="$FAKEHOME/.config" \
+            XDG_DATA_HOME="$FAKEHOME/.local/share" \
+            XDG_CACHE_HOME="$FAKEHOME/.cache" \
+            WEBKIT_DISABLE_COMPOSITING_MODE=1 \
+            NEXUS_E2E_BINARY=src-tauri/target/debug/Nexus \
+            node e2e/smoke.mjs
+
+      - name: Failure screenshot (what the operator would have seen)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-failure
+          path: e2e/artifacts/
+          if-no-files-found: ignore

@@ -1,0 +1,255 @@
+// @vitest-environment jsdom
+// Sharing the rig with another program (#48, rogerloxton): "I can't get VarAC or FreeDV to use
+// RigCTL when Nexus is running."
+//
+// A serial port is exclusive-open, so while Nexus holds it nothing else can reach the radio.
+// But Nexus does not own the rig directly — it drives it through Hamlib's rigctld, which is a
+// SERVER, and VarAC/FreeDV/WSJT-X/JS8Call/fldigi all speak that protocol. The endpoint existed
+// all along (`rigctld_port`, per-radio and validated unique); it was simply never shown to
+// anyone, so the apparent answer was "quit Nexus".
+//
+// What is worth pinning is that the address shown is the REAL one for the radio being edited.
+// A hardcoded 4532 would look right on a single-radio station and silently send a second-radio
+// operator to the wrong rig — the failure would be another program controlling the wrong radio,
+// which is worse than no answer at all.
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
+import { render, screen, cleanup, fireEvent, waitFor } from '@testing-library/react'
+import { SettingsPanel } from './SettingsPanel'
+import type { FeaturesApi } from '../useFeatures'
+import defaultSettings from './__fixtures__/defaultSettings.json'
+
+const api = vi.hoisted(() => {
+  // SettingsPanel pulls ~50 verbs from ../api. They all resolve null, which is enough for a
+  // mount — the assertions here are about WHICH save verb gets called, not what it returns.
+  const spies: Record<string, ReturnType<typeof vi.fn>> = {}
+  const get = (name: string) => {
+    if (!spies[name]) spies[name] = vi.fn(() => Promise.resolve(null))
+    return spies[name]
+  }
+  return { spies, get }
+})
+
+// Mock EVERY export of `../api`, derived from the real module rather than a hand-kept list.
+//
+// The list was the problem: a verb missing from it made the panel THROW ON MOUNT ("No export is
+// defined on the mock"), which presents as a behaviour regression in whichever test happened to
+// run -- not as the out-of-date mock it actually is. Reading the real module's export names makes
+// that failure impossible by construction.
+vi.mock('../api', async (importOriginal) => {
+  const actual = await importOriginal<Record<string, unknown>>()
+  const mod: Record<string, unknown> = {}
+  for (const name of Object.keys(actual)) {
+    mod[name] = typeof actual[name] === 'function' ? api.get(name) : actual[name]
+  }
+  return mod
+})
+vi.mock('../toast', () => ({
+  pushToast: vi.fn(),
+  withErrorToast: vi.fn(async (fn: () => Promise<unknown>) => fn()),
+}))
+
+const FTDX10 = {
+  id: 0,
+  name: 'FTDX10',
+  enabled: true,
+  serialPort: 'COM3',
+  baud: 38400,
+  rigModel: 1042,
+  rigModelName: 'Yaesu FTDX10',
+  rigConn: 'serial',
+  rigAddr: '',
+  rigctldPort: 4532,
+  rotctldPort: 4533,
+  icomNativeCat: false,
+  audioIn: 'in-0',
+  audioOut: 'out-0',
+  txLevel: 1,
+  rxGain: 1,
+  pttMethod: 'cat',
+  rotatorModel: 0,
+  rotatorPort: '',
+  rotatorBaud: 9600,
+  rotatorHost: '',
+  nativeScope: 'auto',
+  bands: [],
+}
+const IC9700 = {
+  ...FTDX10,
+  id: 1,
+  name: 'IC-9700',
+  serialPort: 'COM7',
+  baud: 115200,
+  rigModel: 3081,
+  rigModelName: 'Icom IC-9700',
+  rigctldPort: 4534,
+  rotctldPort: 4535,
+  icomNativeCat: true,
+  audioIn: 'in-1',
+  audioOut: 'out-1',
+}
+
+/** Settings with two radios, FTDX10 active, flat mirror = the FTDX10.
+ * Built on the real `Settings::default()` (dumped from Rust) so the panel renders for real
+ * rather than against a hand-guessed subset that drifts. */
+function twoRadioSettings() {
+  return {
+    ...defaultSettings,
+    ...FTDX10,
+    mycall: 'KD9TAW',
+    mygrid: 'EN52',
+    activeRadio: 0,
+    radios: [FTDX10, IC9700],
+    band: '20m',
+    dialMhz: 14.074,
+    sideband: 'USB',
+  } as never
+}
+
+const features: FeaturesApi = {
+  enabled: () => true,
+  setEnabled: vi.fn(),
+  all: () => [],
+  profile: 'full',
+  setProfile: vi.fn(),
+} as unknown as FeaturesApi
+
+function renderPanel() {
+  return render(
+    <SettingsPanel
+      activeRadioId={0}
+      scale={1 as never}
+      scaleMode={'auto' as never}
+      scaleCap={1 as never}
+      onScaleModeChange={() => {}}
+      onScaleCapChange={() => {}}
+      density={'comfortable' as never}
+      onDensityChange={() => {}}
+      onResetLayout={() => {}}
+      features={features}
+    />,
+  )
+}
+
+beforeEach(() => {
+  // Reset in place — the mocked module captured these exact spy objects at import time, so
+  // replacing them here would leave the component calling the old ones.
+  for (const spy of Object.values(api.spies)) {
+    spy.mockClear()
+    spy.mockImplementation(() => Promise.resolve(null))
+  }
+  api.get('getRigModels').mockImplementation(() => Promise.resolve([]))
+  api.get('getAllRigModels').mockImplementation(() => Promise.resolve([]))
+  api.get('getSerialPortsDetailed').mockImplementation(() => Promise.resolve([]))
+  api.get('getBandPlan').mockImplementation(() => Promise.resolve([]))
+  api.get('getAudioDevices').mockImplementation(() => Promise.resolve({ input: [], output: [] }))
+  api.get('getCredentialsStatus').mockImplementation(() => Promise.resolve({}))
+  api.get('detectRigs').mockImplementation(() => Promise.resolve([]))
+  api.get('appVersion').mockImplementation(() => Promise.resolve('0.17.12'))
+  api.get('getSettings').mockImplementation(() => Promise.resolve(twoRadioSettings()))
+  api.get('probeCatPorts').mockImplementation(() =>
+    Promise.resolve({
+      found: true,
+      detail: 'Icom IC-9700 on COM7 @ 115200 baud',
+      portName: 'COM7',
+      baud: 115200,
+      model: 3081,
+      modelName: 'Icom IC-9700',
+      freqMhz: 144.174,
+      modelSeeded: false,
+    }),
+  )
+  api.get('testCat').mockImplementation(() => Promise.resolve({ ok: true, detail: 'ok' }))
+})
+afterEach(cleanup)
+
+/** Click "Edit" on the non-active radio (the IC-9700) so the flat rig form describes it. */
+describe('sharing the rig over Hamlib NET rigctl', () => {
+  /** The address and its hint, found by structure — the rendered text is split across
+   *  elements (the port is interpolated, and the hint nests <strong>/<em>/<code>), so a
+   *  whole-string text query cannot see either. */
+  async function shareRow(container: HTMLElement) {
+    // The panel is tabbed; the rig fieldset renders only under Radio.
+    fireEvent.click(await screen.findByRole('tab', { name: 'Radio' }))
+    await waitFor(() => {
+      expect(container.querySelector('.rig-share-addr')).toBeTruthy()
+    })
+    const addr = container.querySelector('.rig-share-addr')!
+    const hint = addr.closest('.settings-field')!.querySelector('.settings-hint')!
+    return { addr, hint }
+  }
+
+  it('advertises the CAT broker, and it arrives switched on', async () => {
+    // #53: the advertised share address is the BROKER — Nexus itself answering from live
+    // state — never the Hamlib daemon's port, which Test CAT and every CAT-config save tear
+    // down under a connected client (rogerloxton's VarAC log: empty reads and doubled
+    // replies from exactly those windows). Default port 4532 is deliberate: it is Hamlib's
+    // own NET rigctl number, so a logger already pointed there lands on the broker.
+    const { container } = renderPanel()
+    const { addr } = await shareRow(container)
+    expect(addr.textContent).toBe('127.0.0.1:4532')
+    const toggle = addr
+      .closest('.settings-field')!
+      .querySelector('[role="switch"]') as HTMLElement
+    expect(toggle.getAttribute('aria-checked'), 'sharing is on by default').toBe('true')
+  })
+
+  it("the broker address stays put across Edit; the per-radio DIRECT address follows the edited radio", async () => {
+    // Dual-radio: the broker follows the ACTIVE radio, so its address never changes — but an
+    // operator driving the second rig from another program needs that rig's own daemon
+    // address, and sending them radio 1's would have another program controlling the WRONG
+    // radio. The direct line carries the edited radio's port.
+    const { container } = renderPanel()
+    await shareRow(container)
+    fireEvent.click(await screen.findByRole('button', { name: 'Edit' }))
+    await waitFor(() => {
+      expect(container.querySelector('.rig-share-direct')!.textContent).toBe('127.0.0.1:4534')
+    })
+    expect(container.querySelector('.rig-share-addr')!.textContent).toBe('127.0.0.1:4532')
+  })
+
+  it('names the protocol the other programs actually ask for', async () => {
+    const { container } = renderPanel()
+    const { hint } = await shareRow(container)
+    // "Hamlib NET rigctl" is the string in VarAC/WSJT-X/fldigi's own rig lists. Describing it
+    // any other way sends the operator hunting a dropdown for words that are not there.
+    expect(hint.textContent).toMatch(/Hamlib NET rigctl/i)
+    expect(hint.textContent).toMatch(/VarAC/)
+    expect(hint.textContent).toMatch(/FreeDV/)
+    // The instruction that is easy to miss and fails silently.
+    expect(hint.textContent, 'a serial port left set in the other program defeats this')
+      .toMatch(/serial port blank/i)
+  })
+
+  it('warns that two programs can both command the rig', async () => {
+    const { container } = renderPanel()
+    const { hint } = await shareRow(container)
+    expect(hint.textContent).toMatch(/argue|conflict/i)
+  })
+})
+
+describe('wizard re-entry lives on the Radio tab', () => {
+  // The only way back into setup used to be a text link inside a hint on the
+  // APPEARANCE tab (operator, 2026-08-09: "there is no features tab") — setup
+  // must be findable where an operator actually looks for it.
+  it('shows Re-run setup wizard on the Radio tab when the host wires it', async () => {
+    const onRerunWizard = vi.fn()
+    render(
+      <SettingsPanel
+        activeRadioId={0}
+        onRerunWizard={onRerunWizard}
+        scale={1 as never}
+        scaleMode={'auto' as never}
+        scaleCap={1 as never}
+        onScaleModeChange={() => {}}
+        onScaleCapChange={() => {}}
+        density={'comfortable' as never}
+        onDensityChange={() => {}}
+        onResetLayout={() => {}}
+        features={features}
+      />,
+    )
+    fireEvent.click(await screen.findByRole('tab', { name: 'Radio' }))
+    fireEvent.click(await screen.findByRole('button', { name: /Re-run setup wizard/ }))
+    expect(onRerunWizard).toHaveBeenCalledTimes(1)
+  })
+})

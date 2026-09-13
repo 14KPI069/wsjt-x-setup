@@ -1,0 +1,412 @@
+import { useCallback, useMemo, useRef, useState } from 'react'
+import type { SpotRow, NeedTag, AppSnapshot } from '../types'
+import { bandRangeForLabel } from '../band'
+import { useWheelTune } from '../useWheelTune'
+import { useScopeTune } from '../useScopeTune'
+import { NEED_CHIP } from '../features/needVisuals'
+import { surfaceGet, surfaceSet } from '../features/windowScope'
+import { BEACON_BADGE, SpotLegend, TYPE_BADGE } from './SpotLegend'
+import { t } from '../i18n'
+
+/** Fallback track height (px) before the real one is measured — the track flex-fills its window. */
+const TRACK_H = 460
+/** Minimum vertical gap (px) between two spot labels before they're de-collided. */
+const LABEL_GAP = 16
+/** Interior frequency gridlines (so the track reads as a scale, not an empty box). */
+const GRID_DIVS = 6
+/** Minimum window height (MHz) so a tight cluster still spreads across the track. */
+const MIN_SPAN = 0.02
+/** Breathing room (MHz) added around the activity when zooming the window. */
+const MARGIN = 0.008
+
+interface Props {
+  /** Current operating band label (e.g. "20m"). */
+  band: string
+  /** Current dial frequency (MHz) — the "you are here" marker. */
+  dialMhz: number
+  /** Whether the current dial+mode is inside the operator's privileges (colors the marker). */
+  txAllowed: boolean
+  /** Operator's licensed phone sub-band [lo, hi) MHz — shaded. Absent = no shade. */
+  phoneSegLo?: number | null
+  phoneSegHi?: number | null
+  /** All live cluster spots (unfiltered); the map picks the ones matching `spotMode` on this band. */
+  spots: SpotRow[]
+  /** Which spot mode to plot — 'Phone' (SSB, default) or 'CW'. */
+  spotMode?: 'Phone' | 'CW'
+  /** Work a spotted station — QSY to its exact freq + prefill the log. */
+  onWorkSpot: (s: SpotRow) => void
+  /** Top need tag per call (UPPERCASE-keyed, mode-gated) — colors a marker like the roster. */
+  needByCall?: Map<string, NeedTag>
+  /** Activity type per call (UPPERCASE) — POTA/SOTA/DXped badge beside the call. */
+  typeByCall?: Map<string, 'Pota' | 'Sota' | 'Dxped'>
+  /** Calls already worked (UPPERCASE, from the log) — struck through, like the roster. */
+  workedCalls?: Set<string>
+  /** When set (detached window only), shows Dock L/R buttons that snap this window to the
+   *  screen edge as a full-height strip (persisted across launches). */
+  onDock?: (side: 'left' | 'right' | 'none') => void
+
+  // ── Tuning from the map itself (#39, kr4fqg) ───────────────────────────────────────────
+  // The map has always been a frequency SCALE — `yOf` places every tick — so a position on
+  // it already means a frequency; it just had no way to act on one. The readout digits and
+  // the waterfall both tune by wheel, which is what made the band map's silence read as an
+  // inconsistency rather than a missing feature. All optional: with these absent the map is
+  // exactly the read-only scale it was, which is what keeps the existing tests honest.
+  /** Sideband to preserve so a map tune never flips the mode. */
+  sideband?: string
+  /** Tune only when CAT is up and nothing is transmitting. Absent ⇒ read-only map. */
+  tuneEnabled?: boolean
+  /** Wheel step (Hz), the operator's tuning step — same value the cockpit dials use. */
+  stepHz?: number
+  /** Settings ▸ Radio wheel sensitivity, so the map matches every other dial. */
+  wheelSensitivity?: number
+  /** Fresh snapshot after a tune, so the dial marker moves without waiting for a poll. */
+  onSnap?: (s: AppSnapshot) => void
+}
+
+/** Compact "how long ago" for a spot tooltip. The unit letter rides inside the message with
+ * its number, so a translation can never separate the two. */
+function ageLabel(secs: number): string {
+  if (secs < 0) return ''
+  if (secs < 60) return t('bandMap.age.secs', { secs })
+  const m = Math.floor(secs / 60)
+  return m < 60 ? t('bandMap.age.mins', { mins: m }) : t('bandMap.age.hours', { hours: Math.floor(m / 60) })
+}
+
+/**
+ * ⚠️ THIS FILE IS ON THE MIGRATED LIST (i18n/hardcoded-strings.test.ts). Every operator-visible
+ * string comes from the catalog. What does NOT: the band and mode names, the gridline and dial
+ * frequencies, and every value in a spot's tooltip — `modeLabel` is CW/SSB, `detail` is the
+ * spot line assembled from data, and `de <spotter>` is the cluster's own shorthand.
+ *
+ * Vertical N1MM-style band map — the same live cluster spots as `BandStrip`, on a vertical
+ * frequency axis (high freq at top) with a labeled gridline scale, COLORED by need/worked exactly
+ * like the operating roster (a marker carries `need-${cls}` from `needByCall`, struck through when
+ * worked). Click a marker to QSY + prefill the log. Unlike the full-band horizontal strip, the map
+ * ZOOMS to where the activity is (the spots + your dial, + a margin) so the calls spread out and
+ * stay readable rather than crushing into one sub-band corner. Labels are de-collided so a dense
+ * cluster stays legible while each tick keeps its true frequency.
+ */
+export function BandMap({
+  band,
+  dialMhz,
+  txAllowed,
+  phoneSegLo,
+  phoneSegHi,
+  spots,
+  spotMode = 'Phone',
+  onWorkSpot,
+  needByCall,
+  typeByCall,
+  workedCalls,
+  onDock,
+  sideband,
+  tuneEnabled,
+  stepHz,
+  wheelSensitivity,
+  onSnap,
+}: Props) {
+  // PER-SURFACE (matching BandStrip, which writes the same key): a wide second-monitor
+  // board can afford the legend where the docked strip cannot.
+  const [showLegend, setShowLegend] = useState(
+    () => (surfaceGet('nexus.spotlegend') ?? '1') === '1',
+  )
+  const toggleLegend = () => {
+    setShowLegend((v) => {
+      surfaceSet('nexus.spotlegend', v ? '0' : '1')
+      return !v
+    })
+  }
+  const range = bandRangeForLabel(band)
+  const modeLabel = spotMode === 'CW' ? 'CW' : 'SSB'
+
+  // Measure the track so label de-collision works at any window height (it flex-fills a resizable
+  // pop-out window, so a fixed height would be wrong). A CALLBACK ref (not useRef+effect) so the
+  // observer attaches whenever the track node mounts — including after an earlier render where the
+  // band was off the plan and the track wasn't rendered at all.
+  const roRef = useRef<ResizeObserver | null>(null)
+  const [trackH, setTrackH] = useState(TRACK_H)
+  // The element itself, as a RefObject, because `useWheelTune` attaches its listener to one.
+  // The callback ref below still owns the ResizeObserver; this just records the node so both
+  // needs are served by the ONE ref the track already had.
+  const trackEl = useRef<HTMLDivElement | null>(null)
+  const trackRef = useCallback((el: HTMLDivElement | null) => {
+    roRef.current?.disconnect()
+    roRef.current = null
+    trackEl.current = el
+    if (el && typeof ResizeObserver !== 'undefined') {
+      const ro = new ResizeObserver(() => setTrackH(el.clientHeight || TRACK_H))
+      ro.observe(el)
+      roRef.current = ro
+      setTrackH(el.clientHeight || TRACK_H)
+    }
+  }, [])
+
+  const inBand = useMemo(
+    () =>
+      spots
+        .filter((s) => s.mode === spotMode && s.band === band)
+        .sort((a, b) => b.freqMhz - a.freqMhz),
+    [spots, spotMode, band],
+  )
+
+  // Zoom window: the activity (spots + dial) plus a margin, clamped to the band, with a minimum
+  // span. Empty → the whole band. This is what keeps the calls spread out instead of crammed.
+  const win = useMemo(() => {
+    if (!range) return null
+    const anchor = inBand.map((s) => s.freqMhz)
+    if (dialMhz >= range.lo && dialMhz <= range.hi) anchor.push(dialMhz)
+    let lo = range.lo
+    let hi = range.hi
+    if (anchor.length > 0) {
+      lo = Math.max(range.lo, Math.min(...anchor) - MARGIN)
+      hi = Math.min(range.hi, Math.max(...anchor) + MARGIN)
+      if (hi - lo < MIN_SPAN) {
+        const mid = (lo + hi) / 2
+        lo = Math.max(range.lo, mid - MIN_SPAN / 2)
+        hi = Math.min(range.hi, mid + MIN_SPAN / 2)
+      }
+    }
+    return { lo, hi }
+  }, [range, inBand, dialMhz])
+
+  // % from the TOP for a frequency (high freq → 0% = top, low freq → 100% = bottom), clamped.
+  const yOf = useMemo(() => {
+    if (!win) return null
+    const span = Math.max(win.hi - win.lo, 1e-6)
+    return (mhz: number) => (1 - (Math.min(win.hi, Math.max(win.lo, mhz)) - win.lo) / span) * 100
+  }, [win])
+
+  // Wheel-tune the track, through the SAME hook the readout digits and the waterfall use — so
+  // the coalescer, the band-edge handling, the per-event step cap and the sensitivity setting
+  // are all the ones the operator already knows, rather than a second implementation that
+  // drifts. `enabled` false makes it inert, which is the read-only case.
+  useWheelTune(trackEl, {
+    dialMhz,
+    sideband: sideband || 'USB',
+    enabled: tuneEnabled === true,
+    stepHz: stepHz ?? 1000,
+    sensitivity: wheelSensitivity,
+    onSnap,
+  })
+
+  // Click-to-tune, through the scope's hook for the same reason.
+  const scopeTune = useScopeTune({
+    sideband: sideband || 'USB',
+    enabled: tuneEnabled === true,
+    onSnap,
+  })
+
+  /** Invert `yOf`: a point on the track is already a frequency, this just reads it back. */
+  const onTrackClick = useCallback(
+    (e: React.MouseEvent<HTMLDivElement>) => {
+      if (tuneEnabled !== true || !win) return
+      // A spot's label is de-collided AWAY from its true frequency, so a click that lands on
+      // one means "work this station", never "tune to wherever the label drifted to". Those
+      // buttons carry their own onWorkSpot and it already QSYs; tuning as well would fight it
+      // with a frequency that is visibly not the spot's.
+      if ((e.target as HTMLElement).closest('.bandmap-spot')) return
+      const el = trackEl.current
+      if (!el) return
+      const rect = el.getBoundingClientRect()
+      if (rect.height <= 0) return
+      const frac = Math.min(1, Math.max(0, (e.clientY - rect.top) / rect.height))
+      // Top of the track is the HIGH edge (yOf is inverted), so walk down from `hi`.
+      const mhz = win.hi - frac * (win.hi - win.lo)
+      scopeTune({ dialHz: mhz * 1e6, kind: 'click' })
+    },
+    [tuneEnabled, win, scopeTune],
+  )
+
+  // Frequency gridlines/labels across the window (top = hi … bottom = lo).
+  const grid = useMemo(() => {
+    if (!win) return []
+    return Array.from({ length: GRID_DIVS + 1 }, (_, k) => ({
+      y: (k / GRID_DIVS) * 100,
+      freq: win.hi - (win.hi - win.lo) * (k / GRID_DIVS),
+    }))
+  }, [win])
+
+  // De-collide labels: forward pass pushes overlaps down, backward pass compresses up if the stack
+  // overflowed the bottom, so every label stays visible + clickable. Ticks keep true frequency.
+  // More spots than fit at LABEL_GAP would pile up into unclickable overlaps, so cap the plotted
+  // set to the FRESHEST that fit and report the rest as "N more" — never a stack of dead targets.
+  const { rows, hidden } = useMemo(() => {
+    if (!yOf) return { rows: [] as { s: SpotRow; freqY: number; labelY: number }[], hidden: 0 }
+    const gapPct = (LABEL_GAP / Math.max(trackH, 1)) * 100
+    const cap = Math.max(4, Math.floor(Math.max(trackH, 1) / LABEL_GAP))
+    const freshness = (s: SpotRow) => (s.ageSecs < 0 ? 0 : s.ageSecs) // unknown age = freshest
+    let plotted = inBand
+    let hid = 0
+    if (inBand.length > cap) {
+      plotted = [...inBand]
+        .sort((a, b) => freshness(a) - freshness(b))
+        .slice(0, cap)
+        .sort((a, b) => b.freqMhz - a.freqMhz)
+      hid = inBand.length - cap
+    }
+    const out = plotted.map((s) => ({ s, freqY: yOf(s.freqMhz), labelY: yOf(s.freqMhz) }))
+    for (let i = 1; i < out.length; i++) {
+      out[i].labelY = Math.max(out[i].labelY, out[i - 1].labelY + gapPct)
+    }
+    const top = gapPct / 2
+    const bottom = 100 - gapPct / 2
+    if (out.length > 0 && out[out.length - 1].labelY > bottom) {
+      out[out.length - 1].labelY = bottom
+      for (let i = out.length - 2; i >= 0; i--) {
+        out[i].labelY = Math.max(top, Math.min(out[i].labelY, out[i + 1].labelY - gapPct))
+      }
+    }
+    return { rows: out, hidden: hid }
+  }, [inBand, yOf, trackH])
+
+  // Band off the UI band plan (e.g. a rig knob tuned somewhere we have no range for): render the
+  // frame + an honest message rather than a blank window.
+  if (!range || !yOf) {
+    return (
+      <div className="bandmap">
+        <div className="bandstrip-head">
+          <span className="bandstrip-title">{t('bandMap.title')}</span>
+          <span className="bandstrip-count">{t('bandMap.offPlan', { band: band || '—' })}</span>
+          {onDock && (
+            <span className="bandmap-dock">
+              <button type="button" className="bandmap-dock-btn" onClick={() => onDock('left')} title={t('bandMap.dock.left.title')}>
+                ◧
+              </button>
+              <button type="button" className="bandmap-dock-btn" onClick={() => onDock('right')} title={t('bandMap.dock.right.title')}>
+                ◨
+              </button>
+            </span>
+          )}
+        </div>
+        <div className="bandmap-track">
+          <div className="bandmap-empty">
+            {t('bandMap.empty.noPlan', { band: band || t('bandMap.empty.thisFrequency') })}
+          </div>
+        </div>
+      </div>
+    )
+  }
+
+  const shade =
+    phoneSegLo != null && phoneSegHi != null
+      ? { top: yOf(phoneSegHi), height: yOf(phoneSegLo) - yOf(phoneSegHi) }
+      : null
+  const dialIn = dialMhz >= (win?.lo ?? 0) && dialMhz <= (win?.hi ?? 0)
+
+  return (
+    <div className="bandmap">
+      <div className="bandstrip-head">
+        <span className="bandstrip-title">{t('bandMap.title')}</span>
+        <span className="bandstrip-count">
+          {inBand.length > 0
+            ? t('bandMap.count', { count: inBand.length, mode: modeLabel, band }) +
+              (hidden > 0 ? t('bandMap.count.more', { count: hidden }) : '')
+            : t('bandMap.empty.none', { mode: modeLabel, band })}
+        </span>
+        <button
+          type="button"
+          className={`bandstrip-legend-toggle${showLegend ? ' on' : ''}`}
+          onClick={toggleLegend}
+          title={t('bandMap.legend.title')}
+          aria-pressed={showLegend}
+        >
+          {t('bandMap.legend.label')}
+        </button>
+        {onDock && (
+          <span className="bandmap-dock">
+            <button type="button" className="bandmap-dock-btn" onClick={() => onDock('left')} title={t('bandMap.dock.left.titleRemembered')}>
+              ◧
+            </button>
+            <button type="button" className="bandmap-dock-btn" onClick={() => onDock('right')} title={t('bandMap.dock.right.titleRemembered')}>
+              ◨
+            </button>
+          </span>
+        )}
+      </div>
+      {showLegend && <SpotLegend />}
+      <div
+        ref={trackRef}
+        onClick={onTrackClick}
+        className={`bandmap-track${tuneEnabled === true ? ' tunable' : ''}`}
+        title={
+          tuneEnabled === true
+            ? t('bandMap.track.title.tunable', { band })
+            : t('bandMap.track.title', { band })
+        }
+      >
+        {grid.map((g, k) => (
+          <div className="bandmap-grid" key={k} style={{ top: `${g.y}%` }}>
+            <span className="bandmap-grid-lbl mono">{g.freq.toFixed(3)}</span>
+          </div>
+        ))}
+        {shade && shade.height > 0 && (
+          <div
+            className="bandmap-shade"
+            style={{ top: `${shade.top}%`, height: `${shade.height}%` }}
+            title={t('bandMap.shade.title')}
+          />
+        )}
+        {rows.map(({ s, freqY, labelY }, i) => {
+          const cu = s.call.toUpperCase()
+          // A beacon/bulletin row never carries a need colour. `needByCall` is keyed by CALL,
+          // so without this a call that is BOTH a beacon site and a real station (4U1UN is
+          // the IBP beacon and the UN HQ station) would paint its beacon row with the colour
+          // earned by its real one. The backend already refuses to score the beacon itself.
+          const beacon = s.beacon ? BEACON_BADGE[s.beacon] : null
+          const need = beacon ? null : (needByCall?.get(cu) ?? null)
+          const chip = need ? NEED_CHIP[need] : null
+          const type = typeByCall?.get(cu)
+          const badge = type ? TYPE_BADGE[type] : null
+          const worked = workedCalls?.has(cu) ?? false
+          const opacity = s.ageSecs < 0 ? 0.95 : Math.max(0.4, 1 - s.ageSecs / 1800)
+          const detail = [
+            s.call,
+            `${s.freqMhz.toFixed(3)} MHz`,
+            ageLabel(s.ageSecs),
+            beacon?.word,
+            chip?.label,
+            badge?.word,
+            s.spotter && `de ${s.spotter}`,
+            s.comment,
+          ]
+            .filter(Boolean)
+            .join(' · ')
+          const needCls = chip ? ` need-${chip.cls}` : ''
+          return (
+            <span key={`${s.call}-${s.freqMhz}-${i}`}>
+              {/* tick at the TRUE frequency; the clickable label is de-collided nearby */}
+              <span className={`bandmap-tick${needCls}`} style={{ top: `${freqY}%` }} />
+              <button
+                type="button"
+                className={`bandmap-spot${needCls}${worked ? ' worked' : ''}`}
+                style={{ top: `${labelY}%`, opacity }}
+                title={t('bandMap.spot.title', { detail })}
+                onClick={() => onWorkSpot(s)}
+              >
+                {beacon && <span className={`spot-type-badge ${beacon.cls}`}>{beacon.ch}</span>}
+                {badge && <span className={`spot-type-badge ${badge.cls}`}>{badge.ch}</span>}
+                <span className="bandmap-call mono">{s.call}</span>
+              </button>
+            </span>
+          )
+        })}
+        {dialIn && (
+          <div
+            className={`bandmap-dial${txAllowed ? '' : ' blocked'}`}
+            style={{ top: `${yOf(dialMhz)}%` }}
+            title={
+              txAllowed
+                ? t('bandMap.dial.title', { freq: dialMhz.toFixed(3) })
+                : t('bandMap.dial.title.blocked', { freq: dialMhz.toFixed(3) })
+            }
+          >
+            <span className="bandmap-dial-lbl mono">{dialMhz.toFixed(3)}</span>
+          </div>
+        )}
+        {rows.length === 0 && (
+          <div className="bandmap-empty">{t('bandMap.empty.none', { mode: modeLabel, band })}</div>
+        )}
+      </div>
+    </div>
+  )
+}

@@ -1,0 +1,150 @@
+# Nexus desktop shell (Tauri v2).
+#
+# This crate is deliberately STANDALONE — note the empty `[workspace]` table
+# below. It is NOT a member of the root `../Cargo.toml` workspace. Keeping it
+# out of the workspace means the workspace (tempo-fast-sys / ft1 / tempo-core) keeps
+# building on hosts that have no WebView toolchain (this dev box has no
+# webkit2gtk and no display, so Tauri cannot build here). The shell builds on a
+# machine that has the platform WebView runtime — see README.md.
+[package]
+publish = false
+name = "tempo"
+version = "1.10.3"
+edition = "2021"
+license = "GPL-3.0-only"
+authors = ["KD9TAW <kd9taw@protonmail.com>"]
+repository = "https://github.com/kd9taw/nexus"
+homepage = "https://github.com/kd9taw/nexus"
+description = "Nexus — all-mode ham radio operations center; Tauri v2 desktop shell"
+# Pin a modern-enough toolchain; Tauri v2 requires a recent stable Rust.
+rust-version = "1.77"
+
+# Empty workspace table => this Cargo.toml is its own workspace root, so it is
+# NOT pulled into ../Cargo.toml. Do not add members here.
+[workspace]
+
+# The class guard, spelled out because this crate is its OWN workspace and
+# cannot inherit the root's `[workspace.lints]` — the exact reason src-tauri is
+# missed by `cargo clippy --workspace`. It carries every Tauri command, so it is
+# the crate where a match-scrutinee guard re-lock hangs the whole app. Rationale
+# in full at `[workspace.lints.clippy]` in ../Cargo.toml.
+#
+# `deny`, not `warn`, and ONLY here: the root's `warn` is promoted to an error by
+# the `-D warnings` on every workspace clippy step, but src-tauri's CI step
+# deliberately carries no `-D warnings` (it has ~37 pre-existing lints — see the
+# comment on that step in ci.yml). A `warn` here would therefore be warning #38
+# in a step that exits 0, i.e. no gate at all in the one crate that matters most.
+# Deny makes it a hard error without touching the pre-existing backlog.
+[lints.clippy]
+significant_drop_in_scrutinee = "deny"
+
+[[bin]]
+name = "Nexus"
+path = "src/main.rs"
+
+[lib]
+# The Tauri app logic lives in the library so it can be unit-tested and
+# (on mobile) reused as the entry point. `main.rs` is a thin wrapper.
+name = "tempo_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+# protocol-asset backs tauri.conf.json's assetProtocol (SSTV gallery BMPs served
+# to the webview via convertFileSrc under the sstv-gallery scope).
+tauri = { version = "2", features = ["protocol-asset"] }
+tauri-plugin-opener = "2"
+# Pounce's OS notification. The web Notification API does not exist in WKWebView (and no
+# permission was ever requested on any platform), so the alert half of Pounce was dead
+# app-wide — this is the standard Tauri v2 plugin for the job, first-party like opener/
+# updater. Apache-2.0 OR MIT — compatible with our GPL-3.0-only. OSS-integration checklist
+# run 2026-08-17; NOTICE updated. Called from Rust (os_notify), so no ACL capability entry.
+tauri-plugin-notification = "2"
+# Signed self-update (0.17.17). Apache-2.0 OR MIT (Tauri first-party, same licence as tauri
+# itself, already vendored) — compatible with our GPL-3.0-only. OSS-integration checklist run
+# 2026-07-25; NOTICE updated.
+tauri-plugin-updater = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Update-check fetch of SourceForge best_release.json. Matches the propagation crate's exact
+# reqwest spec (rustls-tls, NOT native-tls) so the MinGW cross-build never pulls in openssl.
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "json"] }
+# The application/domain logic. Built by the M3 UI task (#2). This shell only
+# locks its AppState behind a Mutex and forwards commands to it.
+tempo-app = { path = "../crates/tempo-app" }
+# Propagation & opening intelligence with LIVE feeds (NOAA SWPC + PSK Reporter).
+propagation = { path = "../crates/propagation", features = ["live"] }
+# DX-cluster / RBN spot feed for need-aware spotting.
+tempo-net = { path = "../crates/tempo-net" }
+# OS-native credential vault for the LoTW password (Windows Credential Manager /
+# macOS Keychain / Linux Secret Service). No external dep on Windows/macOS.
+keyring = { version = "3.6", features = [
+    "apple-native",
+    "windows-native",
+    "sync-secret-service",
+] }
+# tempo-core for the pure LoTW URL/validate/high-water helpers used by the
+# download command (the reconcile path is reached via tempo-app).
+tempo-core = { path = "../crates/tempo-core" }
+
+# SSTV encoder for the transmit command: the webview sends raw RGB, the command
+# resolves the mode + validates dims via `for_mode` and encodes via `encode_image`
+# (off the engine lock). Already in the lockfile transitively via tempo-audio; a
+# direct dep here needs no new external crate.
+tempo-sstv = { path = "../crates/tempo-sstv" }
+# Real sound-card + rig transport (optional; enabled by the `radio` feature).
+tempo-audio = { path = "../crates/tempo-audio", optional = true }
+
+# Reading the display's EDID physical size, which is the only way to learn a Linux panel's
+# true DPI: X11 reports scale factor 1 whatever the hardware is, so the UI scale had no
+# signal to work from (see `display_metrics`). LINUX ONLY and NOT A NEW PACKAGE — gdk 0.18.2
+# is already in this tree, pulled in by tao via tauri itself, and this pins the same version:
+# the Cargo.lock diff for adding it is one line, the crate's name against `tempo`. Nothing new
+# is fetched, built or linked.
+#
+# Licence: MIT (gtk-rs/gtk3-rs, verified against the crate's own LICENSE text, not just its
+# metadata) — compatible with our GPL-3.0-only.
+#
+# ⚠️ It is also UNMAINTAINED, and knowingly so: gtk3-rs is archived and RUSTSEC-2024-0412 is
+# already in deny.toml's ignore list with the reason ("every tauri v2 app carries these ten;
+# the fix is upstream tauri moving to gtk4"). Depending on it directly adds no exposure we do
+# not already have and stops mattering at the same moment the transitive one does — on a tauri
+# major. If that migration ever lands, this is one of the call sites to move.
+#
+# ⚠️ NOTICE ENTRY IS OUTSTANDING — it belongs in the "Rust crate dependencies" list and adding
+# it is approval-gated. Do not ship a release from this without it.
+[target.'cfg(target_os = "linux")'.dependencies]
+gdk = "0.18"
+
+[features]
+# This feature is used by the desktop binary. It allows configuring whether the
+# app uses the custom protocol assets or the dev server (handled by Tauri).
+custom-protocol = ["tauri/custom-protocol"]
+# Enable the live radio loop (sound card via cpal + PTT/CAT via rigctld). Needs
+# the platform audio dev libs at build time (ALSA/CoreAudio/WASAPI) and a sound
+# card (+ optional rigctld) at runtime. Without it the shell serves app state but
+# does not key the radio — useful for UI work.
+radio = ["dep:tempo-audio", "tempo-audio/device", "tempo-audio/serial", "tempo-audio/ai-cw"]
+
+# Shipped binaries: strip DWARF at link time. A tester's heaptrack showed std's
+# panic-backtrace machinery (gimli) retaining ~68 MB parsing the binary's debug
+# info after a caught panic; with no DWARF there is nothing to parse, and the
+# installers shrink. The symbol table stays, so panic messages still name
+# functions. Dev builds keep full debug info.
+[profile.release]
+strip = "debuginfo"
+# ⭐ MEASURED, NOT ASSUMED: 87.3 MB -> 55.2 MB on the windows-gnu build, same commit, profile the
+# only difference. That is 32 MB off what an operator installs, and most of what the cpal 0.18
+# upgrade cost — that upgrade swapped `windows-sys` for the full `windows` crate family to reach
+# six sample formats Nexus had been refusing outright, and put 44 MB into the binary doing it.
+#
+# ⚠️ `panic = "abort"` is NOT here and must not be added to save more. There are 16 catch_unwind
+# sites in this codebase; abort turns every one of them into a hard crash. It belongs to crash
+# BEHAVIOUR, not to file size, and it was in the first draft of this change until it was caught.
+#
+# The cost is build time: fat LTO with one codegen unit is slow, and it is paid on release
+# builds only.
+lto = true
+codegen-units = 1

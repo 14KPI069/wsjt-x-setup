@@ -1,0 +1,213 @@
+// @vitest-environment jsdom
+//
+// Field report 2026-08: a Hermes Lite 2 owner running Thetis could not make CAT work in
+// Nexus (it worked in WSJT-X), and got it going by picking a FlexRadio profile. Two things
+// in this panel were part of that: "Network (FlexRadio / remote)" told an SDR operator the
+// row was not for them, and the two Flex native-stream toggles were gated on the rig model's
+// NAME containing "flex" — which the PowerSDR entry's label matched, offering a SmartSDR
+// VITA-49 stream to an ANAN/HL2 that cannot serve one.
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
+import { render, screen, cleanup, fireEvent } from '@testing-library/react'
+import { SettingsPanel } from './SettingsPanel'
+import type { FeaturesApi } from '../useFeatures'
+import defaultSettings from './__fixtures__/defaultSettings.json'
+
+const api = vi.hoisted(() => {
+  const spies: Record<string, ReturnType<typeof vi.fn>> = {}
+  const get = (name: string) => {
+    if (!spies[name]) spies[name] = vi.fn(() => Promise.resolve(null))
+    return spies[name]
+  }
+  return { spies, get }
+})
+
+// Mock EVERY export of `../api`, derived from the real module rather than a hand-kept list.
+//
+// The list was the problem: a verb missing from it made the panel THROW ON MOUNT ("No export is
+// defined on the mock"), which presents as a behaviour regression in whichever test happened to
+// run -- not as the out-of-date mock it actually is. Reading the real module's export names makes
+// that failure impossible by construction.
+vi.mock('../api', async (importOriginal) => {
+  const actual = await importOriginal<Record<string, unknown>>()
+  const mod: Record<string, unknown> = {}
+  for (const name of Object.keys(actual)) {
+    mod[name] = typeof actual[name] === 'function' ? api.get(name) : actual[name]
+  }
+  return mod
+})
+vi.mock('../toast', () => ({
+  pushToast: vi.fn(),
+  withErrorToast: vi.fn(async (fn: () => Promise<unknown>) => fn()),
+}))
+
+/** One radio, on a network CAT address, with the given model. */
+function networkRadio(rigModel: number, rigModelName: string) {
+  const radio = {
+    id: 0,
+    name: 'Radio 1',
+    enabled: true,
+    serialPort: '',
+    baud: 38400,
+    rigModel,
+    rigModelName,
+    rigConn: 'network',
+    rigAddr: '127.0.0.1:13013',
+    rigctldPort: 4532,
+    rotctldPort: 4533,
+    icomNativeCat: false,
+    audioIn: 'in-0',
+    audioOut: 'out-0',
+    txLevel: 1,
+    rxGain: 1,
+    pttMethod: 'cat',
+    rotatorModel: 0,
+    rotatorPort: '',
+    rotatorBaud: 9600,
+    rotatorHost: '',
+    nativeScope: 'auto',
+    bands: [],
+  }
+  return {
+    ...defaultSettings,
+    ...radio,
+    // `flexRadioIp` is the OTHER half of the Flex gate — empty here, so the model number is
+    // the only thing that can open those toggles.
+    flexRadioIp: '',
+    mycall: 'KD9TAW',
+    mygrid: 'EN52',
+    activeRadio: 0,
+    radios: [radio],
+  } as never
+}
+
+const features: FeaturesApi = {
+  enabled: () => true,
+  setEnabled: vi.fn(),
+  all: () => [],
+  profile: 'full',
+  setProfile: vi.fn(),
+} as unknown as FeaturesApi
+
+function renderPanel() {
+  return render(
+    <SettingsPanel
+      activeRadioId={0}
+      scale={1 as never}
+      scaleMode={'auto' as never}
+      scaleCap={1 as never}
+      onScaleModeChange={() => {}}
+      onScaleCapChange={() => {}}
+      density={'comfortable' as never}
+      onDensityChange={() => {}}
+      onResetLayout={() => {}}
+      features={features}
+    />,
+  )
+}
+
+beforeEach(() => {
+  for (const spy of Object.values(api.spies)) {
+    spy.mockClear()
+    spy.mockImplementation(() => Promise.resolve(null))
+  }
+  api.get('getRigModels').mockImplementation(() => Promise.resolve([]))
+  api.get('getAllRigModels').mockImplementation(() => Promise.resolve([]))
+  api.get('getSerialPortsDetailed').mockImplementation(() => Promise.resolve([]))
+  api.get('getBandPlan').mockImplementation(() => Promise.resolve([]))
+  api.get('getAudioDevices').mockImplementation(() => Promise.resolve({ input: [], output: [] }))
+  api.get('getCredentialsStatus').mockImplementation(() => Promise.resolve({}))
+  api.get('detectRigs').mockImplementation(() => Promise.resolve([]))
+  api.get('appVersion').mockImplementation(() => Promise.resolve('1.0.1'))
+})
+afterEach(cleanup)
+
+async function openRadioTab(settings: unknown) {
+  api.get('getSettings').mockImplementation(() => Promise.resolve(settings))
+  renderPanel()
+  fireEvent.click(await screen.findByRole('tab', { name: 'Radio' }))
+  // The Connection row is unconditional on this tab — wait for it before asserting absence.
+  await screen.findByText('Connection')
+}
+
+/** The Flex native-stream toggles live in the collapsed "Advanced" disclosure. Open it —
+ *  an absence assertion against a collapsed group would pass for every model. */
+async function openAdvanced() {
+  fireEvent.click(await screen.findByRole('button', { name: /Advanced/ }))
+  // Proof the group really opened, so the toggle assertions below mean something.
+  await screen.findByText('rigctld TCP Port')
+}
+
+describe('the SmartSDR-only toggles are gated on the radio, not on the word "flex"', () => {
+  it('an SDR program that merely mentions FLEX is not offered a SmartSDR stream', async () => {
+    // The shipped 2048 label carries "legacy FLEX" — and the old label was literally
+    // "FlexRadio PowerSDR". Neither radio can serve a SmartSDR VITA-49 panadapter or DAX.
+    await openRadioTab(networkRadio(2048, 'PowerSDR / mRX PS (Apache ANAN / legacy FLEX)'))
+    await openAdvanced()
+    expect(screen.queryByText(/Flex native panadapter/i)).toBeNull()
+    expect(screen.queryByText(/Flex native DAX audio/i)).toBeNull()
+  })
+
+  it('Thetis is not offered one either', async () => {
+    await openRadioTab(networkRadio(2054, 'Thetis (Hermes Lite 2 / ANAN / HPSDR)'))
+    await openAdvanced()
+    expect(screen.queryByText(/Flex native panadapter/i)).toBeNull()
+    expect(screen.queryByText(/Flex native DAX audio/i)).toBeNull()
+  })
+
+  it('a real FLEX-6xxx on SmartSDR CAT still gets both — the verified-good configuration', async () => {
+    await openRadioTab(networkRadio(2036, 'FlexRadio FLEX-6xxx (SmartSDR CAT)'))
+    await openAdvanced()
+    expect(screen.queryByText(/Flex native panadapter/i)).not.toBeNull()
+    expect(screen.queryByText(/Flex native DAX audio/i)).not.toBeNull()
+  })
+})
+
+describe('the Connection row tells an SDR operator it is for them', () => {
+  it('the network option is not labelled as a FlexRadio row', async () => {
+    await openRadioTab(networkRadio(2054, 'Thetis (Hermes Lite 2 / ANAN / HPSDR)'))
+    const network = screen.getByRole('option', { name: /^Network/ }) as HTMLOptionElement
+    expect(network.value).toBe('network') // the persisted value must NOT move
+    expect(network.textContent).toMatch(/SDR/i)
+    expect(network.textContent).not.toMatch(/FlexRadio/i)
+  })
+})
+
+describe('the port hint tells the truth about TCI', () => {
+  // ⚠️ THIS HINT HAS BEEN WRONG TWICE, IN OPPOSITE DIRECTIONS. Both are pinned here so a
+  // third wording cannot revive either.
+  //
+  //   1. It shipped saying the TCI Server box is "a WebSocket protocol Nexus can't drive".
+  //      Too strong: Hamlib has a TCI backend, so the flat denial was false.
+  //   2. It was then rewritten to send the operator to model 7 — on the evidence that
+  //      `strings libhamlib-4.dll` contains `tci1x.c`. That inference does not hold. Source
+  //      strings can be present while the backend is not registered in the build, and
+  //      measured on the real delivery path the bundled daemon answers:
+  //        rigctld.exe -m 7 -r 127.0.0.1:50001  ->  "Unknown rig num 7, or initialization
+  //        error."  (while -m 1 starts fine, and `rigctl -l` lists no TCI entry at all)
+  //      Model 7 was removed from the catalog on 2026-08-06. Pointing anyone at it was
+  //      pointing them at a daemon that refuses to start.
+  //
+  // What is true, and all this field needs to say: 50001 is Thetis's TCI Server port, this
+  // build cannot drive TCI, so the CAT server port (13013) is the number that belongs here.
+  it('does not send the operator to a model this build cannot load', async () => {
+    await openRadioTab(networkRadio(2054, 'Thetis (Hermes Lite 2 / ANAN / HPSDR)'))
+    const text = screen.getByText(/Running an SDR program/).textContent ?? ''
+    // Failure 2: no route via model 7. It cannot load.
+    expect(text).not.toMatch(/model 7|\(7\)/)
+    expect(text).not.toMatch(/Show all models/i)
+    // Failure 1: do not deny TCI exists as a protocol — say what THIS build lacks.
+    expect(text).not.toMatch(/can'?t drive|cannot drive|unsupported/i)
+    // Still steers this field to the CAT port, and still names the box not to use.
+    expect(text).toMatch(/13013/)
+    expect(text).toMatch(/50001/)
+  })
+
+  // The claim "beta in Hamlib" is not readable from the artifact we ship: `rig_caps.status`
+  // in the bundled libhamlib-4.dll is an enum, not a string, so nothing in this build can
+  // check it. It matched upstream source at the time of writing and nothing keeps it true.
+  it('makes no claim about Hamlib maturity that this build cannot check', async () => {
+    await openRadioTab(networkRadio(2054, 'x'))
+    const text = screen.getByText(/Running an SDR program/).textContent ?? ''
+    expect(text).not.toMatch(/beta|alpha|experimental/i)
+  })
+})

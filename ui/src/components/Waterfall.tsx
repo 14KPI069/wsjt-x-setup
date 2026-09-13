@@ -1,0 +1,1137 @@
+// ⚠️ THIS FILE IS ON THE **MIGRATED** LIST (i18n/hardcoded-strings.test.ts): the wide graph's
+// prose — its heading, the gesture hint, the zoom/gain/zero controls, the scroll, 3D, pause and
+// pop-out buttons, the canvas and the legend — is in the catalog under `waterfall.*`. It is an
+// INSTRUMENT: its gestures set the RX and TX audio offsets, and it holds no transmit control.
+//
+// The units rule lands on the SPECTRUM: every span in kHz, the `dBr` legend and its ticks, the
+// frequency axis and the scrollback time tape drawn into the bitmap, and the RX/TX marker names
+// are measurements and tokens, so they stay in the code — as do the zoom LABELS, which live in
+// `waterfall.ts` and are not this batch's file. The one thing drawn on the canvas that IS prose
+// is the paused chip, and it comes from the catalog.
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import { getSpectrumRow } from '../api'
+import { sampleLut } from '../colormaps'
+import {
+  agcRange,
+  applyGainZero,
+  bakeLut,
+  flattenRow,
+  isRfScopeSource,
+  normalize,
+  parkFloor,
+  resampleRow,
+  resolveColormap,
+  RowFetchLatch,
+  WATERFALL_ZOOMS,
+  WF_FLOOR_PCT,
+  coerceZoomSpan,
+  zoomWindow,
+  MIN_SPAN,
+  spanDb,
+  tuneTarget,
+} from '../waterfall'
+import { useWaterfallPalette } from '../waterfallPalette'
+import { WaterfallHistory, ageLabel } from '../waterfallHistory'
+import { drawDss } from '../dss'
+import { surfaceGet, surfaceSet } from '../features/windowScope'
+import { PalettePicker } from './PalettePicker'
+import { MOD_LABEL } from '../platform'
+import { t } from '../i18n'
+
+/** The legend's unit — relative dB, the scale WSJT-X uses. A unit, not a word. */
+const DBR = 'dBr'
+
+/** Persist the operator's manual waterfall contrast (gain/zero) in localStorage; 0 = auto.
+ * The palette lives in the shared master store (see `waterfallPalette.ts`).
+ *
+ * gain/zero stay SHARED (app-wide): they are a contrast calibration against the station's
+ * own noise floor, and re-calibrating per window is the surprise. Their true scope is the
+ * RADIO — when `r<id>` surfaces exist they should move to `scopedKey(_, 'radio')`, which
+ * leaves the key bare until then, NOT to per-surface. */
+const GAIN_KEY = 'nexus.waterfall.gain'
+const ZERO_KEY = 'nexus.waterfall.zero'
+/** PER-SURFACE: a wide overview docked plus a zoomed-in torn-off waterfall is the reason
+ *  to pop the waterfall out at all. */
+const ZOOM_KEY = 'nexus.waterfall.zoom'
+/** PER-SURFACE: 2D scroll vs 3D stacked-spectrum (3DSS) view. A torn-off 3D display next to a
+ *  docked 2D one is a legitimate multi-monitor setup, so this is per-surface like the zoom. */
+const THREED_KEY = 'nexus.waterfall.dss'
+/** PER-SURFACE: which way the flat 2D waterfall scrolls — `down` = newest row at the TOP.
+ *
+ *  ⚠️ THE DEFAULT IS `down` (operator ruling, 2026-08-15). It was `up` — newest at the BOTTOM —
+ *  for every build through 1.3.2, and the opt-in ran the other way. Flipping a default is not
+ *  free: every operator who never touched the toggle sees their waterfall reverse on upgrade,
+ *  which is exactly what the previous wording existed to prevent. That was a deliberate call,
+ *  not a silent one, and the button is right there in the waterfall header for anyone who wants
+ *  the old direction back.
+ *
+ *  Only the exact string `up` opts out now. ABSENT, blank, stale, or written by some other build
+ *  all resolve to `down` — the reading is unchanged in shape, just inverted in polarity, so a
+ *  foreign value can still never select a direction nobody chose. An operator who already tried
+ *  `down` and went back keeps `up`, because the toggle writes both strings explicitly.
+ *
+ *  Per-surface for the same reason as the zoom and the 3D toggle: a torn-off waterfall on a
+ *  second monitor may legitimately run the other way from the docked one. */
+const FLOW_KEY = 'nexus.waterfall.flow'
+/** Load a persisted [-1,1] slider value (gain/zero); missing/blocked → 0 (= auto). */
+function loadKnob(key: string): number {
+  try {
+    const v = parseFloat(localStorage.getItem(key) ?? '')
+    return Number.isFinite(v) ? Math.max(-1, Math.min(1, v)) : 0
+  } catch {
+    return 0
+  }
+}
+/** Load the persisted waterfall view; missing/blocked/out-of-range → 0 (the default
+ * 0–3 kHz "Std" view). Only the picker's own option values are legitimate — "any finite
+ * value is kept" (the old rule) let a stale/foreign span render a view the zoom select
+ * cannot represent. */
+function loadZoom(): number {
+  const v = parseFloat(surfaceGet(ZOOM_KEY) ?? '')
+  return Number.isFinite(v) ? coerceZoomSpan(v) : 0
+}
+
+interface Props {
+  transmitting: boolean
+  /** Receive audio offset (Hz) — the green marker (where we listen). */
+  rxOffsetHz: number
+  /** Transmit audio offset (Hz) — the red marker (where we transmit). */
+  txOffsetHz: number
+  theme: string
+  /** Tune from a waterfall click: set the TX offset, the RX offset, or both. */
+  onTune?: (freqHz: number, target: 'tx' | 'rx' | 'both') => void
+  /** False while the Operate cockpit is navigated away (kept mounted but hidden):
+   * pause the spectrum fetch/scroll/overlay and preserve the canvas backing store
+   * so returning shows the accumulated waterfall intact (no CPU spent while away). */
+  active?: boolean
+  /** Pop the waterfall into its own window. When set, a ⧉ button renders as the last
+   * item of the header row (kept in-flow so it never overlaps the Gain/Zero knobs). */
+  onPopOut?: () => void
+  /** Named vertical cursors (Hz + color + short label) drawn IN PLACE OF the RX/TX
+   * markers — e.g. RTTY mark/space. When set, the RX/TX marker block is skipped; the
+   * FT8 path is byte-identical when this is undefined. */
+  cursors?: { hz: number; color: string; label: string }[]
+  /** Header hint text override (default: the left/right/Shift/Ctrl legend). */
+  hint?: string
+  /** New-row poll cadence (ms) — and, because the producer publishes every 20 ms
+   * (`tempo_audio::rxdsp::TICK_MS`), also how many published frames each drawn row stands
+   * for: ~6 at the default 120 (the FT surfaces), ~2.5 at 50.
+   *
+   * ⚠️ This doc used to claim 120 was "slot-synchronous mode" and "matches WSJT-X". BOTH
+   * WERE FALSE and went unexamined for it: nothing in this component synchronises to an FT
+   * slot (`acc`/`rowMs` is a free-running accumulator), and WSJT-X draws 0.69 rows/s
+   * (`m_waterfallAvg` 5 × a 288 ms symspec hop, widegraph.cpp:66,160-172) — 12× SLOWER
+   * than us, not equal.
+   *
+   * Why 120 stays 120 on the FT surfaces, now that it has a real reason: it buys ~6 frames
+   * per row, and a viewport of ~450 device rows holds ~54 s of history — 3½ FT8 cycles,
+   * which is what the operator actually reads the waterfall for. Halving it would halve
+   * BOTH (noisier floor, ~1½ cycles on screen) and cost 2.4× the IPC, which several mounted
+   * waterfalls each pay a 512-float row for.
+   *
+   * ⚠️ DO NOT READ "~6 frames" AS PARITY WITH WSJT-X's 5. The counts are not comparable and
+   * an earlier revision of this comment let them look it. Our six frames are 171 ms windows
+   * overlapping 88%, worth roughly ENL 1.7; theirs are five 1.365 s windows overlapping 79%,
+   * integrating ~2.5 s at about ENL 3. We are still the noisier picture by ~1 dB rms — the
+   * honest figure is in the `spectrum.rs` module header and this is the number to carry away.
+   *
+   * The live-instrument surfaces (RTTY cockpit, SSTV band) pass 50 to match the rig scope's
+   * 20 Hz (PhoneScope) — at 120 they discarded 5 of every 6 rows, the operator's "smoothed
+   * out" report (2026-07-30). Reduced-motion still overrides to the gentler 480 either way. */
+  rowMs?: number
+  /** Palette scope (see `waterfallPalette.ts`). The FT8/FT4 surfaces pass
+   * `FT_PALETTE_SCOPE` so they keep their own palette, defaulting to Turbo, instead of
+   * inheriting a pick made in another mode. Unset = the shared master palette, which is
+   * what the RTTY and SSTV waterfalls want (they move with the CW/Phone scopes). */
+  paletteScope?: string
+  /** Paint a DARK BAND for the duration of our own transmission (and freeze the visual AGC
+   * with it). See the fill site in `drawRow` for the full argument.
+   *
+   * ⚠️ DEFAULT FALSE, and the default is the point. This is an FT-surface behavior: an FT8/FT4
+   * over is 13 seconds, so a black band is read as "that was us transmitting" and the picture
+   * is honest about having no receiver during it. The SAME component draws the RTTY cockpit's
+   * and SSTV's band, where an over runs MINUTES — there a scrolling black band is
+   * indistinguishable from a dead waterfall, and field reports (2026-08-17) read it as exactly
+   * that. Those surfaces keep the pre-1.5 behavior of painting the rows they are served, which
+   * under the backend's transmit hold is the last real picture of the band. */
+  txBlanks?: boolean
+}
+
+// Default FT8/digital view window (Hz) — the FT8 signals live here, now spanning the full 4 kHz
+// spectrum row so stations calling above ~2.9 kHz are visible + clickable. drawRow maps the view
+// onto the row via the DTO's lo/hi, so the row and view share the same span.
+const F_MIN = 200
+const F_MAX = 4000
+
+// Display mapping over the current view window [lo, hi] (defaults = the FT8 view), so
+// the waterfall can zoom into a sub-range of the band.
+function freqToX(hz: number, width: number, lo = F_MIN, hi = F_MAX): number {
+  const f = Math.max(lo, Math.min(hi, hz))
+  return ((f - lo) / (hi - lo)) * width
+}
+
+function xToFreq(x: number, width: number, lo = F_MIN, hi = F_MAX): number {
+  return lo + (x / width) * (hi - lo)
+}
+
+export function Waterfall({
+  transmitting,
+  rxOffsetHz,
+  txOffsetHz,
+  theme,
+  onTune,
+  active = true,
+  onPopOut,
+  cursors,
+  hint,
+  rowMs = 120,
+  paletteScope,
+  txBlanks = false,
+}: Props) {
+  const canvasRef = useRef<HTMLCanvasElement>(null)
+  // Separate transparent overlay for the axis + Rx/Tx markers, so they are NEVER baked into
+  // the scrolling spectrum canvas (a moved marker used to freeze into the image and scroll up
+  // as a streak — one per past tune). The overlay is cleared every frame.
+  const overlayRef = useRef<HTMLCanvasElement>(null)
+  const rafRef = useRef<number | null>(null)
+  // Master palette ('auto' = theme-driven), shared across every scope; changing it in any
+  // mode recolors them all. Manual contrast (gain/zero, 0 = pure auto-AGC) stays local.
+  const [palette] = useWaterfallPalette(paletteScope)
+  const [gain, setGain] = useState<number>(() => loadKnob(GAIN_KEY))
+  const [zero, setZero] = useState<number>(() => loadKnob(ZERO_KEY))
+  // Span/zoom: the displayed audio-band window. 0 = the default Std 0–3 kHz view, -1 = Full
+  // 0–4 kHz, positive = a sub-window centered on the RX marker. Only the SPAN is state; the
+  // window is DERIVED from (span, RX marker) on every render and never stored.
+  //
+  // ⚠️ The window used to be `useState` too, and that is issue #115 (akhepcat — "waterfall
+  // X-axis labels incorrect when switching bandpass"). A stored copy of a derived value has
+  // to be re-synced by hand, and there was exactly one writer — the zoom <select>'s onChange
+  // below — plus a useState INITIALISER that ran at FIRST RENDER. So a persisted span centered
+  // on whatever `rxOffsetHz` happened to be at mount (0 before the first snapshot lands) and
+  // then froze: the axis went on labelling 200–800 Hz however far the operator tuned. The
+  // labels were always right FOR the window — the window was stale. Deriving it retires the
+  // staleness class outright rather than adding a second hand-written writer.
+  //
+  // Std/Full are FIXED windows (see `zoomRange`), so a retune is a no-op for them — the same
+  // edges come back and the rebuild effect below sees no change. And `rxOffsetHz` moves only
+  // when the operator moves it (a waterfall click, a decode double-click, `rtty_net`/`psk_net`
+  // — RTTY/PSK AFC is reported separately and does NOT drag the netted center), so following
+  // it costs one cold re-render per retune, not one per poll.
+  const [zoomSpan, setZoomSpan] = useState<number>(loadZoom)
+  // ⚠️ THE WINDOW HAS MEMORY, so this is not a pure re-derivation (#164). Re-centring on the
+  // marker every render made the display PAN: a left-click moves the RX marker, so each click
+  // slid the view by up to half a span. `zoomWindow` holds the slice still while the marker is
+  // inside it and pages only when it leaves — which keeps #115's guarantee that the window can
+  // never be stale. The ref is the previous window; nothing else reads it.
+  const prevViewRef = useRef<{ lo: number; hi: number } | null>(null)
+  const view = useMemo(() => {
+    const next = zoomWindow(prevViewRef.current, rxOffsetHz, zoomSpan)
+    prevViewRef.current = next
+    return next
+  }, [rxOffsetHz, zoomSpan])
+  // refs so the animation loop always reads current props without re-subscribing
+  const txRef = useRef(transmitting)
+  const txBlanksRef = useRef(txBlanks)
+  const themeRef = useRef(theme)
+  const rxOffRef = useRef(rxOffsetHz)
+  const txOffRef = useRef(txOffsetHz)
+  const cursorsRef = useRef(cursors)
+  const activeRef = useRef(active)
+  const rowMsRef = useRef(rowMs)
+  const gainRef = useRef(gain)
+  const zeroRef = useRef(zero)
+  const viewLoRef = useRef(view.lo)
+  const viewHiRef = useRef(view.hi)
+  // pre-baked colormap LUT (256×RGBA) for the render hot path; rebuilt on palette/theme.
+  const lutRef = useRef<Uint8ClampedArray>(bakeLut(resolveColormap(palette, theme)))
+  // live legend readout (updated directly, no React re-render at 8 Hz)
+  const dbLabelRef = useRef<HTMLSpanElement>(null)
+  // Retained waterfall DATA (not pixels): every row survives with its own frequency frame,
+  // so the cold paths re-render FROM DATA — instant palette recolor of history, smear-free
+  // zoom/resize, pause + scrollback. The hot path appends + scrolls a retained RGBA buffer
+  // (no canvas readback; the spectrum canvas is now write-only).
+  // Columns = the audio feed's own bin count (`rxdsp::compute_row` BINS), so a row is stored
+  // EXACTLY — no resample on the way in. Storing 1024 forced an upsampling push that
+  // interpolated a one-bin FT8 tone down to 0.8× peak before the renderer ever saw it, and
+  // invented nothing to show for it (the resample to device pixels happens on the way out).
+  // PhoneScope keeps 1024 because it pushes device-width rows, i.e. it decimates.
+  const historyRef = useRef(new WaterfallHistory(512))
+  const [paused, setPaused] = useState(false)
+  const pausedRef = useRef(paused)
+  pausedRef.current = paused
+  // 3DSS: the perspective stacked-spectrum "alternate waterfall", drawn from the SAME history
+  // ring. Per-surface persisted.
+  const [dss, setDss] = useState<boolean>(() => surfaceGet(THREED_KEY) === '1')
+  const dssRef = useRef(dss)
+  dssRef.current = dss
+  // Scroll direction of the flat 2D waterfall. true (THE DEFAULT since 2026-08-15) = newest row
+  // at the TOP, history travelling down. false mirrors it — what every build through 1.3.2 did.
+  // ⚠️ BOTH render paths read this ref and must never disagree: the hot path's copyWithin +
+  // where the new row is written, and `renderInto`'s cold rebuild (which re-runs on palette,
+  // theme, zoom, resize, pause/scrollback and 2D↔3D). A half-flip tears the picture.
+  // The 3DSS view is deliberately unaffected — it keeps its own front-to-back perspective.
+  const [newestAtTop, setNewestAtTop] = useState<boolean>(() => surfaceGet(FLOW_KEY) !== 'up')
+  const newestAtTopRef = useRef(newestAtTop)
+  newestAtTopRef.current = newestAtTop
+  /** Scrollback offset in rows while paused (0 = live tail). */
+  const offsetRef = useRef(0)
+  /** Cold-path re-render hook, owned by the canvas effect (null until mounted). */
+  const rebuildRef = useRef<(() => void) | null>(null)
+
+  txRef.current = transmitting
+  txBlanksRef.current = txBlanks
+  themeRef.current = theme
+  rxOffRef.current = rxOffsetHz
+  txOffRef.current = txOffsetHz
+  cursorsRef.current = cursors
+  activeRef.current = active
+  rowMsRef.current = rowMs
+  gainRef.current = gain
+  zeroRef.current = zero
+  viewLoRef.current = view.lo
+  viewHiRef.current = view.hi
+
+  // Rebuild the LUT synchronously before paint (useLayoutEffect, not useEffect)
+  // so it changes atomically with the legend gradient (a sync useMemo below) on
+  // a theme switch — no frame where the legend and the canvas colormap disagree.
+  useLayoutEffect(() => {
+    lutRef.current = bakeLut(resolveColormap(palette, theme))
+    // Recolor the ACCUMULATED history in the new palette — the old pixel-scroll canvas
+    // could only affect rows painted after the switch.
+    rebuildRef.current?.()
+  }, [palette, theme])
+
+  // The view window moved — a zoom pick, or the RX marker moving under a zoomed view (issue
+  // #115). Re-render the ACCUMULATED history at the new edges, the same cold path a palette
+  // switch takes; without it the operator watches the old image scroll under a re-labelled
+  // axis. `viewLoRef`/`viewHiRef` are assigned in the render body above, so they already hold
+  // the new edges by the time this runs. useLayoutEffect (not useEffect) for the same reason
+  // as the LUT: the picture and the axis overlay must never disagree for a frame.
+  // ⚠️ This is the ONLY repaint-on-window-change path now. The zoom <select> used to poke the
+  // refs and call the rebuild by hand, which is exactly why the window followed a zoom pick
+  // and nothing else. Do not re-add that poke — a second writer is how #115 happened.
+  useLayoutEffect(() => {
+    rebuildRef.current?.()
+  }, [view.lo, view.hi])
+
+  // Legend gradient (weak→strong, bottom→top) for the active colormap.
+  const legendGradient = useMemo(() => {
+    const name = resolveColormap(palette, theme)
+    const stops: string[] = []
+    const N = 8
+    for (let i = 0; i <= N; i++) {
+      const [r, g, b] = sampleLut(name, i / N)
+      stops.push(`rgb(${r},${g},${b}) ${Math.round((i / N) * 100)}%`)
+    }
+    return `linear-gradient(to top, ${stops.join(', ')})`
+  }, [palette, theme])
+
+  useEffect(() => {
+    const canvas = canvasRef.current
+    if (!canvas) return
+    // The canvas is WRITE-ONLY now: the scroll happens in a retained CPU-side RGBA
+    // buffer (copyWithin) + one putImageData per row, and every cold path re-renders
+    // from the history ring. The old getImageData-per-row scroll — which forced a
+    // CPU-backed canvas (willReadFrequently) because each GPU readback STALLED the
+    // main thread ("clicking a button takes forever" on laptop GPUs) — is gone, so
+    // the canvas may be GPU-backed again.
+    const ctx = canvas.getContext('2d')
+    if (!ctx) return
+    // Marker/axis overlay context (transparent, cleared each frame). Optional — if it can't be
+    // acquired, drawOverlay simply no-ops on the markers rather than crashing the spectrum loop.
+    const overlay = overlayRef.current
+    const octx = overlay?.getContext('2d') ?? null
+
+    let running = true
+    // Single-flight guard WITH a watchdog: never overlap async drawRow calls, and never let
+    // one that does not settle latch the waterfall dead for the life of the mount. See
+    // `RowFetchLatch` for the failure this closes and why the generation counter is load-bearing.
+    const latch = new RowFetchLatch('waterfall')
+    let acc = 0
+    let last = performance.now()
+    // Row cadence comes from the rowMs prop (via ref — this effect runs once): 120 on the FT
+    // surfaces, 50 on the live-instrument surfaces (RTTY / SSTV band). See the prop doc.
+    const ROW_MS_REDUCED = 480 // gentler cadence under reduced-motion
+
+    // Reduced motion: the OS preference OR the in-app `data-motion=reduce`
+    // escape hatch (slow field rigs). The waterfall is a live instrument, so we
+    // slow the scroll cadence rather than freezing it. Read live each frame so
+    // the toggle takes effect without a remount.
+    const mq = window.matchMedia('(prefers-reduced-motion: reduce)')
+    const reducedMotion = () =>
+      mq.matches || document.documentElement.getAttribute('data-motion') === 'reduce'
+
+    // visual-AGC state: EMA-smoothed floor/ceiling across rows (slow attack/
+    // release so a strong signal keying up doesn't black out the noise floor).
+    let agcFloor = 0
+    let agcCeil = 1
+    // Display window after the operator's manual gain/zero is applied (the values the
+    // row + legend actually render with); identical to agc* when gain=zero=0.
+    let dispFloor = 0
+    let dispCeil = 1
+    let agcInit = false
+    const AGC_ALPHA = 0.1
+
+    // Retained RGBA viewport buffer (the waterfall area, devW × wfHd): the hot path
+    // scrolls it with copyWithin + writes the one new row at the leading edge (bottom, or top
+    // when the operator has flipped the scroll direction) + blits it once — the canvas
+    // is WRITE-ONLY (the old getImageData readback scroll is gone). Cold paths rebuild it
+    // from the history ring. Realloc only on a real size change.
+    let retBuf: Uint8ClampedArray<ArrayBuffer> | null = null
+    let retImg: ImageData | null = null
+    let retW = 0
+    let retH = 0
+    // Reused per-column resample scratch (device width) — no per-row garbage.
+    let magBuf: Float32Array | null = null
+    let magBufW = 0
+    // Reused FLATTENED-row scratch (bin count) — same reason. `flattenRow` writes here and
+    // every downstream read in drawRow is of this buffer, never of the raw DTO row.
+    let flatBuf: Float32Array | null = null
+    const retained = (Wd: number, wfHd: number): ImageData => {
+      if (!retBuf || !retImg || retW !== Wd || retH !== wfHd) {
+        retBuf = new Uint8ClampedArray(Wd * wfHd * 4)
+        retImg = new ImageData(retBuf, Wd, wfHd)
+        retW = Wd
+        retH = wfHd
+        // A fresh buffer starts as re-rendered history (or palette floor when empty).
+        historyRef.current.renderInto(
+          retBuf,
+          Wd,
+          wfHd,
+          viewLoRef.current,
+          viewHiRef.current,
+          lutRef.current,
+          offsetRef.current,
+          newestAtTopRef.current,
+        )
+      }
+      return retImg
+    }
+    // Cold-path re-render: palette/theme switch, zoom change, scrollback, resize, 2D↔3D.
+    const rebuildFromHistory = () => {
+      if (!(retW > 0 && retH > 0)) return
+      const lut = lutRef.current
+      if (dssRef.current) {
+        // 3D stacked-spectrum: redraw the whole surface directly on the canvas.
+        drawDss(ctx, retW, retH, historyRef.current, lut, [lut[0], lut[1], lut[2]], {
+          loHz: viewLoRef.current,
+          hiHz: viewHiRef.current,
+        })
+        return
+      }
+      if (!retBuf) return
+      historyRef.current.renderInto(
+        retBuf,
+        retW,
+        retH,
+        viewLoRef.current,
+        viewHiRef.current,
+        lut,
+        offsetRef.current,
+        newestAtTopRef.current,
+      )
+      try {
+        ctx.putImageData(retImg!, 0, 0)
+      } catch {
+        /* zero-size mid-layout */
+      }
+    }
+    rebuildRef.current = rebuildFromHistory
+
+    // Backing-store + CSS↔device mapping. The app scales the whole UI with CSS
+    // `zoom` (90/110/125%), so `getBoundingClientRect() × devicePixelRatio` does
+    // NOT equal the real device-pixel count — under zoom the two never line up, so
+    // the old sizing oscillated and the resize re-cleared the canvas every frame
+    // (the flicker, present only at zoom ≠ 100%). The fix: size the backing store
+    // from the ResizeObserver's `devicePixelContentBoxSize` — the EXACT device
+    // pixels the canvas occupies, correct under any zoom × dpr — and derive the
+    // draw scale (device px per CSS px) from it for the overlay transform.
+    let devW = 0 // backing-store width  (device px)
+    let devH = 0 // backing-store height (device px)
+    let cssW = 1 // CSS px width  (for overlay coords)
+    let cssH = 1 // CSS px height
+    let scaleX = 1 // device px per CSS px (= zoom × dpr)
+    let scaleY = 1
+    const measure = (entry?: ResizeObserverEntry): { dW: number; dH: number } => {
+      const dpcb = entry?.devicePixelContentBoxSize?.[0]
+      if (dpcb) return { dW: Math.max(1, dpcb.inlineSize), dH: Math.max(1, dpcb.blockSize) }
+      // Fallback (no device-pixel-content-box support): rect × dpr.
+      const dpr = window.devicePixelRatio || 1
+      return {
+        dW: Math.max(1, Math.round(cssW * dpr)),
+        dH: Math.max(1, Math.round(cssH * dpr)),
+      }
+    }
+    // Bottom freq-axis strip (CSS px) — thinner when the waterfall is a short
+    // horizontal strip (top layout) so it doesn't eat the limited height.
+    // (Defined BEFORE resize(): the history-rebuild path inside resize uses it.)
+    const axisHFor = (h: number) => (h < 160 ? 14 : 18)
+
+    const resize = (entry?: ResizeObserverEntry) => {
+      const rect = canvas.getBoundingClientRect()
+      // While the cockpit is hidden (kept mounted but display:none across nav) the
+      // canvas measures ~0. Do NOT reclear/shrink the backing store to 1×1 — keep
+      // the accumulated waterfall so it's intact when we navigate back. (A genuine
+      // 0-size only happens when hidden or mid-layout; never resize away real history.)
+      if ((canvas.offsetParent === null || rect.width < 2 || rect.height < 2) && devW > 0 && devH > 0) {
+        return
+      }
+      cssW = Math.max(1, rect.width)
+      cssH = Math.max(1, rect.height)
+      const { dW, dH } = measure(entry)
+      // Keep the draw scale fresh even when the pixel size is unchanged.
+      scaleX = dW / cssW
+      scaleY = dH / cssH
+      if (dW === devW && dH === devH) return // exact-integer size stable → no reclear
+      // canvas.width/height assignment CLEARS the backing store — but history now lives
+      // as DATA, so a (rare, real) size change simply re-renders the viewport from the
+      // ring: smear-free at the new geometry, no pixel snapshot/re-blit dance. Paint the
+      // colormap floor first so an empty history still reads as a quiet band.
+      canvas.width = dW
+      canvas.height = dH
+      const lut = lutRef.current
+      ctx.fillStyle = `rgb(${lut[0]},${lut[1]},${lut[2]})`
+      ctx.fillRect(0, 0, dW, dH)
+      devW = dW
+      devH = dH
+      const axisDp = Math.round(axisHFor(cssH) * scaleY)
+      retained(dW, Math.max(1, dH - axisDp)) // realloc + render history at the new size
+      rebuildFromHistory()
+      // Keep the overlay backing store the same device size as the spectrum canvas (it's cleared
+      // each frame, so no history to preserve — a plain resize is fine).
+      if (overlay && (overlay.width !== dW || overlay.height !== dH)) {
+        overlay.width = dW
+        overlay.height = dH
+      }
+    }
+    resize()
+    const ro = new ResizeObserver((entries) => resize(entries[0]))
+    // Observe in device-pixel-content-box so we get the exact backing-store size
+    // under CSS zoom; fall back to the default box if unsupported.
+    try {
+      ro.observe(canvas, { box: 'device-pixel-content-box' })
+    } catch {
+      ro.observe(canvas)
+    }
+
+    const drawRow = async (myGen: number) => {
+      // Fetch FIRST, so the scroll + new-row blit stay atomic and 1:1 with data:
+      // an empty/failed row must NOT scroll (that would duplicate + smear the
+      // bottom line and desync the AGC/legend from the displayed pixels).
+      let spec
+      try {
+        spec = await getSpectrumRow(txRef.current)
+      } catch {
+        return
+      }
+      // Superseded while we were awaiting: the watchdog gave this call up for lost and the
+      // waterfall has moved on. Resolving late must not append a row out of order — the
+      // history ring and the leading-edge blit are the same picture, and a stale row would
+      // put a wrong scanline into both.
+      if (!latch.owns(myGen)) return
+      const row = spec.row
+      if (!row || row.length === 0) return
+      // The FT8/FT4 waterfall shows the AUDIO passband (0–4000 Hz) and is NOT source-aware, so a
+      // native RF-panadapter row (absolute MHz span, e.g. a native-CI-V Icom scope) would map every
+      // column out of range → a flat colormap-floor field. Backend gating stops feeding RF rows in
+      // DATA mode, but skip one here too as defense in depth: keep the last audio frame rather than
+      // blanking. (PhoneScope, the CW/Phone scope, IS source-aware and renders RF rows correctly.)
+      if (spec.source && isRfScopeSource(spec.source)) return
+
+      // Read dimensions AFTER the await (from the resize-maintained device-pixel
+      // backing store, which is exact under CSS zoom — NOT recomputed from
+      // gBCR × dpr, which zoom would desync). The spectrum scrolls in device px.
+      const axisDp = Math.round(axisHFor(cssH) * scaleY)
+      const Wd = devW
+      const wfHd = Math.max(1, devH - axisDp)
+      if (Wd <= 0 || wfHd <= 0) return
+      // Guard against a stale buffer if a resize is mid-flight.
+      if (Wd > canvas.width || wfHd > canvas.height) return
+
+      const nBins = row.length
+      const rowLo = spec.loHz ?? F_MIN
+      const rowHi = spec.hiHz ?? F_MAX
+
+      // FLATTEN FIRST — before anything measures, draws or stores this row. `flattenRow`
+      // removes the rig's passband tilt and filter curvature and nothing else, which is what
+      // lets the parked black point below be stated as an absolute number of dB over the noise
+      // rather than over "the median of whatever is in view". Without it the effective park
+      // drifts to 10 dB at the quiet end of a 15 dB-tilt passband and goes NEGATIVE at the loud
+      // end — a bright field and deleted signals at once, and which signal survives decided by
+      // where it sits in the passband instead of by its SNR.
+      //
+      // Every downstream read is of `frow`, deliberately: the AGC, the history ring (which is
+      // what every cold path re-renders from) and the live blit must all describe the same
+      // picture, or a zoom/palette/resize would repaint the accumulated waterfall differently
+      // from the way it was drawn.
+      //
+      // NOT in the producer. `tuneSnap.ts::detectSignal` thresholds a click against a
+      // percentile of the row it is handed and then MOVES THE RADIO; PhoneScope/MiniSpectrum
+      // draw a trace whose shape IS the rig's passband. Flattening at the source would have
+      // reached all three. See `flattenRow`'s header.
+      if (!flatBuf || flatBuf.length !== nBins) flatBuf = new Float32Array(nBins)
+      flattenRow(row, flatBuf)
+      const frow = flatBuf
+      // ⚠️ OUR OWN TX ZEROES THE ROW AT THE SOURCE (operator retest, 2026-08-16: the first
+      // dark-band fix darkened only the HISTORY copy, and the live hot path below paints
+      // `frow` independently — so the drawn waterfall still replayed the held row bright,
+      // and live and rebuild disagreed, the exact divergence the shared-mapping discipline
+      // in this file exists to prevent). Zeroing `frow` itself puts the floor into BOTH
+      // consumers by construction: the leading-edge write and the retained history. The
+      // AGC is frozen on the same flag, so the darkness cannot re-create the key-up clamp.
+      //
+      // ⚠️ ONLY WHERE THE OVER IS SHORT — see the `txBlanks` prop. The dark band is honest
+      // ONLY because an FT8/FT4 over lasts 13 seconds: it reads as "that was us", and during
+      // it there genuinely is no receiver to picture. The same band under RTTY or SSTV runs
+      // for minutes, and a waterfall that scrolls solid black for minutes is
+      // indistinguishable from one that has died — field reports (2026-08-17) called exactly
+      // that "the waterfall stops". Those surfaces therefore paint the row they are served;
+      // the backend's transmit hold makes that the last real picture of the band rather than
+      // the muted codec, so the key-up clamp this whole mechanism exists to prevent cannot
+      // come back through this branch either.
+      const blanking = txBlanksRef.current && txRef.current
+      if (blanking) frow.fill(0)
+
+      // visual-AGC over the VISIBLE window only, EMA-smoothed across frames.
+      //
+      // The window used to be fitted to the WHOLE row, and that is not a detail: the row spans
+      // 0–4000 Hz while the default view draws 200–3000, and every SSB/DATA filter leaves a ~40 dB
+      // dead cliff above ~3.3 kHz. So ~15% of the row sat 40 dB below anything drawn, the 5th
+      // percentile landed INSIDE it, and ~38 dB of the window was spent bridging digital silence to
+      // the noise floor — which is what put the noise at mid-palette. PhoneScope.tsx:414-419 has
+      // done it over the visible window since it was written, for the same reason (a loud signal
+      // outside the view must not compress what is shown); this is that fix, arriving late.
+      const binHz = (rowHi - rowLo) / nBins
+      const vLo = Math.max(0, Math.floor((viewLoRef.current - rowLo) / binHz))
+      const vHi = Math.min(nBins, Math.ceil((viewHiRef.current - rowLo) / binHz))
+      const visible = vHi - vLo >= 8 ? frow.slice(vLo, vHi) : frow
+      const { floor, ceil } = agcRange(visible, WF_FLOOR_PCT)
+      // ⚠️ THE AGC FREEZES WHILE TRANSMITTING — the post-TX red band (operator-relayed
+      // report, 2026-08-16). While keyed, the rig's codec returns a muted receiver, the row
+      // collapses toward digital silence, and this EMA followed it down; on key-up the
+      // returning band noise sat ~40 dB above the collapsed window and every bin clamped to
+      // the hot end of the palette for the EMA's ~2.7 s recovery — a full-width red band,
+      // 10-23 rows tall. Holding the window through TX means key-up resumes from the
+      // pre-TX picture. The backend holds its published row through TX as well (the same
+      // report's second seam), so this guard mostly sees the LAST REAL row anyway — it
+      // remains because a monitor path or an in-flight row can still arrive keyed.
+      //
+      // Paired with the fill above on the SAME condition, deliberately: the freeze is what
+      // stops the zeroed row from re-creating the key-up clamp, so a surface that does not
+      // blank must not freeze either — it is being served the real band and its AGC should
+      // track it. Splitting the two conditions is how the clamp comes back.
+      if (!blanking) {
+        if (!agcInit) {
+          agcFloor = floor
+          agcCeil = ceil
+          agcInit = true
+        } else {
+          agcFloor += (floor - agcFloor) * AGC_ALPHA
+          agcCeil += (ceil - agcCeil) * AGC_ALPHA
+        }
+      }
+      // Park the black point WF_PARK_DB above the measured noise median and hold a minimum
+      // window (see parkFloor) — the default that makes an empty band read black instead of a
+      // bright dancing field. Then the operator's manual gain (contrast) / zero (baseline) on
+      // top: both 0 → exactly this default, and Zero still slides ±½ window either side of it.
+      const parked = parkFloor(agcFloor, agcCeil)
+      ;({ floor: dispFloor, ceil: dispCeil } = applyGainZero(
+        parked.floor,
+        parked.ceil,
+        gainRef.current,
+        zeroRef.current,
+      ))
+      // live legend readout: dynamic range bottom→top, in dB relative to the current
+      // strongest signal (top = 0 dBr). A degenerate span (silent/all-zero band) reads
+      // ~0 dBr, not a fabricated full-scale range.
+      //
+      // The row's intensity axis is LINEAR IN dB (2026-08-04), so the displayed range is
+      // just the AGC window's height scaled by WF_DB_SPAN — one multiply, and it is now
+      // actually true. The old `20·log10(dispFloor/dispCeil)` read the axis as an amplitude
+      // ratio, which it no longer is; left alone it would have gone on printing a confident
+      // number that no longer meant anything.
+      if (dbLabelRef.current) {
+        const range = dispCeil - dispFloor > MIN_SPAN ? -Math.round(spanDb(dispFloor, dispCeil)) : 0
+        dbLabelRef.current.textContent = String(range).replace('-', '−')
+      }
+
+      // Append the row to the RETAINED HISTORY as normalized intensities over the ROW's
+      // OWN frequency span (carried in the DTO) — the ring is what every cold path
+      // (palette recolor, zoom, resize, scrollback) re-renders from.
+      const tRow = new Float32Array(nBins)
+      // TX rows arrive already zeroed at the source above — the same floor lands here and
+      // on the leading-edge write, so an over reads as the quiet gap it actually was
+      // (WSJT-X's own picture) in the live scroll AND in every cold rebuild.
+      for (let b = 0; b < nBins; b++) tRow[b] = normalize(frow[b], dispFloor, dispCeil)
+      historyRef.current.push(tRow, rowLo, rowHi, Date.now())
+
+      // PAUSED: history keeps accumulating (nothing is lost) but the VIEW is frozen —
+      // the scroll/blit below is skipped. drawOverlay renders the pause chip + time tape.
+      if (pausedRef.current) return
+
+      // 3DSS: redraw the whole stacked-spectrum surface from history each new row (it's a
+      // rebuild by nature — cheap at the 8 Hz row cadence). The retained-buffer 2D scroll
+      // below is skipped.
+      if (dssRef.current) {
+        const lut = lutRef.current
+        // (retBuf stays allocated from resize() for a clean switch back to 2D.)
+        drawDss(ctx, Wd, wfHd, historyRef.current, lut, [lut[0], lut[1], lut[2]], {
+          loHz: viewLoRef.current,
+          hiHz: viewHiRef.current,
+        })
+        return
+      }
+
+      // Scroll the retained RGBA buffer one row with copyWithin (pure CPU — the old
+      // getImageData readback stall is gone; the canvas is write-only now), write the new
+      // row through the LUT at the leading edge, and blit the buffer once.
+      //
+      // The direction is the operator's (FLOW_KEY), read ONCE here so the shift and the
+      // row it makes room for can never disagree: default = shift every row UP and write
+      // the new row at the BOTTOM; flipped = shift DOWN and write at the TOP. `renderInto`
+      // below/above takes the same flag, which is what keeps a palette switch, zoom, resize
+      // or pause from repainting the accumulated history the other way round.
+      const topDown = newestAtTopRef.current
+      const img = retained(Wd, wfHd)
+      const out = retBuf!
+      const rowBytes = Wd * 4
+      if (topDown) out.copyWithin(rowBytes, 0)
+      else out.copyWithin(0, rowBytes)
+      const lut = lutRef.current
+      // device-x → view frequency → bin, through the SAME mapping the history rebuild
+      // uses (resampleRow: max-pool where a pixel covers several bins, interpolate where
+      // a bin covers several pixels). Before this they disagreed twice over — the live
+      // row interpolated off bin EDGES while the rebuild point-sampled bin cells — so a
+      // palette switch / zoom / resize / pause turned the accumulated waterfall blocky
+      // and nudged it sideways half a bin.
+      const vlo = viewLoRef.current
+      const vhi = viewHiRef.current
+      if (!magBuf || magBufW !== Wd) {
+        magBuf = new Float32Array(Wd)
+        magBufW = Wd
+      }
+      const mag = magBuf
+      resampleRow(frow, rowLo, rowHi, vlo, vhi, mag)
+      const base = topDown ? 0 : (wfHd - 1) * rowBytes
+      for (let x = 0; x < Wd; x++) {
+        const v = mag[x]
+        const o = base + x * 4
+        // NaN = this column's frequency is outside the row's span (a view wider than the
+        // feed) — palette floor, exactly as the rebuild paints it. The old clamp smeared
+        // the row's edge bin across that band instead.
+        if (Number.isNaN(v)) {
+          out[o] = lut[0]
+          out[o + 1] = lut[1]
+          out[o + 2] = lut[2]
+          out[o + 3] = 255
+          continue
+        }
+        const t = normalize(v, dispFloor, dispCeil)
+        const li = (t >= 1 ? 255 : Math.round(t * 255)) * 4
+        out[o] = lut[li]
+        out[o + 1] = lut[li + 1]
+        out[o + 2] = lut[li + 2]
+        out[o + 3] = 255
+      }
+      try {
+        ctx.putImageData(img, 0, 0)
+      } catch {
+        // ignore (e.g. zero-size during layout)
+      }
+    }
+
+    const drawOverlay = () => {
+      // The axis + Rx/Tx markers render on the SEPARATE overlay canvas (transparent, fully
+      // cleared each frame). This is what keeps a moved marker from freezing into the scrolling
+      // spectrum image. The spectrum canvas (ctx) is only ever touched by drawRow.
+      if (!octx) return
+      // Draw in CSS px; map to the device-pixel store via the measured scale
+      // (= zoom × dpr), so the axis + markers stay aligned with the spectrum at
+      // any UI zoom. (The spectrum path blits in device px and ignores this.)
+      octx.setTransform(scaleX, 0, 0, scaleY, 0, 0)
+      const W = cssW
+      const H = cssH
+      // Clear the entire overlay every frame — no marker/axis pixel survives to the next frame.
+      octx.clearRect(0, 0, W, H)
+      const AXIS_H = axisHFor(H)
+      const wfH = H - AXIS_H
+      const th = themeRef.current
+      const axisColor = th === 'light' ? 'rgba(40,50,70,0.7)' : 'rgba(190,205,230,0.7)'
+      const axisBg = th === 'light' ? 'rgba(245,247,250,0.95)' : 'rgba(10,14,22,0.92)'
+
+      // --- bottom frequency axis ---
+      octx.fillStyle = axisBg
+      octx.fillRect(0, wfH, W, AXIS_H)
+      octx.fillStyle = axisColor
+      octx.font = '10px system-ui, sans-serif'
+      octx.textBaseline = 'middle'
+      const vlo = viewLoRef.current
+      const vhi = viewHiRef.current
+      // Sparser labels when narrow; finer when zoomed in (a small window needs ticks).
+      const span = vhi - vlo
+      const labelStep = span <= 800 ? 200 : span <= 1600 ? 500 : W < 280 ? 1000 : 500
+      const first = Math.ceil(vlo / labelStep) * labelStep
+      for (let f = first; f <= vhi; f += labelStep) {
+        const x = freqToX(f, W, vlo, vhi)
+        octx.fillRect(x, wfH, 1, 4)
+        octx.fillText(`${f}`, Math.min(W - 26, x + 2), wfH + AXIS_H / 2)
+      }
+
+      // (No per-decode callsign labels on the waterfall — WSJT-X keeps the
+      // spectrum clean; callsigns live in the Band Activity list. Only the
+      // Rx/Tx markers are drawn.)
+
+      // Paused: a chip + a right-edge time tape so scrollback has a scale. The tape maps
+      // viewport rows → their stored timestamps (device rows ÷ scaleY = CSS rows).
+      if (pausedRef.current) {
+        const h = historyRef.current
+        const off = offsetRef.current
+        octx.font = '600 10px system-ui, sans-serif'
+        octx.fillStyle = 'rgba(255,200,80,0.95)'
+        // The chip is a STATE MESSAGE and comes from the catalog; the age beside it (and the
+        // time tape below, and the axis) are measurements drawn as tick labels.
+        const newest = h.frameAt(off)
+        const backLabel = newest ? ageLabel(Date.now() - newest.tsMs) : t('waterfall.paused.now')
+        octx.fillText(
+          off > 0 ? t('waterfall.paused.back', { age: backLabel }) : t('waterfall.paused'),
+          6,
+          20,
+        )
+        // Time tape: 4 evenly spaced age labels down the right edge. Each label's age is
+        // read off the SAME mapping renderInto paints with — newest end at the bottom by
+        // default, at the top when the operator has flipped the scroll direction.
+        // ⚠️ This used to be a plain `off + (devRows-1)·i/5`, i.e. ages increasing DOWNWARD,
+        // which was upside down against the picture in the only direction that existed: it
+        // labelled the top (oldest) rows as the most recent. Mirrored, not merely flipped.
+        octx.fillStyle = axisColor
+        octx.font = '9px system-ui, sans-serif'
+        const devRows = Math.max(1, Math.round(wfH * scaleY))
+        for (let i = 1; i <= 4; i++) {
+          const yCss = (wfH * i) / 5
+          const yDev = Math.round(((devRows - 1) * i) / 5)
+          const age = off + (newestAtTopRef.current ? yDev : devRows - 1 - yDev)
+          const fr = h.frameAt(age)
+          if (!fr) continue
+          octx.fillText(`−${ageLabel(Date.now() - fr.tsMs)}`, W - 34, yCss)
+        }
+      }
+
+      // Named cursors (e.g. RTTY mark/space) REPLACE the RX/TX markers when
+      // supplied; the FT8 path (cursors undefined) keeps the existing draw.
+      const cursors = cursorsRef.current
+      if (cursors) {
+        octx.font = '600 10px system-ui, sans-serif'
+        for (const c of cursors) {
+          if (c.hz < vlo || c.hz > vhi) continue // scrolled outside a zoom window
+          const cx = freqToX(c.hz, W, vlo, vhi)
+          octx.fillStyle = c.color
+          octx.fillRect(cx - 1, 0, 2, wfH)
+          octx.fillText(c.label, Math.min(W - 14, cx + 3), 9)
+        }
+      } else {
+        // --- TX marker (red) then RX marker (green), drawn last so they're on top ---
+        // Markers map through the same view; skip one that's scrolled outside a zoom
+        // window (else freqToX would clamp it misleadingly to the edge).
+        const txOff = txOffRef.current
+        if (txOff >= vlo && txOff <= vhi) {
+          const txx = freqToX(txOff, W, vlo, vhi)
+          octx.fillStyle = txRef.current ? 'rgba(255,70,70,0.95)' : 'rgba(255,90,90,0.7)'
+          octx.fillRect(txx - 1, 0, 2, wfH)
+          octx.fillStyle = '#ff5a5a'
+          octx.font = '600 10px system-ui, sans-serif'
+          octx.fillText('TX', Math.min(W - 18, txx + 3), 9)
+        }
+
+        const rxOff = rxOffRef.current
+        if (rxOff >= vlo && rxOff <= vhi) {
+          const rxx = freqToX(rxOff, W, vlo, vhi)
+          octx.fillStyle = 'rgba(60,220,140,0.9)'
+          octx.fillRect(rxx - 1, 0, 2, wfH)
+          octx.fillStyle = '#3ddc8c'
+          octx.font = '600 10px system-ui, sans-serif'
+          octx.fillText('RX', Math.min(W - 18, rxx + 3), wfH - 6)
+        }
+      }
+    }
+
+    const loop = (now: number) => {
+      if (!running) return
+      // Paused while the cockpit is navigated away (kept mounted but hidden): skip
+      // the spectrum fetch + scroll + overlay entirely so no CPU is spent and the
+      // backing store is left untouched. Keep `last` current and `acc` at 0 so the
+      // scroll resumes cleanly (no time-debt burst) the moment we return.
+      if (!activeRef.current) {
+        last = now
+        acc = 0
+        rafRef.current = requestAnimationFrame(loop)
+        return
+      }
+      acc += now - last
+      last = now
+      const rowMs = reducedMotion() ? ROW_MS_REDUCED : rowMsRef.current
+      // A fetch that never settles must not latch the waterfall dead — give it up and let the
+      // next tick poll again. BEFORE the claim below, so the freed latch is usable this
+      // same tick.
+      latch.abandonIfStuck(now)
+      // single-flight: `begin` refuses while a fetch is in flight, so a slow row simply skips
+      // its tick (history stays exactly 1:1 with data) and `acc` keeps accumulating.
+      if (acc >= rowMs) {
+        const myGen = latch.begin(now)
+        if (myGen !== null) {
+          acc = 0
+          drawRow(myGen)
+            .catch(() => {})
+            .finally(() => latch.end(myGen))
+        }
+      }
+      // Overlay is decoupled from the data fetch: repaint every frame so the
+      // markers, click-to-tune feedback, and decode chips stay live and never
+      // freeze — even if a fetch rejects or the cadence is slow (reduced motion).
+      drawOverlay()
+      rafRef.current = requestAnimationFrame(loop)
+    }
+    rafRef.current = requestAnimationFrame(loop)
+
+    return () => {
+      running = false
+      if (rafRef.current !== null) cancelAnimationFrame(rafRef.current)
+      ro.disconnect()
+    }
+    // intentionally run once; live props read via refs
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  // Wide-graph gestures. LEFT = RX (green) is stock WSJT-X and JTDX alike, so it is the one
+  // gesture that must never move — an operator's muscle memory for it is universal. On top of
+  // that:
+  //   Shift+left = TX (red)   — stock WSJT-X
+  //   RIGHT      = TX (red)   — JTDX (operator preference, 2026-07-26)
+  //   Ctrl / ⌘   = both       — ⌘ because Qt maps WSJT-X's Ctrl to Cmd on macOS, and mac
+  //                             WebKit delivers Ctrl+left as a BUTTON-2 press (the OS
+  //                             right-click) — tuneTarget owns both wrinkles.
+  // Right-click is ADDITIVE: stock WSJT-X has no right-button action, so adopting JTDX's here
+  // takes nothing away from a WSJT-X operator and both conventions work side by side.
+  // ⚠️ Nexus once mapped left=TX/right=RX, which moved the WRONG marker for anyone arriving
+  // from WSJT-X. Do not "restore" that — left is RX in every mainstream client.
+  const handleMouseDown = (e: React.MouseEvent<HTMLCanvasElement>) => {
+    if (!onTune) return
+    const target = tuneTarget(e.button, e.ctrlKey, e.shiftKey, e.metaKey)
+    if (!target) return // middle / back / forward must never retune the radio
+    const rect = canvasRef.current!.getBoundingClientRect()
+    const hz = Math.round(xToFreq(e.clientX - rect.left, rect.width, view.lo, view.hi))
+    e.preventDefault()
+    onTune(hz, target)
+  }
+
+  return (
+    <div className="waterfall-wrap">
+      <div className="panel-header">
+        <h2>{t('waterfall.title')}</h2>
+        {/* MOD_LABEL: advertising "Ctrl" on a Mac names the OS right-click gesture — ⌘ there. */}
+        <span className="wf-hint">{hint ?? t('waterfall.hint', { mod: MOD_LABEL })}</span>
+        <PalettePicker scope={paletteScope} />
+        <select
+          className="wf-palette wf-zoom"
+          value={zoomSpan}
+          aria-label={t('waterfall.zoom.aria')}
+          title={t('waterfall.zoom.title')}
+          onChange={(e) => {
+            // The SPAN is the only thing the operator picks; the window follows from it and
+            // the RX marker (see the `view` memo). The repaint is the rebuild layout-effect's
+            // job — this handler deliberately touches neither the view refs nor the canvas.
+            const span = Number(e.target.value)
+            setZoomSpan(span)
+            surfaceSet(ZOOM_KEY, String(span))
+          }}
+        >
+          {WATERFALL_ZOOMS.map((z) => (
+            <option key={z.value} value={z.value}>
+              {z.label}
+            </option>
+          ))}
+        </select>
+        <label className="wf-knob" title={t('waterfall.gain.title')}>
+          <span>G</span>
+          <input
+            type="range"
+            min={-1}
+            max={1}
+            step={0.05}
+            value={gain}
+            aria-label={t('waterfall.gain.aria')}
+            onChange={(e) => {
+              const v = Number(e.target.value)
+              setGain(v)
+              try {
+                localStorage.setItem(GAIN_KEY, String(v))
+              } catch {
+                /* storage blocked — still applies this session */
+              }
+            }}
+            onDoubleClick={() => {
+              setGain(0)
+              try {
+                localStorage.setItem(GAIN_KEY, '0')
+              } catch {
+                /* */
+              }
+            }}
+          />
+        </label>
+        {/* WSJT-X's plotZero, and its authority too: an absolute ±WF_ZERO_TRIM_DB trim of the
+            black point, NOT a fraction of the display window. Center is NOT "off" — it is the
+            parked default (noise median + WF_PARK_DB); left brings the noise floor back up into
+            the palette, right pushes it further under. This value is persisted app-wide, so
+            whatever it can do it does on every waterfall at once — see WF_ZERO_TRIM_DB for what
+            the un-bounded form did to an ordinary station. */}
+        <label
+          className="wf-knob"
+          title={t('waterfall.zero.title')}
+        >
+          <span>Z</span>
+          <input
+            type="range"
+            min={-1}
+            max={1}
+            step={0.05}
+            value={zero}
+            aria-label={t('waterfall.zero.aria')}
+            onChange={(e) => {
+              const v = Number(e.target.value)
+              setZero(v)
+              try {
+                localStorage.setItem(ZERO_KEY, String(v))
+              } catch {
+                /* storage blocked — still applies this session */
+              }
+            }}
+            onDoubleClick={() => {
+              setZero(0)
+              try {
+                localStorage.setItem(ZERO_KEY, '0')
+              } catch {
+                /* */
+              }
+            }}
+          />
+        </label>
+        {/* Scroll direction. The operator's own wording (2026-08-14) names the CURRENT
+            state; those two words alone do not say where a new row lands, so the tooltip
+            spells out both halves — which end is newest and which way history travels. */}
+        <button
+          type="button"
+          className={`wf-popout wf-flow${newestAtTop ? ' on' : ''}`}
+          aria-pressed={newestAtTop}
+          onClick={() => {
+            const next = !newestAtTop
+            setNewestAtTop(next)
+            newestAtTopRef.current = next
+            surfaceSet(FLOW_KEY, next ? 'down' : 'up')
+            // Repaint the ACCUMULATED history the new way at once. Without this the operator
+            // watches the old image scroll the new direction until something else triggers a
+            // rebuild — a half-flipped waterfall.
+            rebuildRef.current?.()
+          }}
+          // Four WHOLE tooltips, never a stem plus an appended sentence: what the 3D view does
+          // with the direction is part of the statement, not a tail glued to it.
+          title={
+            newestAtTop
+              ? dss
+                ? t('waterfall.flow.down.title.dss')
+                : t('waterfall.flow.down.title')
+              : dss
+                ? t('waterfall.flow.up.title.dss')
+                : t('waterfall.flow.up.title')
+          }
+        >
+          {newestAtTop ? t('waterfall.flow.down.label') : t('waterfall.flow.up.label')}
+        </button>
+        <button
+          type="button"
+          className={`wf-popout wf-dss${dss ? ' on' : ''}`}
+          aria-pressed={dss}
+          onClick={() => {
+            const next = !dss
+            setDss(next)
+            dssRef.current = next
+            surfaceSet(THREED_KEY, next ? '1' : '0')
+            rebuildRef.current?.() // repaint immediately in the new view
+          }}
+          title={dss ? t('waterfall.dss.on.title') : t('waterfall.dss.off.title')}
+        >
+          {dss ? '▤' : '◭'}
+        </button>
+        <button
+          type="button"
+          className={`wf-popout wf-pause${paused ? ' on' : ''}`}
+          aria-pressed={paused}
+          onClick={() => {
+            const next = !paused
+            setPaused(next)
+            pausedRef.current = next
+            if (!next) {
+              // Resume: snap back to the live tail and re-render (history kept accumulating).
+              offsetRef.current = 0
+            }
+            rebuildRef.current?.()
+          }}
+          title={paused ? t('waterfall.pause.resume.title') : t('waterfall.pause.title')}
+        >
+          {paused ? '▶' : '⏸'}
+        </button>
+        {onPopOut && (
+          <button
+            type="button"
+            className="wf-popout"
+            onClick={onPopOut}
+            title={t('waterfall.popOut.title')}
+          >
+            ⧉
+          </button>
+        )}
+      </div>
+      <div className="wf-stage">
+        <canvas
+          ref={canvasRef}
+          className="waterfall-canvas"
+          onMouseDown={handleMouseDown}
+          onContextMenu={(e) => e.preventDefault()}
+          onWheel={(e) => {
+            // Paused = scrollback mode. The wheel FOLLOWS THE FLOW: older rows lie the way
+            // history travels, so going back in time is wheel-UP in the default direction
+            // (history climbs, old rows leave over the top) and wheel-DOWN once the operator
+            // has flipped it. Keeping the sign fixed would send the wheel the wrong way
+            // against half the operators' own displays.
+            if (!pausedRef.current) return
+            const h = historyRef.current
+            const back = newestAtTopRef.current ? e.deltaY > 0 : e.deltaY < 0
+            const step = back ? 3 : -3
+            // Viewport height in HISTORY rows ≈ the retained buffer height; a generous
+            // clamp via maxOffset keeps a full screen of rows at max scrollback.
+            const cur = offsetRef.current
+            const next = Math.max(0, Math.min(h.maxOffset(1), cur + step))
+            if (next !== cur) {
+              offsetRef.current = next
+              rebuildRef.current?.()
+            }
+          }}
+          title={t('waterfall.canvas.title', { mod: MOD_LABEL })}
+        />
+        {/* Axis + Rx/Tx markers layer — transparent, cleared each frame, never scrolled. */}
+        <canvas ref={overlayRef} className="waterfall-overlay" aria-hidden="true" />
+        <div
+          className="wf-legend"
+          aria-hidden="true"
+          title={t('waterfall.legend.title')}
+        >
+          <span className="wf-legend-tick">0</span>
+          <div className="wf-legend-bar" style={{ background: legendGradient }} />
+          <span className="wf-legend-tick">
+            <span ref={dbLabelRef}>−40</span>
+          </span>
+          <span className="wf-legend-cap">{DBR}</span>
+        </div>
+      </div>
+    </div>
+  )
+}

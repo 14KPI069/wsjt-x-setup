@@ -1,0 +1,431 @@
+// Which browser-storage keys are PRIVATE to a window and which are shared by the whole
+// station — the classification itself, and a scan proving the call sites agree with it.
+//
+// Two failure modes, and they are not symmetric:
+//   - a shared key scoped by mistake → silent cross-talk stops; the operator sets a
+//     preference and it mysteriously does not stick. Worst case: an "already fired"
+//     dedupe set re-alerts the SAME event once per open window.
+//   - a per-surface key left shared → two windows overwrite each other's layout.
+// The scan below catches both, and catches the nastier variant of the second: a key
+// written from more than one component where only one site got migrated.
+//
+// Reads the tree the same way wire-consistency.test.ts reads dto.rs. Deliberately NOT a
+// jsdom test — nothing here needs a DOM; the behavioural half lives in
+// features/windowScope.test.ts.
+import { describe, it, expect } from 'vitest'
+import { readFileSync, readdirSync, statSync } from 'node:fs'
+import { fileURLToPath } from 'node:url'
+import { join, relative } from 'node:path'
+import { scopedKey, surfaceKey } from './features/windowScope'
+import { panelStorageKey } from './features/panelState'
+
+/** Every base key routed through the per-surface scope. Adding one here without routing
+ *  it (or routing one without adding it here) fails `routes exactly the per-surface keys`
+ *  below — the list and the code cannot drift apart. */
+export const PER_SURFACE = [
+  'neededFilters',
+  'nexus-ui-scale-mode',
+  'nexus.awardsTab',
+  'nexus.connect.config',
+  'nexus.connect.globe3d.layers',
+  'nexus.connect.insights.collapsed',
+  'nexus.connect.intent',
+  'nexus.connect.layers',
+  'nexus.connect.map3d',
+  'nexus.connect.projection',
+  'nexus.decodes.filter',
+  'nexus.decodes.hideB4',
+  'nexus.decodes.hideBlocked',
+  'nexus.decodes.hideConfirmed',
+  'nexus.logbook.globespin',
+  'nexus.operate.layout',
+  'nexus.operateLayout',
+  'nexus.ota.bandFilter',
+  'nexus.ota.modeFilter',
+  'nexus.ota.program',
+  'nexus.ota.sortAsc',
+  'nexus.ota.sortKey',
+  'nexus.phonescope.dss',
+  'nexus.phonescope.flow',
+  'nexus.phonescope.win',
+  'nexus.roster.filters',
+  'nexus.sats.favOnly',
+  'nexus.spotlegend',
+  'nexus.split.cw.scope',
+  'nexus.split.operate.waterfall',
+  'nexus.split.phone.scope',
+  'nexus.view',
+  'nexus.waterfall.dss',
+  'nexus.waterfall.flow',
+  'nexus.waterfall.zoom',
+  'tempo-left-rail-w',
+  'tempo-right-rail-w',
+]
+
+/** Keys that describe the STATION or the PERSON and must never be scoped. Listed rather
+ *  than inferred so a failure names the key that leaked. */
+const SHARED = [
+  // Display units: one preference the whole station shares, like the country exclude.
+  'nexus.units',
+  // Prose language: the same preference in every window, for the same reason units are. A
+  // pop-out band map reading a different language than the window that spawned it would be
+  // the shape of bug this list exists to prevent.
+  'nexus.locale',
+  // Wildcard call-hide: a standing display preference across windows (features/hideCalls).
+  'nexus.decodes.hideCalls',
+  // Arbitrary-entity country excludes, stored beside the curated keys (F4MQS).
+  'nexus.decodes.countryExclude.entities',
+  'nexus.navOrder', // left-rail section order — a person/station preference, same in every window
+  'nexus-density',
+  // Field mode: being outdoors is a fact about the STATION, not a window — a pop-out beside
+  // the main window in the same sunlight must follow it (DetachedPanel mirrors the hook).
+  'nexus-field-mode',
+  'nexus-motion',
+  'nexus-ui-scale-cap',
+  'nexus.connect.chaseDefault.v1',
+  'nexus.connect.mode',
+  'nexus.cw.sensitivity',
+  // The FT country-exclusion list. SHARED, and the one key here where that is a RULING
+  // rather than a classification: a standing statement about how this operator chases is
+  // not a property of a window. Per-surface, a torn-off band map would inherit it once and
+  // then diverge on its first toggle, so the pop-out would show the decodes the main
+  // window hides — two surfaces disagreeing about what is on the band.
+  'nexus.decodes.countryExclude',
+  'nexus.decodes.countryExclude.paused',
+  'nexus.cw.tuneStep',
+  'nexus.cwAssist',
+  'nexus.dev.xray',
+  // The Field Day contacts-per-hour goal. SHARED: a target rate is a statement about how this
+  // operator is running the event, not about one window — a torn-off board showing a different
+  // goal than the cockpit would be two surfaces disagreeing about the same target.
+  'nexus.fd.rateGoal',
+  'nexus.dxped.alarms',
+  'nexus.dxped.chasing',
+  'nexus.features.v1',
+  'nexus.features.wizardSeen',
+  'nexus.memory.bank.v1',
+  'nexus.memory.bank.v2',
+  'nexus.needed.autopop',
+  'nexus.operate.tuneStep',
+  'nexus.panels.wfDetached.v1',
+  'nexus.phone.tuneStep',
+  'nexus.profiles',
+  'nexus.program.chirpHowtoSeen.v1',
+  'nexus.program.recents.v1',
+  'nexus.sats.alarms',
+  'nexus.sats.chasing',
+  'nexus.sats.chasingNorad',
+  // The one-time seed marker. SHARED for the same reason the ★ set it seeded
+  // is: per-surface, a second window would find "never seeded" and star ten
+  // birds on top of whatever the operator had settled on.
+  'nexus.sats.seeded',
+  'nexus.waterfall.detached',
+  'nexus.waterfall.gain',
+  'nexus.waterfall.palette',
+  'nexus.waterfall.zero',
+  'nexus.watchlist',
+  'nexus.workspace',
+  'tempo-onboarded',
+  'tempo-theme',
+]
+
+/** The subset of SHARED whose whole job is "this already happened". Per-surface here does
+ *  not merely annoy — it re-fires the same alert once per open window, mid-pass. */
+const DEDUPE = [
+  'nexus-journey-seen',
+  'nexus.dxped.alarms.fired',
+  'nexus.sats.alarms.fired',
+  // "The seed notice was read." Per-surface, the notice would reappear in
+  // every pop-out and again after every window open — an announcement about a
+  // one-time event, made repeatedly.
+  'nexus.sats.seedAck',
+  'nexus.update.dismissedVersion',
+  'tempo-achievements-seen',
+]
+
+/**
+ * Keys held in sessionStorage through SpotsPanel's `useSessionState`. sessionStorage is
+ * already per-webview by the platform, so these need no scope suffix — the same guarantee
+ * PER_SURFACE buys, by a different mechanism (windowScope.test.ts leans on it for seenSet).
+ * Their lifetime is deliberately shorter: the Spots filters are meant to survive a view
+ * switch and die on app exit, unlike the roster/board filters, which persist across restarts.
+ *
+ * Listed AND scanned for (see `classifies every useSessionState key`), because the raw-storage
+ * scan below structurally cannot see them: the helper takes the key as a PARAMETER, so no
+ * literal ever appears at a `sessionStorage.*` call site. This list used to name a stale trio
+ * — `nexus.spots.modes` (renamed to hiddenModes), `.bands`, `.sort` — while the four keys
+ * added after it went unlisted entirely, so it recorded a verdict on one key that no longer
+ * existed and none on four that did.
+ */
+const SESSION_SCOPED = [
+  'nexus.spots.bands',
+  'nexus.spots.filtersOpen',
+  'nexus.spots.hiddenModes',
+  'nexus.spots.licensedOnly',
+  'nexus.spots.localOnly',
+  'nexus.spots.query',
+  'nexus.spots.sort',
+  'nexus.spots.states',
+]
+
+describe('zero migration: the main window keeps the exact key strings already on disk', () => {
+  // Asserted as LITERALS, key by key. A property test over the helper passes just as
+  // happily against `${base}.main`, which is precisely what would orphan every saved
+  // layout, zoom, projection and board filter the moment an operator upgrades.
+  it.each(PER_SURFACE)('%s is byte-identical on the main surface', (base) => {
+    expect(surfaceKey(base, 'main')).toBe(base)
+  })
+
+  it('spells out the keys most expensive to lose', () => {
+    expect(surfaceKey('tempo-right-rail-w', 'main')).toBe('tempo-right-rail-w')
+    expect(surfaceKey('tempo-left-rail-w', 'main')).toBe('tempo-left-rail-w')
+    expect(surfaceKey('nexus-ui-scale-mode', 'main')).toBe('nexus-ui-scale-mode')
+    expect(surfaceKey('nexus.connect.config', 'main')).toBe('nexus.connect.config')
+    expect(surfaceKey('nexus.connect.projection', 'main')).toBe('nexus.connect.projection')
+    expect(surfaceKey('neededFilters', 'main')).toBe('neededFilters')
+    expect(surfaceKey('nexus.split.operate.waterfall', 'main')).toBe('nexus.split.operate.waterfall')
+  })
+
+  it('leaves the panel record on its own (already-shipped, already-suffixed) spelling', () => {
+    // nexus.panels.* shipped in 0.15.0 ALREADY suffixed, so for that one key the
+    // byte-identical string is the SUFFIXED one — the opposite of every other key. It
+    // therefore builds its key itself, and this is what keeps the two rules apart.
+    expect(panelStorageKey('operate', 'main')).toBe('nexus.panels.operate.main')
+    expect(panelStorageKey('operate', 'w1')).toBe('nexus.panels.operate.w1')
+    expect(surfaceKey('nexus.panels.operate', 'main')).toBe('nexus.panels.operate')
+  })
+
+  it('suffixes only above main, and never for the global scope', () => {
+    expect(surfaceKey('nexus.view', 'w1')).toBe('nexus.view.w1')
+    expect(surfaceKey('nexus.view', 'w2')).toBe('nexus.view.w2')
+    expect(surfaceKey('nexus.view', 'r3')).toBe('nexus.view.r3')
+    for (const inst of ['main', 'w2', 'r3']) {
+      expect(scopedKey('tempo-theme', 'global', inst)).toBe('tempo-theme')
+    }
+  })
+
+  it('keeps the radio scope bare until an r<id> surface exists', () => {
+    // The tune-step and waterfall-calibration keys are shared TODAY and belong on 'radio'
+    // once r<id> windows are openable (an IC-9700 on 2 m does not want the HF rig's step
+    // size or noise-floor contrast). This is what makes that promotion a no-op on disk
+    // instead of a rename that resets them.
+    for (const base of ['nexus.phone.tuneStep', 'nexus.waterfall.gain']) {
+      expect(scopedKey(base, 'radio', 'main')).toBe(base)
+      expect(scopedKey(base, 'radio', 'w1')).toBe(base)
+      expect(scopedKey(base, 'radio', 'r2')).toBe(`${base}.r2`)
+    }
+  })
+})
+
+// ── Call-site scan ──────────────────────────────────────────────────────────────────
+const SRC = fileURLToPath(new URL('.', import.meta.url))
+
+function sources(dir: string, out: string[] = []): string[] {
+  for (const name of readdirSync(dir)) {
+    if (name === 'node_modules' || name === 'assets' || name === 'data') continue
+    const full = join(dir, name)
+    if (statSync(full).isDirectory()) sources(full, out)
+    else if (/\.tsx?$/.test(name) && !/\.test\.tsx?$/.test(name) && !/\.d\.ts$/.test(name)) {
+      out.push(full)
+    }
+  }
+  return out
+}
+
+/** Call sites that pass a key THROUGH (a function parameter or a JSX prop), so the literal
+ *  lives at their callers. Declared explicitly, and each declaration is verified below. */
+const INDIRECT: Record<string, string[]> = {
+  'usePaneWidths.ts:key': ['tempo-right-rail-w', 'tempo-left-rail-w'],
+  'components/ConnectView.tsx:key': ['nexus.connect.intent'],
+  // Reserved generic pane-grid persistence. Carries NO key today: no `PaneLayoutSpec`
+  // literal exists in the tree (Connect composes the pure helpers and persists through its
+  // own scoped `nexus.connect.config`). Routed through the scope helper anyway so the next
+  // view to adopt `usePaneLayout` inherits per-surface behaviour instead of landing an
+  // unscoped layout key — which no test could catch, since its literal would not be in the
+  // classification either.
+  'features/paneLayout.ts:spec': [],
+  'components/Splitter.tsx:storageKey': [
+    'nexus.split.operate.waterfall',
+    'nexus.split.cw.scope',
+    'nexus.split.phone.scope',
+  ],
+}
+
+const routed = new Set<string>()
+const indirect = new Set<string>()
+for (const file of sources(SRC)) {
+  const rel = relative(SRC, file).replace(/\\/g, '/')
+  if (rel === 'features/windowScope.ts') continue // the definition, not a call site
+  const text = readFileSync(file, 'utf8')
+  for (const m of text.matchAll(/\bsurface(?:Get|Set|Key)\(\s*('[^']*'|"[^"]*"|[A-Za-z_$][\w$]*)/g)) {
+    const arg = m[1]
+    if (arg.startsWith("'") || arg.startsWith('"')) {
+      routed.add(arg.slice(1, -1))
+      continue
+    }
+    const decl = text.match(new RegExp(`\\bconst ${arg}\\s*=\\s*'([^']*)'`))
+    if (decl) routed.add(decl[1])
+    else indirect.add(`${rel}:${arg}`)
+  }
+}
+
+/** Every RAW `localStorage.(get|set|remove)Item` in the tree, resolved to the key it names —
+ *  literal or `const`-declared. This is the half the `routed` scan structurally cannot see. */
+const rawUses: { file: string; key: string; op: string }[] = []
+for (const file of sources(SRC)) {
+  const rel = relative(SRC, file).replace(/\\/g, '/')
+  if (rel === 'features/windowScope.ts') continue // the definition, not a call site
+  const text = readFileSync(file, 'utf8')
+  for (const m of text.matchAll(
+    /localStorage\.(getItem|setItem|removeItem)\(\s*('[^']*'|"[^"]*"|[A-Za-z_$][\w$]*)/g,
+  )) {
+    const [, op, arg] = m
+    if (arg.startsWith("'") || arg.startsWith('"')) {
+      rawUses.push({ file: rel, key: arg.slice(1, -1), op })
+      continue
+    }
+    const decl = text.match(new RegExp(`\\bconst ${arg}\\s*=\\s*'([^']*)'`))
+    if (decl) rawUses.push({ file: rel, key: decl[1], op })
+  }
+}
+
+describe('call sites agree with the classification', () => {
+  /**
+   * THE HALF-MIGRATED KEY — the defect the `routed` scan below is structurally blind to,
+   * and the reason this test exists.
+   *
+   * `routed` is a UNION of every key seen at a `surface*` call. So a key whose READ was
+   * migrated and whose WRITE was not still appears in it, and set-equality passes. Proven,
+   * not assumed: reverting one `surfaceSet(TAB_KEY, …)` in AwardsJourney.tsx back to a raw
+   * `localStorage.setItem` left all 745 tests green.
+   *
+   * That is the worst-shaped defect available here. The pop-out READS its own key (empty,
+   * so it inherits) but WRITES the main window's — so it silently overwrites the main
+   * window while appearing to have private state, and nobody sees it until the main window
+   * is reopened. Checking raw uses directly is total, and cheap.
+   */
+  /**
+   * COMPLETENESS. Every other test here checks that the keys we CLASSIFIED are handled
+   * right; none checks that we classified every key. An unclassified key is an unreviewed
+   * key — a new one added next week gets a verdict from nobody, which is the drift this
+   * file exists to prevent.
+   *
+   * `nexus.__probe` is exempt: it is a write-then-delete probe for read-only storage, never
+   * persisted, so it has no scope to get wrong.
+   *
+   * The sessionStorage keys are classified in SESSION_SCOPED and checked by their own scan —
+   * this one cannot see them at all (the key reaches `sessionStorage` as a parameter), which
+   * is exactly why hand-listing them here had gone stale unnoticed.
+   */
+  it('classifies every storage key in the tree', () => {
+    const EXEMPT = new Set([
+      'nexus.__probe', // transient write/delete probe
+    ])
+    const classified = new Set([...PER_SURFACE, ...SHARED, ...DEDUPE, ...SESSION_SCOPED])
+    const seen = new Set<string>()
+    for (const file of sources(SRC)) {
+      const text = readFileSync(file, 'utf8')
+      for (const m of text.matchAll(
+        /(?:local|session)Storage\.(?:getItem|setItem|removeItem)\(\s*('[^']*'|"[^"]*"|[A-Za-z_$][\w$]*)/g,
+      )) {
+        const arg = m[1]
+        if (arg.startsWith("'") || arg.startsWith('"')) {
+          seen.add(arg.slice(1, -1))
+          continue
+        }
+        const decl = text.match(new RegExp(`\\bconst ${arg}\\s*=\\s*'([^']*)'`))
+        if (decl) seen.add(decl[1])
+      }
+    }
+    const unclassified = [...seen].filter((k) => !classified.has(k) && !EXEMPT.has(k)).sort()
+    expect(unclassified).toEqual([])
+  })
+
+  /**
+   * The sessionStorage seam, scanned rather than remembered.
+   *
+   * `useSessionState(key, init)` receives its key as a PARAMETER, so the raw-storage scan
+   * above — which resolves only literals and same-file `const`s — sees none of these keys and
+   * can never report them unclassified. That blind spot is how the hand-written exemption came
+   * to name a renamed key and miss four real ones for four releases.
+   *
+   * Asserted as SET EQUALITY, so it fails in both directions: a new `useSessionState` key is
+   * unclassified until listed, a renamed one breaks its old entry, and a stale entry for a key
+   * no longer in the tree fails too. Same contract the `INDIRECT` seams get for `surface*`.
+   */
+  it('classifies every useSessionState key', () => {
+    const sessionKeys = new Set<string>()
+    for (const file of sources(SRC)) {
+      const text = readFileSync(file, 'utf8')
+      // `[^(]*` skips any generic argument (`useSessionState<string[]>('…')`) without
+      // tripping over `>` inside it. The helper's own definition takes `key: string`, not a
+      // literal, so it never matches itself.
+      for (const m of text.matchAll(/useSessionState[^(]*\(\s*'([^']*)'/g)) sessionKeys.add(m[1])
+    }
+    expect([...sessionKeys].sort()).toEqual([...SESSION_SCOPED].sort())
+  })
+
+  it('keeps the sessionStorage keys OUT of the per-surface scope helper', () => {
+    // They are already per-webview; routing one through surfaceKey would suffix a key that is
+    // private by construction, and the pop-out would silently start from empty.
+    expect(SESSION_SCOPED.filter((k) => routed.has(k))).toEqual([])
+  })
+
+  it('leaves NO per-surface key on a raw localStorage call', () => {
+    const leaks = rawUses
+      .filter((u) => PER_SURFACE.includes(u.key))
+      .map((u) => `${u.file}: localStorage.${u.op}(${u.key})`)
+    expect(leaks).toEqual([])
+  })
+
+
+  it('routes exactly the per-surface keys through the scope helper', () => {
+    const all = [...routed, ...Object.values(INDIRECT).flat()]
+    expect([...new Set(all)].sort()).toEqual([...PER_SURFACE].sort())
+  })
+
+  it('never routes a shared key — that would be silent cross-talk between windows', () => {
+    expect([...SHARED, ...DEDUPE].filter((k) => routed.has(k))).toEqual([])
+  })
+
+  it('accounts for every pass-through seam', () => {
+    expect([...indirect].sort()).toEqual(Object.keys(INDIRECT).sort())
+  })
+
+  it('checks the pass-through seams really carry the keys they claim', () => {
+    const panes = readFileSync(join(SRC, 'usePaneWidths.ts'), 'utf8')
+    expect(panes).toContain("const KEY_RIGHT = 'tempo-right-rail-w'")
+    expect(panes).toContain("const KEY_LEFT = 'tempo-left-rail-w'")
+    expect(readFileSync(join(SRC, 'components/ConnectView.tsx'), 'utf8')).toContain(
+      "persisted('nexus.connect.intent'",
+    )
+    for (const [file, key] of [
+      ['components/OperateCockpit.tsx', 'nexus.split.operate.waterfall'],
+      ['components/CwCockpit.tsx', 'nexus.split.cw.scope'],
+      ['components/PhoneCockpit.tsx', 'nexus.split.phone.scope'],
+    ]) {
+      expect(readFileSync(join(SRC, file), 'utf8')).toContain(`storageKey="${key}"`)
+    }
+  })
+
+  it('scopes BOTH writers of a key written from two components', () => {
+    // nexus.spotlegend is toggled independently by BandMap and BandStrip. Migrating one
+    // and not the other leaves a legend toggle that half-works across windows — the exact
+    // shape of a partial migration, and invisible to a single-component test.
+    for (const file of ['components/BandMap.tsx', 'components/BandStrip.tsx']) {
+      const text = readFileSync(join(SRC, file), 'utf8')
+      expect(text, file).toContain("surfaceGet('nexus.spotlegend')")
+      expect(text, file).toContain("surfaceSet('nexus.spotlegend'")
+      expect(text, file).not.toContain("localStorage.getItem('nexus.spotlegend')")
+      expect(text, file).not.toContain("localStorage.setItem('nexus.spotlegend'")
+    }
+  })
+
+  it('classifies every key exactly once', () => {
+    const seen = new Set<string>()
+    for (const k of [...PER_SURFACE, ...SHARED, ...DEDUPE]) {
+      expect(seen.has(k), `${k} is classified twice`).toBe(false)
+      seen.add(k)
+    }
+  })
+})

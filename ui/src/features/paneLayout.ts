@@ -1,0 +1,163 @@
+// Generic pane-grid layout — the reusable half of Connect's assignable grid, lifted
+// so any view (Operate first) can have add/remove/reposition panes without copying the
+// placement rules. Pure (no JSX), mirrors features/state.ts so it unit-tests without React.
+//
+// A view supplies its own slot + pane vocabulary and defaults; this module owns the
+// RULES that must be identical everywhere:
+//   - the grid is a PERMUTATION — assigning a placed pane swaps, so nothing vanishes
+//   - a corrupted / hand-edited store is coerced back to a valid permutation
+//   - a slot or pane added in a later release auto-fills from defaults
+// Connect (features/connectConfig.ts) is the first consumer; its mode/overlays and
+// one-time migrations stay view-local because no other view has them.
+import { useCallback, useState } from 'react'
+import { surfaceGet, surfaceSet } from './windowScope'
+
+/**
+ * A view's pane VOCABULARY — everything the pure placement helpers need, and nothing
+ * about storage. Split from PaneLayoutSpec deliberately: Connect persists its placement
+ * inside a larger config blob of its own, so it must NOT be able to reach
+ * load/savePlacement — handing those a blob key would overwrite mode+overlays with bare
+ * slots. Omitting storageKey makes that a compile error rather than a latent landmine.
+ */
+export interface PaneVocabulary<S extends string, P extends string> {
+  /** Slot ids in grid order. A SlotId === its CSS grid-area name. */
+  readonly slotIds: readonly S[]
+  /** Every assignable pane — the picker's vocabulary and the coercion whitelist. */
+  readonly paneIds: readonly P[]
+  /** Recommended first-run placement. Must be a complete record. */
+  readonly defaults: Readonly<Record<S, P>>
+}
+
+/** Vocabulary PLUS a dedicated key — for views whose placement is the whole stored value. */
+export interface PaneLayoutSpec<S extends string, P extends string> extends PaneVocabulary<S, P> {
+  /** localStorage key holding this view's placement, and nothing else. */
+  readonly storageKey: string
+}
+
+export type Placement<S extends string, P extends string> = Record<S, P>
+
+export function isPaneOf<P extends string>(spec: { paneIds: readonly P[] }, v: unknown): v is P {
+  return typeof v === 'string' && (spec.paneIds as readonly string[]).includes(v)
+}
+
+/**
+ * Full record from `defaults`, overlaid with valid persisted placements. Unknown slot
+ * keys / unknown pane ids are dropped; a slot added later auto-fills. Mirrors
+ * coerceEnabled's "missing → safe default" (features/state.ts).
+ *
+ * Then enforces the permutation invariant ("nothing vanishes") even against a store
+ * that placed one pane in two slots: walk in order, and on a repeat swap in the first
+ * pane not yet placed. `assignPane` preserves the permutation, so this only fires on
+ * external corruption.
+ */
+export function coercePlacement<S extends string, P extends string>(
+  spec: PaneVocabulary<S, P>,
+  raw: unknown,
+): Placement<S, P> {
+  const out: Placement<S, P> = { ...spec.defaults }
+  if (raw && typeof raw === 'object') {
+    for (const s of spec.slotIds) {
+      const v = (raw as Record<string, unknown>)[s]
+      if (isPaneOf(spec, v)) out[s] = v
+    }
+  }
+  const used = new Set<P>()
+  for (const s of spec.slotIds) {
+    if (used.has(out[s])) {
+      const fill = spec.paneIds.find((p) => !used.has(p))
+      if (fill) out[s] = fill
+    }
+    used.add(out[s])
+  }
+  return out
+}
+
+/**
+ * Place `paneId` in `slotId`. If it already lives elsewhere the two SWAP, so the
+ * displaced pane keeps a home and the grid stays a permutation. Pure — returns a new
+ * record, never mutates.
+ */
+export function assignIn<S extends string, P extends string>(
+  spec: PaneVocabulary<S, P>,
+  slots: Placement<S, P>,
+  slotId: S,
+  paneId: P,
+): Placement<S, P> {
+  const next = { ...slots }
+  const prev = spec.slotIds.find((s) => next[s] === paneId && s !== slotId)
+  if (prev) next[prev] = next[slotId] // swap
+  next[slotId] = paneId
+  return next
+}
+
+/**
+ * Pane placement is PER-SURFACE: which pane sits in which slot is a description of one
+ * window's board, exactly like `nexus.connect.config` (the one spec that exists today —
+ * Connect composes these helpers but persists through its own scoped key, so nothing
+ * currently reaches this function).
+ *
+ * Scoped anyway, precisely BECAUSE it is unreached. The module docs reserve it for future
+ * views, and the next view to adopt `usePaneLayout` would otherwise land an unscoped layout
+ * key that two windows fight over — with no test firing, since its key literal would not be
+ * in the classification either. Cheap now; a silent cross-talk bug later.
+ */
+export function loadPlacement<S extends string, P extends string>(
+  spec: PaneLayoutSpec<S, P>,
+): Placement<S, P> {
+  const raw = surfaceGet(spec.storageKey)
+  try {
+    if (raw != null) return coercePlacement(spec, JSON.parse(raw))
+  } catch {
+    /* malformed — fall through (matches useFeatures.readInitial) */
+  }
+  return { ...spec.defaults }
+}
+
+export function savePlacement<S extends string, P extends string>(
+  spec: PaneLayoutSpec<S, P>,
+  slots: Placement<S, P>,
+): void {
+  surfaceSet(spec.storageKey, JSON.stringify(slots))
+}
+
+export interface PaneLayoutApi<S extends string, P extends string> {
+  slots: Placement<S, P>
+  assignPane: (slotId: S, paneId: P) => void
+  /**
+   * Replace the whole board at once — for presets and "reset to defaults", which cannot
+   * be expressed as a sequence of assignPane calls (each swap would drag the previous
+   * occupant along). Takes `unknown` and coerces, so a preset constant, a restored
+   * backup, or junk all land on a valid permutation.
+   */
+  setPlacement: (next: unknown) => void
+}
+
+/**
+ * The plain pane grid for a view that needs nothing but placement. Connect does NOT
+ * use this (it persists mode + overlays in one blob and owns migrations); it composes
+ * the pure helpers above instead. Operate and later views use this directly.
+ */
+export function usePaneLayout<S extends string, P extends string>(
+  spec: PaneLayoutSpec<S, P>,
+): PaneLayoutApi<S, P> {
+  const [slots, setSlots] = useState<Placement<S, P>>(() => loadPlacement(spec))
+  const assignPane = useCallback(
+    (slotId: S, paneId: P) =>
+      setSlots((cur) => {
+        const next = assignIn(spec, cur, slotId, paneId)
+        savePlacement(spec, next)
+        return next
+      }),
+    [spec],
+  )
+  const setPlacement = useCallback(
+    (next: unknown) =>
+      setSlots(() => {
+        const coerced = coercePlacement(spec, next)
+        savePlacement(spec, coerced)
+        return coerced
+      }),
+    [spec],
+  )
+  return { slots, assignPane, setPlacement }
+}

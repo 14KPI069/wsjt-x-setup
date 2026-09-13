@@ -1,0 +1,500 @@
+//! Nexus mode + signal-source abstractions — the architectural spine of the
+//! digital-ops nerve center.
+//!
+//! Two pluggable seams let the rest of the app stay mode- and source-agnostic:
+//!
+//! - [`Mode`] — everything mode-specific (T/R timing, frame size, waveform,
+//!   decode, passband, capabilities). FT8/FT4/FT1 ship today; a future mode is a
+//!   new `impl Mode` with no other changes. ([`Ft8Mode`], [`Ft4Mode`], [`Ft1Mode`].)
+//! - [`SignalSource`] — the user-selectable "native engine vs companion" switch:
+//!   [`NativeSource`] decodes locally captured audio with a [`Mode`], while
+//!   [`WsjtxUdpSource`] consumes an upstream WSJT-X/JTDX/MSHV decode stream over
+//!   UDP. Both yield the unified [`Decode`].
+//!
+//! Every decode, whatever its mode or source, is normalized to one [`Decode`].
+
+pub mod decode;
+pub mod mode;
+pub mod source;
+
+pub use decode::Decode;
+pub use mode::{make_mode, tx_mode, Capabilities, Ft1Mode, Ft4Mode, Ft8Mode, Mode, ModeKind};
+pub use source::{DecodeRequest, NativeSource, SignalSource, WsjtxUdpSource};
+
+/// Clear FT8's a7 cross-cycle decode table (prior-slot call pairs). The engine
+/// calls this on band QSY / tier switch — analogous to `tempo_fast::harq_reset` — so a
+/// new band's audio is not probed with stale prior-cycle AP hypotheses.
+pub use ft8::a7_reset as reset_ft8_a7;
+
+#[cfg(test)]
+mod tests {
+
+    /// FT2 MUST run the early pass — this flag routes it out of service.rs's
+    /// key-before-decode branch, where its first on-air QSOs answered every step one
+    /// full cycle late and sent every message twice (2026-08-16). The loop-level
+    /// ordering itself has no test harness yet (documented gap in the QSO review);
+    /// this pins the configuration that selects the correct branch.
+    #[test]
+    fn ft2_runs_an_early_pass() {
+        assert!(
+            crate::mode::make_mode(crate::mode::ModeKind::Ft2)
+                .capabilities()
+                .early_decode
+        );
+    }
+    use super::*;
+
+    const FS: f32 = 12_000.0;
+
+    fn to_i16_frame(wave: &[f32], frame_len: usize, off: usize, gain: f32) -> Vec<i16> {
+        let mut iwave = vec![0i16; frame_len];
+        for (i, &s) in wave.iter().enumerate() {
+            let k = off + i;
+            if k < frame_len {
+                iwave[k] = (s * gain).clamp(-32768.0, 32767.0) as i16;
+            }
+        }
+        iwave
+    }
+
+    /// A clean (noise-free) full-frame buffer carrying `msg` at `f0`, built via
+    /// the mode's own `encode`/`gen_wave` — so it exercises the trait, not the
+    /// concrete crate. FT8 starts at the 0.5 s TX point; FT4 self-positions; FT1
+    /// is placed at ~0.4 s (matching the proven acquisition harness).
+    fn native_frame(mode: &dyn Mode, msg: &str, f0: f32) -> Vec<i16> {
+        let tones = mode.encode(msg);
+        assert!(!tones.is_empty(), "{} encode failed", mode.name());
+        let wave = mode.gen_wave(&tones, FS, f0);
+        // FT8 and FT4 self-position (Mode::gen_wave includes the 0.5 s lead-in); FT1's
+        // bare wave is placed at the proven ~0.4 s acquisition point by this harness.
+        let off = match mode.kind() {
+            ModeKind::Ft8 => 0,
+            ModeKind::Ft4 => 0,
+            // FT2 self-positions too — `Mode::gen_wave` prepends FT2_LEAD_IN_SECS.
+            ModeKind::Ft2 => 0,
+            // FST4 is RECEIVE-ONLY. Mode::encode returns empty for it, so the
+            // assert above fires before this match is ever reached. This harness
+            // is TX-dependent by construction and cannot serve a mode that does
+            // not transmit — which is the point, not a gap to fill in later.
+            ModeKind::Fst4 { .. } => {
+                unreachable!("FST4/FST4W are receive-only; native_frame requires encode()")
+            }
+            // Q65 is likewise RECEIVE-ONLY, and the same assert fires first. Listed
+            // explicitly rather than folded into a `_` arm so that adding a
+            // TRANSMITTING mode later fails to compile here instead of silently
+            // inheriting some other mode's slot offset.
+            ModeKind::Q65 { .. } => {
+                unreachable!("Q65 is receive-only; native_frame requires encode()")
+            }
+            ModeKind::Msk144 { .. } => {
+                unreachable!("MSK144 is receive-only; native_frame requires encode()")
+            }
+            ModeKind::Jt65 { .. } => {
+                unreachable!("JT65 is receive-only; native_frame requires encode()")
+            }
+            ModeKind::Wspr => {
+                unreachable!("WSPR is receive-only; native_frame requires encode()")
+            }
+            ModeKind::TempoFast => 4_800,
+        };
+        to_i16_frame(&wave, mode.frame_samples(), off, 1000.0)
+    }
+
+    #[test]
+    fn mode_metadata() {
+        let m8 = make_mode(ModeKind::Ft8);
+        assert_eq!(m8.name(), "FT8");
+        assert_eq!(m8.slot_secs(), 15.0);
+        assert_eq!(m8.frame_samples(), ft8::NMAX);
+        assert!(m8.capabilities().fox_hound);
+        assert!(!m8.capabilities().ir_harq);
+
+        let m4 = make_mode(ModeKind::Ft4);
+        assert_eq!(m4.slot_secs(), 7.5);
+        assert_eq!(m4.frame_samples(), ft4::NMAX);
+        assert!(!m4.capabilities().fox_hound);
+
+        let m1 = make_mode(ModeKind::TempoFast);
+        assert_eq!(m1.slot_secs(), 4.0);
+        assert_eq!(m1.frame_samples(), tempo_fast::NMAX);
+        assert!(m1.capabilities().ir_harq);
+
+        let mq = make_mode(ModeKind::Q65_30A);
+        assert_eq!(mq.name(), "Q65-30A");
+        assert_eq!(mq.slot_secs(), 30.0);
+        assert_eq!(mq.frame_samples(), q65::nmax(30));
+        assert!(
+            mq.capabilities().tx,
+            "Q65 transmits since the encoder was wired"
+        );
+
+        // Q65-60B: the EME working combination, and proof the period and submode
+        // actually reach the buffer contract and the label rather than being
+        // decoration on a still-pinned decoder.
+        let eme = make_mode(ModeKind::Q65 {
+            period_s: 60,
+            submode: 1,
+        });
+        assert_eq!(eme.name(), "Q65-60B");
+        assert_eq!(eme.slot_secs(), 60.0);
+        assert_eq!(eme.frame_samples(), 60 * 12_000);
+        assert!(eme.capabilities().tx);
+
+        // Every combination must produce a distinct, well-formed label.
+        let names: std::collections::HashSet<&str> =
+            ModeKind::q65_all().map(|k| k.as_str()).collect();
+        assert_eq!(names.len(), 25, "Q65 labels collided: {names:?}");
+        assert!(
+            !names.contains("Q65"),
+            "a combination fell through to the family name"
+        );
+
+        // FT2's period is FIXED, so unlike FST4/Q65/MSK144 there is no
+        // period-carrying variant behind the one `ALL` entry.
+        let m2 = make_mode(ModeKind::Ft2);
+        assert_eq!(m2.name(), "FT2");
+        assert_eq!(m2.slot_secs(), 3.75);
+        assert_eq!(m2.frame_samples(), ft2::NMAX);
+        // 3.75 s × 12 kHz lands exactly on NMAX: frame == capture, as for FT8.
+        assert_eq!(ModeKind::Ft2.capture_samples(), ft2::NMAX);
+        assert!(m2.capabilities().tx);
+
+        assert_eq!(ModeKind::ALL.len(), 9) // FT8, FT4, FT2, FST4, Q65, MSK144, JT65, WSPR, TempoFast;
+    }
+
+    /// Each native mode decodes its own clean signal through a `Box<dyn
+    /// SignalSource>` — proving the Mode + SignalSource dispatch end to end.
+    fn native_roundtrip(kind: ModeKind) {
+        let msg = "CQ KD9TAW EN52";
+        let mode = make_mode(kind);
+        let frame = native_frame(mode.as_ref(), msg, 1500.0);
+
+        let mut src: Box<dyn SignalSource> = Box::new(NativeSource::from_kind(kind));
+        assert_eq!(src.mode_kind(), Some(kind));
+        let decs = src.decode(&DecodeRequest::full_band(&frame));
+        assert!(
+            decs.iter().any(|d| d.message == msg),
+            "{} native source must decode its own signal; got {decs:?}",
+            kind.as_str()
+        );
+        // Every native decode is tagged with the source's mode (so the feed can
+        // label it truly, even after a mode switch).
+        assert!(
+            decs.iter().all(|d| d.mode == Some(kind)),
+            "{} native decodes must carry their mode",
+            kind.as_str()
+        );
+    }
+
+    #[test]
+    fn native_ft8_through_trait() {
+        native_roundtrip(ModeKind::Ft8);
+    }
+
+    #[test]
+    fn native_ft4_through_trait() {
+        native_roundtrip(ModeKind::Ft4);
+    }
+
+    #[test]
+    fn ft1_gen_wave_has_a_lead_in_and_never_clips_the_signal() {
+        // REGRESSION (on air, KD9TAW <-> N9UM, 6 m, 2026-07-26): TempoFast was seen on the
+        // panadapter and decoded only intermittently, while FT8 worked perfectly on the same
+        // radios. Roughly half of all frames were lost in each direction, so single-frame
+        // messages arrived and multi-frame ones never reassembled.
+        //
+        // Cause: FT1's decoder CANNOT search for an early signal. `tempofast_decode.f90` sweeps
+        // `do istart=0,200,4` and refines with `max(0,ibest_all-5)` — clamped at zero. FT8
+        // (`sync8.f90`, `do j=-JZ,+JZ` about a +0.5 s nominal) and FT4 (`ibmin=-344`) both search
+        // negative. FT1 alone transmitted at t=0, i.e. sitting ON the clamp with no early margin,
+        // so ordinary clock error (N9UM measured -0.25 s off UTC) pushed frames off a cliff.
+        let m = make_mode(ModeKind::TempoFast);
+        let tones = m.encode("CQ KD9TAW EN52");
+        let wave = m.gen_wave(&tones, FS, 1500.0);
+        let bare = tempo_fast::gen_wave(&tones, FS, 1500.0);
+        // ⚠️ READ THE CONSTANT, DO NOT RESTATE IT. This was a hardcoded `0.4 * FS`, and when
+        // `FT1_LEAD_IN_SECS` moved to 0.300 (2026-08-05) the test kept asserting silence over a
+        // window that now contains tones — it failed loudly here, but a change in the other
+        // direction would have passed while testing nothing.
+        let lead = (crate::mode::FT1_LEAD_IN_SECS * FS).round() as usize;
+
+        // The buffer LENGTH must not change. FT1's over already fills its whole 4 s T/R period,
+        // and the PTT hold is sized from the wave length — a longer buffer would push the tail
+        // past the slot boundary into the peer's receive window.
+        assert_eq!(
+            wave.len(),
+            bare.len(),
+            "FT1 buffer stays exactly one T/R period"
+        );
+        assert_eq!(wave.len(), tempo_fast::NMAX);
+
+        assert!(wave[..lead].iter().all(|&s| s == 0.0), "lead-in is silence");
+        assert!(
+            wave[lead..].iter().any(|&s| s != 0.0),
+            "tones follow the lead-in"
+        );
+
+        // The shift must be a pure delay of the SAME waveform — nothing resampled, nothing
+        // clipped off the end. Everything the shift pushed past the end must have been silence.
+        let keep = bare.len() - lead;
+        assert!(
+            bare[keep..].iter().all(|&s| s == 0.0),
+            "the shift may only push trailing silence off the end, never signal"
+        );
+        assert_eq!(
+            &wave[lead..],
+            &bare[..keep],
+            "a pure delay, sample for sample"
+        );
+
+        // And the delay is real: the first sample of signal moved right by the lead-in.
+        let first_bare = bare.iter().position(|&s| s != 0.0).unwrap();
+        let first_wave = wave.iter().position(|&s| s != 0.0).unwrap();
+        assert_eq!(
+            first_wave,
+            first_bare + lead,
+            "signal starts {lead} samples later"
+        );
+    }
+
+    #[test]
+    fn ft8_gen_wave_is_slot_positioned_with_lead_in() {
+        // Mode::gen_wave for FT8 must include the 0.5 s lead-in (slot-positioned), so the
+        // radio loop plays it at the slot boundary without going on the air 0.5 s early.
+        let m = make_mode(ModeKind::Ft8);
+        let tones = m.encode("CQ KD9TAW EN52");
+        let wave = m.gen_wave(&tones, FS, 1500.0);
+        let lead = (0.5 * FS).round() as usize;
+        let bare = ft8::gen_wave(&tones, FS, 1500.0);
+        assert_eq!(
+            wave.len(),
+            lead + bare.len(),
+            "FT8 wave includes the 0.5 s lead-in"
+        );
+        assert!(wave[..lead].iter().all(|&s| s == 0.0), "lead-in is silence");
+        assert!(
+            wave[lead..].iter().any(|&s| s != 0.0),
+            "tones follow the lead-in"
+        );
+    }
+
+    #[test]
+    fn native_ft2_through_trait() {
+        native_roundtrip(ModeKind::Ft2);
+    }
+
+    #[test]
+    fn ft2_gen_wave_starts_at_the_slot_boundary_like_decodium() {
+        // ⭐ THE TX-PLACEMENT PROOF, corrected 2026-08-16. FT2 audio starts AT the
+        // slot boundary — Decodium's own transmit convention (their decoder is a
+        // free-running ring, so its `xdt = xibest/1333.33 − 0.5` is a window
+        // re-centring, not a slot contract; a slot-aligned window reads slot-start
+        // audio as dt ≈ −0.5, ours and theirs alike). The first version of this
+        // test asserted dt ≈ 0 with a 0.5 s lead — encoding with our lead and
+        // decoding with our decoder, it proved only that Nexus agreed with Nexus.
+        //
+        // Round trip: encode -> Mode::gen_wave -> the radio loop plays the buffer
+        // straight (sample 0 = slot t=0) -> Mode::decode_frame, read dt back.
+        let m = make_mode(ModeKind::Ft2);
+        let msg = "CQ KD9TAW EN52";
+        let tones = m.encode(msg);
+        assert_eq!(tones.len(), ft2::NN, "FT2 encodes 103 channel symbols");
+
+        let wave = m.gen_wave(&tones, FS, 1200.0);
+        assert_eq!(
+            wave.len(),
+            ft2::NWAVE,
+            "the buffer is exactly 2.52 s of tones — no lead-in, per Decodium"
+        );
+        assert!(
+            wave.len() < ModeKind::Ft2.capture_samples(),
+            "FT2's over must fit its 3.75 s slot: {} samples of {}",
+            wave.len(),
+            ModeKind::Ft2.capture_samples()
+        );
+
+        let dt_of = |w: &[f32]| -> f32 {
+            let frame = to_i16_frame(w, m.frame_samples(), 0, 8000.0);
+            let decs = m.decode_frame(&frame, 200, 2900, 3, "KD9TAW", "", 0, 1200, 0, true, false);
+            decs.iter()
+                .find(|d| d.message == msg)
+                .unwrap_or_else(|| panic!("FT2 did not decode its own transmission: {decs:?}"))
+                .dt
+        };
+
+        let dt = dt_of(&wave);
+        assert!(
+            (dt + 0.5).abs() < 0.06,
+            "slot-start FT2 audio reads dt ~= -0.5 in a slot-aligned window, got {dt:.3} s"
+        );
+
+        // POSITIVE CONTROL: the SAME audio shifted 0.5 s later must read dt ~= 0.
+        // If both read the same, the measurement distinguishes nothing and a
+        // placement regression would sail through.
+        let mut shifted = vec![0.0f32; (0.5 * FS) as usize];
+        shifted.extend_from_slice(&wave);
+        let dt_shifted = dt_of(&shifted);
+        assert!(
+            dt_shifted.abs() < 0.06,
+            "control: audio 0.5 s into the window must read dt ~= 0, got {dt_shifted:.3} s"
+        );
+    }
+
+    #[test]
+    fn ft2_gen_wave_refuses_a_sample_rate_it_cannot_honour() {
+        // `ft2::gen_wave` has no sample-rate argument — the vendored generator is
+        // fixed at 12 kHz. A caller asking for 48 kHz must get SILENCE (which keys
+        // nothing) rather than a buffer at the wrong pitch and duration.
+        let m = make_mode(ModeKind::Ft2);
+        let tones = m.encode("CQ KD9TAW EN52");
+        assert!(m.gen_wave(&tones, 48_000.0, 1500.0).is_empty());
+        // And a malformed tone vector is silent at the right rate too.
+        assert!(m.gen_wave(&[1, 2, 3], FS, 1500.0).is_empty());
+    }
+
+    #[test]
+    fn native_ft1_through_trait() {
+        native_roundtrip(ModeKind::TempoFast);
+    }
+
+    /// The extended a7 path (`SignalSource::decode_a7` -> `Mode::decode_frame_a7`
+    /// with a REAL slot-derived frame_time_ms and the final-pass flag) must not
+    /// regress the baseline decode — the a7 machinery only adds decodes on top
+    /// of the direct pass. Also exercises the crate-root `reset_ft8_a7`.
+    #[test]
+    fn native_ft8_decode_a7_extended_path() {
+        let msg = "CQ KD9TAW EN52";
+        let mode = make_mode(ModeKind::Ft8);
+        let frame = native_frame(mode.as_ref(), msg, 1500.0);
+
+        let mut src = NativeSource::from_kind(ModeKind::Ft8);
+        let mut req = DecodeRequest::full_band(&frame);
+        req.frame_time_ms = 15_000; // slot 1 -> a7 slot key nutc = 15
+        let decs = src.decode_a7(&req, true);
+        assert!(
+            decs.iter().any(|d| d.message == msg),
+            "extended a7 path must still decode the clean signal; got {decs:?}"
+        );
+        assert!(
+            decs.iter().all(|d| d.mode == Some(ModeKind::Ft8)),
+            "decode_a7 decodes must carry their mode"
+        );
+
+        // The band-change reset is callable through the crate root (the engine's
+        // clear_decode_context hook) and does not disturb a following decode.
+        reset_ft8_a7();
+        let decs = src.decode_a7(&req, true);
+        assert!(
+            decs.iter().any(|d| d.message == msg),
+            "decode after reset_ft8_a7 must still work; got {decs:?}"
+        );
+    }
+
+    /// The companion source maps an upstream WSJT-X `Decode` datagram to a
+    /// unified [`Decode`], drained at the next interval.
+    #[test]
+    fn wsjtx_udp_source_ingests_decode() {
+        use tempo_net::wsjtx::{encode_decode, Decode as WxDecode};
+
+        let bytes = encode_decode(
+            "WSJT-X",
+            &WxDecode {
+                new: true,
+                time_ms: 1000,
+                snr: -7,
+                delta_time: 0.1,
+                delta_freq: 1200,
+                mode: "~",
+                message: "CQ W1AW FN31",
+                low_confidence: false,
+                off_air: false,
+            },
+        );
+
+        let mut src = WsjtxUdpSource::new();
+        let no_audio: Vec<i16> = Vec::new();
+        // Nothing queued yet.
+        assert!(src.decode(&DecodeRequest::full_band(&no_audio)).is_empty());
+
+        assert!(
+            src.ingest_datagram(&bytes),
+            "Decode datagram should be queued"
+        );
+        let decs = src.decode(&DecodeRequest::full_band(&no_audio));
+        assert_eq!(decs.len(), 1);
+        assert_eq!(decs[0].message, "CQ W1AW FN31");
+        assert_eq!(decs[0].snr, -7);
+        assert_eq!(decs[0].freq, 1200.0);
+        assert_eq!(decs[0].rv, None);
+        // The WSJT-X mode ("~" = FT8) is carried through, not our selected tier.
+        assert_eq!(decs[0].mode, Some(ModeKind::Ft8));
+
+        // A non-Decode datagram is ignored.
+        let close = tempo_net::wsjtx::encode_close("WSJT-X");
+        assert!(!src.ingest_datagram(&close));
+    }
+
+    /// The companion source receives a real WSJT-X `Decode` datagram over a bound
+    /// UDP socket and surfaces it via `decode()` — proving the live network path,
+    /// not just `ingest_datagram`.
+    #[test]
+    fn wsjtx_udp_source_receives_over_socket() {
+        use std::net::UdpSocket;
+        use tempo_net::wsjtx::{encode_decode, Decode as WxDecode};
+
+        let mut src = WsjtxUdpSource::bind("127.0.0.1:0").expect("bind ephemeral");
+        let addr = src.local_addr().expect("bound addr");
+
+        let bytes = encode_decode(
+            "WSJT-X",
+            &WxDecode {
+                new: true,
+                time_ms: 2000,
+                snr: -12,
+                delta_time: -0.2,
+                delta_freq: 1500,
+                mode: "~",
+                message: "K1JT W1AW -15",
+                low_confidence: false,
+                off_air: false,
+            },
+        );
+        UdpSocket::bind("127.0.0.1:0")
+            .expect("tx socket")
+            .send_to(&bytes, addr)
+            .expect("send datagram");
+
+        // Loopback delivery is near-instant but async; poll briefly via the trait.
+        let no_audio: Vec<i16> = Vec::new();
+        let mut decs = Vec::new();
+        for _ in 0..50 {
+            decs = src.decode(&DecodeRequest::full_band(&no_audio));
+            if !decs.is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(decs.len(), 1, "a decode should arrive over the UDP socket");
+        assert_eq!(decs[0].message, "K1JT W1AW -15");
+        assert_eq!(decs[0].snr, -12);
+        assert_eq!(decs[0].freq, 1500.0);
+        assert_eq!(
+            decs[0].mode,
+            Some(ModeKind::Ft8),
+            "WSJT-X mode carried through"
+        );
+    }
+
+    /// Native and companion sources are interchangeable behind the trait object.
+    #[test]
+    fn sources_are_polymorphic() {
+        let sources: Vec<Box<dyn SignalSource>> = vec![
+            Box::new(NativeSource::from_kind(ModeKind::Ft4)),
+            Box::new(WsjtxUdpSource::new()),
+        ];
+        assert_eq!(sources[0].label(), "Native (FT4)");
+        assert_eq!(sources[1].label(), "WSJT-X UDP");
+        assert_eq!(sources[0].mode_kind(), Some(ModeKind::Ft4));
+        assert_eq!(sources[1].mode_kind(), None);
+    }
+}

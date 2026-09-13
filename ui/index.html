@@ -1,0 +1,142 @@
+<!doctype html>
+<html lang="en" data-theme="dark" data-viewport="md">
+  <head>
+    <meta charset="UTF-8" />
+    <!-- Apply persisted theme / scale / pane widths before first paint
+         so there's no reflow flash on launch. The React hooks keep them in sync. -->
+    <script>
+      (function () {
+        try {
+          var d = document.documentElement
+          var t = localStorage.getItem('tempo-theme')
+          if (t === 'light' || t === 'dark') d.setAttribute('data-theme', t)
+          var den = localStorage.getItem('nexus-density')
+          if (den === 'guided' || den === 'standard' || den === 'dense') d.setAttribute('data-density', den)
+          if (localStorage.getItem('nexus-motion') === 'reduce') d.setAttribute('data-motion', 'reduce')
+          // Field mode (outdoor/POTA): high-contrast tokens key off this attribute, and the
+          // zoom seed below mirrors its larger fit — BOTH halves must seed or field mode
+          // flashes the indoor look on every launch.
+          var fieldOn = localStorage.getItem('nexus-field-mode') === '1'
+          if (fieldOn) d.setAttribute('data-contrast', 'high')
+          // First-paint zoom seed — keep in sync with useScale.ts (SCALE_STEPS, the
+          // per-surface natural fit model, keys nexus-ui-scale-mode /
+          // nexus-ui-scale-cap): a pinned Manual scale applies directly (capped in a
+          // pop-out, see below); otherwise auto-fit to the window (min(w/natW, h/natH),
+          // snapped DOWN to a step, capped, floor 65).
+          var STEPS = [65, 70, 75, 80, 85, 90, 100, 110, 125, 150, 175]
+          // Per-surface mode key (mirror windowScope surfaceKey/surfaceGet, incl. the
+          // instance-token grammar): a pop-out (?panel=) may carry its own pin under
+          // 'nexus-ui-scale-mode.<panel>[.<instance>]'; fall back to the bare (main)
+          // key only when this surface never wrote one — otherwise a pop-out with a
+          // divergent pin first-painted at the main window's zoom, then jumped.
+          var q = new URLSearchParams(window.location.search)
+          var panel = q.get('panel')
+          var inst = q.get('instance')
+          var sfx = panel
+            ? '.' + panel + (inst && /^(w(0|[1-9][0-9]{0,2})|r(0|[1-9][0-9]{0,8}))$/.test(inst) ? '.' + inst : '')
+            : ''
+          var modeRaw = sfx ? localStorage.getItem('nexus-ui-scale-mode' + sfx) : null
+          if (modeRaw == null) modeRaw = localStorage.getItem('nexus-ui-scale-mode')
+          var mode = Number(modeRaw)
+          // This window's fit ceiling (fitScale at the max step, floor 65). Auto is
+          // bounded by it; so is a PIN in a pop-out (no scale UI there to recover
+          // with — mirrors capPinnedScale in src/useScale.ts). A main-window pin is
+          // an operator choice and applies verbatim.
+          // Per-surface NATURAL footprint (the fit denominator) — mirror of
+          // PANEL_NATURAL in src/useScale.ts; index-preseed.test.ts compares this copy
+          // to the real fitScale for every openable panel rather than to constants. A
+          // pop-out is a small window the APP sized for its content, so fitting one
+          // against the main cockpit's 1200×900 pinned EVERY pop-out at the 65% floor
+          // (the "font is very, very small" band-map field report).
+          var NAT = { operate: [1200, 900], bandmapPhone: [380, 520], bandmapCw: [380, 520],
+                      waterfall: [560, 200], fieldday: [560, 540], pota: [620, 540],
+                      fdclub: [820, 420] }
+          var natW = 1200, natH = 900
+          if (panel) {
+            var n = Object.prototype.hasOwnProperty.call(NAT, panel) ? NAT[panel] : [640, 520]
+            natW = n[0]; natH = n[1]
+          }
+          // Field mode fits against a 0.85-shrunk natural at the ladder-top cap — the
+          // mirror of fieldFitScale in src/useScale.ts (auto mode only; a pin is verbatim).
+          if (fieldOn) { natW = natW * 0.85; natH = natH * 0.85 }
+          var target = Math.min(window.innerWidth / natW, window.innerHeight / natH) * 100
+          var fitCeil = 65
+          for (var i = 0; i < STEPS.length; i++) {
+            if (STEPS[i] <= target) fitCeil = STEPS[i]
+          }
+          var z
+          if (STEPS.indexOf(mode) !== -1) {
+            z = panel && mode > fitCeil ? fitCeil : mode
+          } else {
+            var cap = Number(localStorage.getItem('nexus-ui-scale-cap'))
+            if (STEPS.indexOf(cap) === -1) cap = 100
+            if (fieldOn) cap = STEPS[STEPS.length - 1]
+            z = Math.min(cap, fitCeil)
+          }
+          var zoom = z / 100
+          d.style.setProperty('--ui-zoom', String(zoom))
+          // Effective (zoom-adjusted) viewport, seeded pre-paint so every
+          // var(--vh-eff/--vw-eff, …) consumer paints right on frame one. useViewport
+          // republishes live one rAF after mount — without this seed every pop-out
+          // painted its first frame 35% short at the 65% floor, then snapped.
+          var ew = window.innerWidth / (zoom || 1)
+          var eh = window.innerHeight / (zoom || 1)
+          d.style.setProperty('--vh-eff', eh + 'px')
+          d.style.setProperty('--vw-eff', ew + 'px')
+          // Initial size class from EFFECTIVE width (mirror classifyViewport() in
+          // src/useViewport.ts) so the first paint is already at the right breakpoint.
+          d.setAttribute('data-viewport', ew < 768 ? 'xs' : ew < 1100 ? 'sm' : ew < 1600 ? 'md' : ew < 2400 ? 'lg' : 'xl')
+          // Rail preseed, clamped with usePaneWidths' exact bounds (left ≥220 ≤40%
+          // effW, right ≥260 ≤60% effW): the stored px may come from a bigger monitor,
+          // and replaying it raw zeroed the center pane until React re-clamped.
+          // Nothing stored (a never-dragged install) seeds the hook's proportional
+          // default (0.18/0.22 · effW, same clamps) — skipping the seed left the :root
+          // 300/360px fallbacks up for the first paint, so EVERY launch jumped when
+          // React published the real default (~319px wider at 3440w). Storage itself
+          // stays untouched either way (writes happen only on operator commit/reset).
+          var lw = Number(localStorage.getItem('tempo-left-rail-w'))
+          if (!(lw > 0)) lw = Math.round(ew * 0.18)
+          d.style.setProperty('--left-rail-w', Math.max(220, Math.min(Math.round(ew * 0.4), lw)) + 'px')
+          var rw = Number(localStorage.getItem('tempo-right-rail-w'))
+          if (!(rw > 0)) rw = Math.round(ew * 0.22)
+          d.style.setProperty('--right-rail-w', Math.max(260, Math.min(Math.round(ew * 0.6), rw)) + 'px')
+        } catch (e) {}
+      })()
+    </script>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <meta name="color-scheme" content="dark light" />
+    <meta name="theme-color" content="#0e151f" />
+    <title>Nexus — unified ham digital-ops nerve center</title>
+    <meta
+      name="description"
+      content="Nexus is a unified, native ham digital-operations app — FT8/FT4 decode, waterfall, spots, map, propagation, logbook, and awards in one place, plus Tempo two-way free-text calling."
+    />
+
+    <!-- Open Graph / social unfurl -->
+    <meta property="og:type" content="website" />
+    <meta property="og:title" content="Nexus — unified ham digital-ops nerve center" />
+    <meta
+      property="og:description"
+      content="FT8/FT4 + waterfall + spots + map + propagation + logbook + awards in one native app, plus Tempo two-way free-text calling. Zero-config setup, automatic propagation intelligence."
+    />
+    <meta property="og:url" content="https://github.com/kd9taw/nexus" />
+    <meta
+      property="og:image"
+      content="https://raw.githubusercontent.com/kd9taw/nexus/main/docs/img/social-card.png"
+    />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="Nexus — unified ham digital-ops nerve center" />
+    <meta
+      name="twitter:description"
+      content="FT8/FT4 + waterfall + spots + map + propagation + logbook + awards in one native app, plus Tempo two-way calling."
+    />
+    <meta
+      name="twitter:image"
+      content="https://raw.githubusercontent.com/kd9taw/nexus/main/docs/img/social-card.png"
+    />
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

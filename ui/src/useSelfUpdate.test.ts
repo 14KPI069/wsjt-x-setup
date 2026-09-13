@@ -1,0 +1,234 @@
+// @vitest-environment jsdom
+//
+// "Not now" must actually mean not now (operator-adjacent report, 2026-08-16).
+//
+// `dismissed` was a boolean that was WRITTEN by dismiss() and read by nothing, so closing the
+// update banner lasted exactly until the hourly re-check re-ran the whole flow, silently
+// re-downloaded, and put the banner straight back. Dismissal is per-VERSION on purpose:
+// refusing 1.4.1 today must not also swallow 1.5.0 next month — an update the operator has
+// never been asked about is not something a stale "no" should answer.
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
+import { renderHook, act } from '@testing-library/react'
+import { useSelfUpdate } from './useSelfUpdate'
+
+type Handle = {
+  available: boolean
+  version?: string
+  download?: (cb: (ev: { event: string; data?: { contentLength?: number; chunkLength?: number } }) => void) => Promise<void>
+  install?: () => Promise<void>
+}
+
+let nextCheck: () => Promise<Handle | null>
+/** What `check_beta_update` returns when the beta channel is exercised (null = up to date). */
+let betaInfo: { version: string; notes: string | null } | null = null
+const checkCalls: number[] = []
+/** Every `invoke(cmd)` the hook made through the api bridge, in order. */
+const invoked: string[] = []
+
+beforeEach(() => {
+  vi.useFakeTimers()
+  checkCalls.length = 0
+  invoked.length = 0
+  betaInfo = null
+  ;(window as unknown as { __TAURI__: unknown }).__TAURI__ = {
+    updater: {
+      check: () => {
+        checkCalls.push(Date.now())
+        return nextCheck()
+      },
+    },
+    // The api.ts bridge: update_install_block answers "nothing blocks" so install()
+    // proceeds; restart_app just has to be SEEN — the assertion is that it is called.
+    core: {
+      invoke: (cmd: string) => {
+        invoked.push(cmd)
+        if (cmd === 'update_install_block') return Promise.resolve(null)
+        if (cmd === 'check_beta_update') return Promise.resolve(betaInfo)
+        return Promise.resolve(undefined)
+      },
+    },
+  }
+})
+afterEach(() => {
+  vi.useRealTimers()
+  delete (window as unknown as { __TAURI__?: unknown }).__TAURI__
+})
+
+const HOUR = 60 * 60 * 1000
+
+function offering(version: string): () => Promise<Handle | null> {
+  return () =>
+    Promise.resolve({
+      available: true,
+      version,
+      download: () => Promise.resolve(), // instant "download" — phase goes straight to ready
+    })
+}
+
+/** Let the hook's async check/download chain settle under fake timers. */
+async function settle() {
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(0)
+  })
+}
+
+describe('self-update dismissal', () => {
+  it('downloads an offered update and reaches ready (control)', async () => {
+    nextCheck = offering('9.9.9')
+    const { result } = renderHook(() => useSelfUpdate(false))
+    await settle()
+    expect(result.current.phase).toBe('ready')
+    expect(result.current.version).toBe('9.9.9')
+  })
+
+  it('a dismissed version STAYS dismissed across the hourly re-check', async () => {
+    nextCheck = offering('9.9.9')
+    const { result } = renderHook(() => useSelfUpdate(false))
+    await settle()
+    expect(result.current.phase).toBe('ready')
+
+    act(() => result.current.dismiss())
+    expect(result.current.phase).toBe('idle')
+
+    // The hourly tick re-checks — and must NOT resurrect the banner for the same version.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(HOUR + 1000)
+    })
+    expect(checkCalls.length, 'control: the re-check itself still runs').toBeGreaterThanOrEqual(2)
+    expect(result.current.phase, 'the dismissed version must not come back').toBe('idle')
+  })
+
+  it('a NEWER version than the dismissed one still lands', async () => {
+    nextCheck = offering('9.9.9')
+    const { result } = renderHook(() => useSelfUpdate(false))
+    await settle()
+    act(() => result.current.dismiss())
+
+    nextCheck = offering('10.0.0')
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(HOUR + 1000)
+    })
+    expect(result.current.phase).toBe('ready')
+    expect(result.current.version).toBe('10.0.0')
+  })
+})
+
+describe('install and restart', () => {
+  // The mac QA audit (2026-08-17): the updater plugin's install() swaps the bundle on disk
+  // and resolves with the OLD build still running on macOS/Linux — nothing restarts unless
+  // WE do it. The hook must therefore invoke restart_app AFTER the plugin install resolves,
+  // never before (a restart mid-swap would relaunch a half-written bundle).
+  it('install() asks the backend to restart once the plugin install resolves', async () => {
+    let installed = false
+    nextCheck = () =>
+      Promise.resolve({
+        available: true,
+        version: '9.9.9',
+        download: () => Promise.resolve(),
+        install: () => {
+          installed = true
+          return Promise.resolve()
+        },
+      })
+    const { result } = renderHook(() => useSelfUpdate(false))
+    await settle()
+    expect(result.current.phase).toBe('ready')
+
+    act(() => result.current.install())
+    await settle()
+    expect(installed, 'control: the plugin install itself ran').toBe(true)
+    expect(invoked).toContain('restart_app')
+    expect(result.current.phase, 'still installing while the restart is in flight').toBe('installing')
+  })
+
+  // Windows loses everything a quit would have flushed unless we flush it OURSELVES, first.
+  // `tauri-plugin-updater` 2.10.1 ends its Windows arm with `ShellExecuteW(installer)` then
+  // `std::process::exit(0)` (updater.rs:865) — the return value is not even read, so once that
+  // line is reached the process is gone. `exit` delivers no `RunEvent`, and `quit_cleanup`
+  // hangs off `ExitRequested`/`Exit`, so on a Windows self-update the conversation history,
+  // the Field Day log, the open propagation episodes, the window geometry and the tail of the
+  // diagnostic log all die unwritten. The plugin's own `on_before_exit` hook is not reachable
+  // from the JS command path (the plugin `Builder` does not expose it), so the flush has to be
+  // asked for from here, BEFORE install() — after it, there is no "after".
+  it('install() flushes the journals BEFORE handing off to the installer', async () => {
+    nextCheck = () =>
+      Promise.resolve({
+        available: true,
+        version: '9.9.9',
+        download: () => Promise.resolve(),
+        install: () => {
+          invoked.push('plugin:install')
+          return Promise.resolve()
+        },
+      })
+    const { result } = renderHook(() => useSelfUpdate(false))
+    await settle()
+
+    act(() => result.current.install())
+    await settle()
+    const flush = invoked.indexOf('prepare_update_install')
+    const handoff = invoked.indexOf('plugin:install')
+    expect(handoff, 'control: the plugin install itself ran').toBeGreaterThanOrEqual(0)
+    expect(flush, 'the backend was never asked to flush').toBeGreaterThanOrEqual(0)
+    expect(flush, 'the flush must precede the handoff — the process may not survive it').toBeLessThan(handoff)
+  })
+
+  it('a failing plugin install surfaces the error and never restarts', async () => {
+    nextCheck = () =>
+      Promise.resolve({
+        available: true,
+        version: '9.9.9',
+        download: () => Promise.resolve(),
+        install: () => Promise.reject(new Error('Read-only file system (os error 30)')),
+      })
+    const { result } = renderHook(() => useSelfUpdate(false))
+    await settle()
+
+    act(() => result.current.install())
+    await settle()
+    expect(result.current.phase).toBe('error')
+    expect(result.current.error).toContain('Read-only file system')
+    expect(invoked, 'a failed swap must not restart into the old bundle').not.toContain('restart_app')
+  })
+})
+
+describe('opt-in beta channel', () => {
+  it('checks the beta feed (not the stable plugin) and reaches ready', async () => {
+    betaInfo = { version: '1.10.3-beta.2', notes: 'notes' }
+    // If the stable plugin check were used, this rejection would surface — it must NOT run.
+    nextCheck = () => Promise.reject(new Error('stable check must not run in beta mode'))
+    const { result } = renderHook(() => useSelfUpdate(true))
+    await settle()
+    expect(result.current.phase).toBe('ready')
+    expect(result.current.version).toBe('1.10.3-beta.2')
+    expect(invoked, 'the beta check ran').toContain('check_beta_update')
+    expect(checkCalls, 'the stable plugin check never ran on the beta channel').toHaveLength(0)
+  })
+
+  it('installs through the beta path, flushing before the handoff, then restarts', async () => {
+    betaInfo = { version: '1.10.3-beta.2', notes: null }
+    nextCheck = () => Promise.reject(new Error('stable check must not run in beta mode'))
+    const { result } = renderHook(() => useSelfUpdate(true))
+    await settle()
+
+    act(() => result.current.install())
+    await settle()
+    const flush = invoked.indexOf('prepare_update_install')
+    const handoff = invoked.indexOf('install_beta_update')
+    expect(handoff, 'the beta installer ran').toBeGreaterThanOrEqual(0)
+    expect(flush, 'the backend was asked to flush').toBeGreaterThanOrEqual(0)
+    expect(flush, 'flush must precede the beta install — the process may not survive it').toBeLessThan(handoff)
+    expect(invoked, 'macOS/Linux restart goes through quit cleanup').toContain('restart_app')
+    // The stable plugin install must never be reached on the beta channel.
+    expect(invoked).not.toContain('plugin:install')
+  })
+
+  it('stays quiet when the beta feed reports nothing newer', async () => {
+    betaInfo = null
+    nextCheck = () => Promise.reject(new Error('stable check must not run in beta mode'))
+    const { result } = renderHook(() => useSelfUpdate(true))
+    await settle()
+    expect(result.current.phase).toBe('idle')
+    expect(result.current.version).toBeNull()
+  })
+})

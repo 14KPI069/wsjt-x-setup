@@ -1,0 +1,2737 @@
+// Data layer.
+//
+// Typed functions over the shared DTO contract. EVERY call goes through the Tauri
+// IPC bridge to the Rust core — there is NO in-browser mock/demo fallback. If the
+// bridge is somehow absent the call throws loudly (surfaced as an error toast)
+// rather than silently fabricating data. Nexus runs only inside the desktop app.
+
+import type {
+  AppSnapshot,
+  AudioDevices,
+  AwardSummary,
+  GeoLogStats,
+  BandChannel,
+  CatTestResult,
+  CatProbeResult,
+  CwDecodeResult,
+  MeterReadout,
+  SkimHit,
+  PskState,
+  RttyState,
+  SstvState,
+  ClubLogPushResult,
+  Activation,
+  DetectedRig,
+  FdEventBeacon,
+  OtaSpot,
+  DiagnosticsReport,
+  FeedHealth,
+  ImportStats,
+  JourneySummary,
+  LoggedQso,
+  LotwSyncResult,
+  UploadReport,
+  ModeRequest,
+  NeedAlert,
+  QrzLookup,
+  QrzPushResult,
+  RouteMode,
+  RoutingRule,
+  Settings,
+  SourceKind,
+  Spectrum,
+  Tier,
+  VoiceMessage,
+  OtaMapSpot,
+  KpForecast,
+} from './types'
+import type { PropagationSnapshot, PathPrediction, GettingOut, AuroraPoint } from './types'
+import type { MufStation, NoaaScalesView, AlertView } from './types'
+import type { RepeaterSearchResult, GeoCandidate, RadioProgProject, ProgChannel } from './types'
+
+type InvokeFn = <T>(cmd: string, args?: Record<string, unknown>) => Promise<T>
+
+declare global {
+  interface Window {
+    __TAURI__?: {
+      core?: { invoke?: InvokeFn }
+      invoke?: InvokeFn
+      /** Tauri's event bridge (exposed by `withGlobalTauri`). Used by usePounce for the app's
+       * one PUSH channel — everything else here polls. */
+      event?: {
+        listen?: <T>(
+          event: string,
+          handler: (e: { payload: T }) => void,
+        ) => Promise<() => void>
+      }
+    }
+    /**
+     * The low-level IPC bridge. Tauri v2 injects this into EVERY app webview,
+     * independent of the `withGlobalTauri` config — so its presence guarantees the
+     * real backend is reachable.
+     */
+    __TAURI_INTERNALS__?: { invoke?: InvokeFn }
+  }
+}
+
+/** Resolve the Tauri IPC bridge, or THROW. There is no demo fallback: a missing
+ *  bridge is a hard error, never silently-fabricated data. */
+function bridge(): InvokeFn {
+  const internals = window.__TAURI_INTERNALS__
+  if (internals?.invoke) return internals.invoke
+  const t = window.__TAURI__
+  if (t?.core?.invoke) return t.core.invoke.bind(t.core)
+  if (t?.invoke) return t.invoke.bind(t)
+  throw new Error(
+    'Nexus: the Tauri IPC bridge is unavailable — the app must run inside the desktop shell.',
+  )
+}
+
+/** True when the backend bridge is present (always true inside the installed app). */
+export function isTauri(): boolean {
+  try {
+    bridge()
+    return true
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Fired after any command that could change WHICH credentials are stored.
+ *
+ * ⚠️ THIS EXISTS SO SETTINGS DOES NOT POLL THE OS KEYCHAIN (#154). Reading whether a password
+ * is saved means opening a Secret Service session per connector, and Settings was doing that
+ * every 5 seconds — which on Fedora 44 crashed `gnome-keyring-daemon` in a loop
+ * (`service_method_open_session` → SIGABRT, restart, repeat) for as long as the app was open.
+ * The answer only changes when the operator saves or clears one, so it is an EVENT, not a poll.
+ *
+ * Raised centrally rather than at each of the ten call sites: a missed one would leave the
+ * badge stale, and the whole point is that nothing re-reads the keychain on a timer to correct
+ * it.
+ */
+export const CREDENTIALS_CHANGED = 'nexus-credentials-changed'
+
+/** Commands that add or remove a stored secret. Matched by SHAPE, so a new connector's
+ *  `set_x_password` / `clear_x` is covered the day it is added and not the day someone
+ *  remembers to extend a list. */
+function mutatesCredentials(cmd: string): boolean {
+  return /^set_[a-z0-9_]+_(password|key|token|code)$/.test(cmd) || /^clear_[a-z0-9_]+$/.test(cmd)
+}
+
+/** The TV entry sets this to its RPC base ('/connect/rpc') before anything invokes.
+ *  ⚠️ Deliberately NOT consulted by `bridge()`/`isTauri()`: isTauri() answers "is the
+ *  desktop shell here", and desktop-only behaviour (DPI seeding, the external-link
+ *  interceptor) must stay off in a browser even when the RPC is reachable. */
+declare global {
+  interface Window {
+    __NEXUS_TV_RPC__?: string
+  }
+}
+
+/** Invoke over HTTP against the read-only LAN RPC — the TV page's transport. Same
+ *  command names and args as the desktop bridge; the server answers only the
+ *  allowlisted read-only set and 404s the rest, which surfaces here as a rejection
+ *  the callers' existing catch paths treat as "feed unavailable" — the same honest
+ *  degradation they already do offline. GET only: the server accepts nothing else. */
+async function httpInvoke<T>(base: string, cmd: string, args?: Record<string, unknown>): Promise<T> {
+  const qs = args === undefined ? '' : `?args=${encodeURIComponent(JSON.stringify(args))}`
+  const r = await fetch(`${base}/${cmd}${qs}`, { cache: 'no-store' })
+  if (!r.ok) throw new Error(`${cmd}: ${r.status} ${await r.text().catch(() => '')}`)
+  return (await r.json()) as T
+}
+
+/** Invoke a backend command. The desktop IPC bridge when present; the TV page's LAN
+ *  RPC when its entry declared one; otherwise a hard error — never fabricated data. */
+async function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
+  const tv = typeof window !== 'undefined' ? window.__NEXUS_TV_RPC__ : undefined
+  const out = isTauri() ? ((await bridge()(cmd, args)) as T)
+    : tv ? await httpInvoke<T>(tv, cmd, args)
+    : ((await bridge()(cmd, args)) as T) // throws with the bridge's own message
+  if (mutatesCredentials(cmd) && typeof window !== 'undefined') {
+    window.dispatchEvent(new Event(CREDENTIALS_CHANGED))
+  }
+  return out
+}
+
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
+
+/** The rolling connectivity log (newest first) — Settings ▸ Connections. */
+export async function getConnectionLog(): Promise<import('./types').ConnEvent[]> {
+  return invoke('get_connection_log')
+}
+
+/** Per-connector status: whether a credential is stored, AND what happened the last time
+ *  Nexus actually talked to the service (never the secrets). */
+export async function getCredentialsStatus(): Promise<import('./types').CredStatus[]> {
+  return invoke('get_credentials_status')
+}
+
+export async function getSnapshot(): Promise<AppSnapshot> {
+  return invoke<AppSnapshot>('get_snapshot')
+}
+
+/** The propagation & opening-intelligence nowcast (adaptive bands, openings,
+ *  DXpedition cards, space weather). */
+export async function getPropagation(): Promise<PropagationSnapshot> {
+  return invoke<PropagationSnapshot>('get_propagation')
+}
+
+/** Historical opening episodes (newest first) — the Connect openings-log pane. */
+export async function getOpeningsLog(): Promise<import('./types').OpeningEpisode[]> {
+  return invoke('get_openings_log')
+}
+
+/** Per-path HF outlook to a station's grid (the PathPredictor seam). */
+export async function getPathOutlook(grid: string): Promise<PathPrediction> {
+  return invoke<PathPrediction>('get_path_outlook', { grid })
+}
+
+/** The no-selection "Band outlook (modelled)": modeled per-band workability + MUF to
+ *  a ring of representative long-haul DX directions. Needs only the operator's grid. */
+export async function getBandOutlook(): Promise<PathPrediction> {
+  return invoke<PathPrediction>('get_band_outlook')
+}
+
+/** "Am I getting out?" — who is hearing the operator now (observed). */
+export async function getGettingOut(): Promise<GettingOut> {
+  return invoke<GettingOut>('get_getting_out')
+}
+
+/** The current OVATION aurora oval for the map overlay. */
+export async function getAurora(): Promise<AuroraPoint[]> {
+  return invoke<AuroraPoint[]>('get_aurora')
+}
+
+export async function getKc2gMuf(): Promise<MufStation[]> {
+  return invoke<MufStation[]>('get_kc2g_muf')
+}
+
+/** Polar-cap absorption (GOES protons → D-RAP2). Null = no proton data yet. */
+export async function getPca(): Promise<import('./types').PcaView | null> {
+  return invoke<import('./types').PcaView | null>('get_pca')
+}
+
+/** Magnetic declination (° east-positive) at the QTH (WMM2025); null = no grid. */
+export async function getDeclination(): Promise<number | null> {
+  return invoke<number | null>('get_declination')
+}
+
+/** Amateur satellites: subpoints now + next-24h passes. Null = no elements. */
+export async function getSatellites(): Promise<import('./types').SatView | null> {
+  return invoke<import('./types').SatView | null>('get_satellites')
+}
+
+/** Passes for the ★ favorites over the next `hours` (Satellites section schedule).
+ * Empty when the grid is unset or no named bird has elements. */
+export async function getSatSchedule(names: string[], hours: number): Promise<import('./types').SatPass[]> {
+  return invoke<import('./types').SatPass[]>('get_sat_schedule', { names, hours })
+}
+
+/** The needs-aware pass ranking: getSatSchedule's rows (SatNOGS status
+ * included) with each pass's `earn` summary stamped (needed grids/entities
+ * reachable through the footprint + `score` sort key). AOS-sorted like the
+ * schedule; computed on demand in a backend blocking task — the Satellites
+ * section fetches it on its slow (5 min) schedule poll, which is the intended
+ * cadence: keep it off fast per-second loops. */
+export async function getSatPassNeeds(names: string[], hours: number): Promise<import('./types').SatPass[]> {
+  return invoke<import('./types').SatPass[]>('get_sat_pass_needs', { names, hours })
+}
+
+/** The ISS's current-or-next pass over the QTH (keyed on NORAD 25544), or null
+ * when the grid is unset, no ISS elements are loaded, or no pass falls in the
+ * next ~3 h. Drives the SSTV auto-arm opt-in. */
+export async function getIssPass(): Promise<import('./types').SatPass | null> {
+  return invoke<import('./types').SatPass | null>('get_iss_pass')
+}
+
+/** Per-bird detail: SatNOGS status/frequencies (cached weekly; absent offline)
+ * + the current/next pass with its polar-plot track. */
+export async function getSatDetail(name: string): Promise<import('./types').SatDetail> {
+  return invoke<import('./types').SatDetail>('get_sat_detail', { name })
+}
+
+/** Arm rotor auto-track for a bird's pass — `aosUnix` picks WHICH schedule row
+ * (±3 min tolerance); omitted = current/next. Returns the initial status, or
+ * null when there's no rotor/grid/matching pass. */
+export async function startSatTrack(
+  name: string,
+  aosUnix?: number,
+): Promise<import('./types').SatTrackStatus | null> {
+  return invoke<import('./types').SatTrackStatus | null>('start_sat_track', { name, aosUnix })
+}
+
+export async function stopSatTrack(): Promise<void> {
+  return invoke('stop_sat_track')
+}
+
+/** The live auto-track state (poll while the section is open); null = idle. */
+export async function getSatTrackStatus(): Promise<import('./types').SatTrackStatus | null> {
+  return invoke<import('./types').SatTrackStatus | null>('sat_track_status')
+}
+
+/** Put the radio under Doppler control for one transponder on `name`; `null`
+ * clears the selection and hands the dial back to the operator.
+ *
+ * `index` is a raw index into the list `getSatDetail` returned — every
+ * transmitter for that bird, dead ones included. Pass the row index as-is.
+ *
+ * ⚠️ It did NOT always mean that: the backend used to drop `!alive` entries
+ * before indexing, so on any bird listing a dead transmitter first the UI's
+ * row index selected a different transponder — a different uplink, silently.
+ * Two layers agreeing on a hidden filter is not a contract; the backend now
+ * indexes the list the caller was actually shown and REFUSES a dead pick by
+ * name instead of shifting everything after it. Do not re-introduce a filter
+ * on either side.
+ *
+ * `auto` says WHO picked: false (the default) = the operator clicked this row,
+ * true = the "Work this pass" chain chose it. The backend needs the difference
+ * because that chain re-runs, and re-running it mid-pass used to move the
+ * operator onto another of the bird's documented pairings — an auto pick is
+ * refused while a pass is engaged on a different row, an operator's is not. */
+export async function setSatTransponder(
+  name: string,
+  index: number | null,
+  auto = false,
+): Promise<void> {
+  return invoke('set_sat_transponder', { name, index, auto })
+}
+
+/** The transponder the ENGINE holds right now (bird + the raw index into the
+ * getSatDetail list), or null when the dial is the operator's. Poll this for
+ * read-back rather than trusting the last local click: the hold is released
+ * backend-side at LOS and on a live-track stop, and a stale mirror keeps a
+ * green Transponder gate — and skips the next "Work this pass" re-pick — for
+ * a hold the engine no longer has. */
+export async function getSatTransponder(): Promise<import('./types').SatTransponderHeld | null> {
+  return invoke<import('./types').SatTransponderHeld | null>('get_sat_transponder')
+}
+
+export interface LotwUsersStatus {
+  count: number
+  fetchedAt: number
+}
+
+/** How many LoTW-user calls are loaded + when the ARRL list was last fetched. */
+export async function getLotwUsersStatus(): Promise<LotwUsersStatus> {
+  return invoke<LotwUsersStatus>('get_lotw_users_status')
+}
+
+/** Fetch/refresh ARRL's LoTW user-activity list (manual, WSJT-X-style; the
+ * file changes weekly and an unchanged file costs a 304, not 6 MB). */
+export async function fetchLotwUsers(): Promise<LotwUsersStatus> {
+  return invoke<LotwUsersStatus>('fetch_lotw_users')
+}
+
+export interface FccStatesStatus {
+  count: number
+  fetchedAt: number
+  generated: string
+}
+
+/** How many FCC callsign→state entries are loaded + when the index was fetched.
+ * Drives the WAS "New State" hint for grid-less cluster/CW/SSB spots. */
+export async function getFccStatesStatus(): Promise<FccStatesStatus> {
+  return invoke<FccStatesStatus>('get_fcc_states_status')
+}
+
+/** Download/refresh the FCC callsign→state index (hosted on hamradiotools.io,
+ * regenerated weekly from the FCC ULS file). Auto-refreshes on startup when stale;
+ * this is the manual button. Resolves with the new status (unchanged if already current). */
+export async function fetchFccStates(): Promise<FccStatesStatus> {
+  return invoke<FccStatesStatus>('fetch_fcc_states')
+}
+
+/** AD1C cty.dat country-file currency — Settings "Country file (DXCC)" fieldset.
+ * The resolver is set once at launch, so a downloaded file applies at the NEXT
+ * launch: `activeVer` is what is resolving now, `installedVer` what is staged
+ * on disk (both AD1C `yyyymmdd` release dates; `installedVer` empty until a
+ * download happens). */
+export interface CtyStatus {
+  /** Entity count of the ACTIVE file. */
+  count: number
+  fetchedAt: number
+  generated: string
+  activeVer: string
+  installedVer: string
+}
+
+export async function getCtyStatus(): Promise<CtyStatus> {
+  return invoke<CtyStatus>('get_cty_status')
+}
+
+/** Download/refresh the country file if AD1C published a newer release
+ * (compared on the content-derived `=VER` date, so an unchanged week is one
+ * small manifest fetch). The downloaded file applies at the next launch —
+ * never mid-session. */
+export async function fetchCty(): Promise<CtyStatus> {
+  return invoke<CtyStatus>('fetch_cty')
+}
+
+/** Field Day rules-data currency — the "check for rules updates" row in
+ * Settings ▸ Contesting ▸ Field Day Setup. Same set-once discipline as the
+ * country file: `activeGenerated` is the data scoring THIS session (the
+ * bundled seed, or a previously downloaded file), `installedGenerated` what is
+ * staged on disk (empty until a download happens; newer than active ⇒
+ * "applies at next launch"). */
+export interface FdRulesStatus {
+  /** Newest rules year in the ACTIVE table. */
+  rulesYear: number
+  activeGenerated: string
+  installedGenerated: string
+  fetchedAt: number
+}
+
+export async function getFdRulesStatus(): Promise<FdRulesStatus> {
+  return invoke<FdRulesStatus>('get_fd_rules_status')
+}
+
+/** Download the hosted fd-rules.json if its `generated` stamp differs from
+ * what we hold (validated with the app loader's own checks before it ever
+ * touches disk). Applies at the next launch — never mid-session. */
+export async function fetchFdRules(): Promise<FdRulesStatus> {
+  return invoke<FdRulesStatus>('fetch_fd_rules')
+}
+
+/** The ACTIVE Field Day event's ruleset FACTS for the warn-only advisories
+ * (banned-mode chip, assistance advisory). Facts only — the advisory text lives
+ * in the catalogs, computed UI-side. `enforcement` ships `'warn'`: nothing is
+ * ever removed or disabled by rule (operator ruling). */
+export interface FdRulesetDto {
+  /** 'arrlfd' | 'wfd' — the snapshot's event convention. */
+  event: string
+  rulesYear: number
+  /** On-air modes this event's rules ban outright (uppercase ADIF-style). */
+  bannedModes: string[]
+  spottingAllowed: boolean
+  clusterAllowed: boolean
+  enforcement: string
+}
+
+/** Ruleset facts for the CONFIGURED event (`settings.fdEvent`) — independent of
+ * the master switch, so Settings can preview an event's rules before it's on. */
+export async function getFdRuleset(): Promise<FdRulesetDto> {
+  return invoke<FdRulesetDto>('get_fd_ruleset')
+}
+
+/** Orbital-element (TLE) currency status — Settings "Orbital elements" fieldset
+ * + the Now-Bar `sat` lane. */
+export interface TleStatus {
+  /** Merged (group + imported) element-set count. */
+  count: number
+  /** …of which pass the per-bird 30 d usability gate. */
+  usableCount: number
+  /** …of THOSE, how many are past the 14 d stale line and drifting (the 14–30 d
+   * band). A subset of `usableCount`, never a sibling — these birds are still
+   * drawn. The median alone hides exactly one shape: half the catalog at 29 d,
+   * the other half fetched this morning, every set-wide surface quiet. This is
+   * the number that shape cannot hide behind. */
+  agingCount: number
+  /** …and how many the 30 d gate holds BACK entirely (elements past 30 d).
+   * Disjoint from `usableCount` — these sit out — so `usableCount +
+   * heldBackCount` is every bird with a readable epoch. Required, never
+   * optional and never derived as `count - usableCount`: that difference also
+   * swallows unparseable epochs, and an absent counter is the sentinel that
+   * makes two surfaces guess differently. Stated beside the age so a current
+   * catalog with a few slow-cadence birds excluded cannot read like a set
+   * that has gone stale. */
+  heldBackCount: number
+  /** Unix stamp of the last successful fetch/304; 0 = never. */
+  fetchedAt: number
+  /** "mirror" | "celestrak" | "import" | "legacy" | "bundled" | "none".
+   * "bundled" = the seed snapshot shipped in the installer, serving before
+   * this install has ever reached the mirror (its `fetchedAt` is 0). */
+  source: string
+  /** Operator file-imports riding the snapshot (persist across refreshes). */
+  importedCount: number
+  /** MEDIAN age (days) of the USABLE (≤30 d) sets — the Satellites badge
+   * scalar, and what every currency surface compares against 14 d. Median,
+   * never the oldest: the 30 d ceiling bounds the oldest ADMITTED bird just
+   * under itself, so a max reads "stale" however fresh the set is. Absent
+   * when no set is usable. */
+  elementAgeDays?: number | null
+  /** Celestrak 403/404 hard stop's end (unix); 0 = not blocked. */
+  blockedUntil: number
+  /** The last refresh failure, RAW ("HTTP 404", a refused-set reason) —
+   * tooltip/debugging material; the operator-voiced headline is composed by
+   * `tleRefreshMessage` from `lastErrorKind` + the currency fields, never
+   * from this text. Absent = last attempt landed. */
+  lastError?: string | null
+  /** Which WAY it failed — "mirrorUnreachable" | "celestrakBlocked" |
+   * "failed" — the composer's branch key. Present iff `lastError` is. */
+  lastErrorKind?: string | null
+}
+
+/** Element-currency status (never blocks on the network). Polling this also
+ * kicks a due background refresh — the App's Now-Bar poll is what keeps
+ * elements current while no satellite surface is open. */
+export async function getTleStatus(): Promise<TleStatus> {
+  return invoke<TleStatus>('get_tle_status')
+}
+
+/** The manual "refresh elements" action: run one refresh attempt NOW and wait
+ * for it. Bypasses the TTL and failure backoff, but never the single-flight,
+ * the Celestrak 2 h floor, or the 403/404 hard stop (etiquette is not
+ * operator-waivable); a mirror that cannot deliver escalates to Celestrak in
+ * the same flight when the floor + block allow. Resolves with the
+ * post-attempt status whether the attempt landed or failed — compose the
+ * result via `tleRefreshMessage`; rejects only when no attempt could run
+ * (one already in flight). */
+export async function fetchTlesNow(): Promise<TleStatus> {
+  return invoke<TleStatus>('fetch_tles_now')
+}
+
+/** Import operator-supplied elements (a downloaded Celestrak file, AMSAT keps,
+ * a new launch's SupGP set) from 2LE/3LE text. Per-bird integrity only — no
+ * count/freshness ratchet; imports persist across refreshes and merge over the
+ * fetched group by NORAD, newest epoch winning. */
+export async function importTles(text: string): Promise<TleStatus> {
+  return invoke<TleStatus>('import_tles', { text })
+}
+
+/** The 60 s X-ray fast lane — the freshest GOES long-band flux, so a flare's
+ * onset reaches the map + alert in ~1 min instead of the 5-min prop cadence. */
+export async function getXrayNow(): Promise<import('./types').XrayNow> {
+  return invoke<import('./types').XrayNow>('get_xray_now')
+}
+
+/** Modelled best-contact windows for every active + upcoming DXpedition ("Your
+ * Window") — computed from YOUR grid with the configured prediction engine and
+ * server-cached (climatology; recomputed on day/engine/target changes). */
+export async function getDxpedWindows(days?: number): Promise<import('./types').DxpedWindow[]> {
+  return invoke<import('./types').DxpedWindow[]>('get_dxped_windows', { days })
+}
+
+/** SWPC R/S/G scales + recent alerts (the backend returns a [scales, alerts] tuple). */
+export async function getSpaceWxScales(): Promise<{ scales: NoaaScalesView; alerts: AlertView[] }> {
+  const [scales, alerts] = await invoke<[NoaaScalesView, AlertView[]]>('get_space_wx_scales')
+  return { scales, alerts }
+}
+
+export async function sendMessage(peer: string, text: string): Promise<AppSnapshot> {
+  // The command returns the post-send snapshot — apply it immediately so the
+  // outbound message renders without waiting ~300 ms for the next poll.
+  return invoke<AppSnapshot>('send_message', { peer, text })
+}
+
+/** One-click resend of a terminal (no-ack / abandoned) chat bubble — re-queues the same
+ * text with a fresh cycle budget on the SAME bubble. ackId targets the exact bubble. */
+export async function resendChat(peer: string, ackId?: string | null): Promise<AppSnapshot> {
+  return invoke<AppSnapshot>('resend_chat', { peer, ackId: ackId ?? null })
+}
+
+/**
+ * Send an open broadcast to everyone on frequency (not directed at a peer).
+ * Lands in the "*" band-activity feed. Returns the fresh snapshot.
+ */
+export async function broadcast(text: string): Promise<AppSnapshot> {
+  return invoke<AppSnapshot>('broadcast', { text })
+}
+
+export async function selectPeer(peer: string | null): Promise<AppSnapshot> {
+  // Round-trip BOTH select and deselect — a null clears the engine's active peer
+  // (it used to linger backend-side, leaving stale roster/QSY context).
+  return invoke<AppSnapshot>('select_peer', { peer })
+}
+
+/** Delete a conversation thread from the recents list, and cancel any messages still
+ * queued for that peer so nothing further for it goes on the air. Persists immediately.
+ * Returns the fresh snapshot. This deletes history, it does not block a station: the
+ * thread re-creates if the peer is heard again (or you broadcast).
+ * (Wire name stays `archive_conversation`.) */
+export async function archiveConversation(peer: string): Promise<AppSnapshot> {
+  return invoke<AppSnapshot>('archive_conversation', { peer })
+}
+
+/**
+ * Answer / work a station by callsign: enters QSO mode targeting that DX.
+ * `message`/`snr` are the exact decoded line being answered (when the operator
+ * double-clicked a decode) so the sequencer jumps to the correct next Tx —
+ * WSJT-X double-click semantics — rather than restarting at the grid.
+ * Returns the fresh snapshot.
+ */
+export async function callStation(
+  call: string,
+  grid?: string,
+  message?: string,
+  snr?: number,
+  freq?: number,
+): Promise<AppSnapshot> {
+  return invoke<AppSnapshot>('call_station', {
+    call,
+    grid: grid ?? null,
+    message: message ?? null,
+    snr: snr ?? null,
+    // The decoded station's audio offset (Hz) — moves our RX/TX onto it (WSJT-X).
+    freq: freq ?? null,
+  })
+}
+
+/** WSJT-X Tx-slot click: force `text` as the next transmission to `call`
+ * (starts/retargets the QSO if needed, arms per the double-click-sets-Tx
+ * behavior option, fires this period when it still fits). The auto-sequencer
+ * resumes normally from whatever step the partner's reply matches. */
+export async function overrideNextTx(
+  call: string,
+  grid: string | null,
+  text: string,
+): Promise<AppSnapshot> {
+  return invoke<AppSnapshot>('override_next_tx', { call, grid, text })
+}
+
+/** The operator erased a decode pane — mirror it to cooperating apps via the
+ * WSJT-X UDP Clear. 0 = Band Activity, 1 = Rx Frequency, 2 = both. */
+export async function notifyErase(window: 0 | 1 | 2): Promise<void> {
+  await invoke('notify_erase', { window })
+}
+
+/** Log a Field Day contact by hand (the CW, Phone, RTTY and PSK cockpits' log strips).
+ * Rejects with a message on a band+mode dupe.
+ *
+ * ⚠️ `mode` IS THE SCORING CLASS, and all THREE belong here. The engine's `log_mode_at`
+ * (tempo-core/src/fieldday.rs) has always taken 'DIG' and handled it specially — it stamps
+ * the real on-air submode behind the class so exports emit the actual mode — but this
+ * signature listed only the two classes its first two callers used. A digital position
+ * picking a station up by hand had no way to say so, and 'PH' credits the wrong class.
+ *
+ * ⚠️ `submode` IS THE MODE THAT WAS ON THE AIR, and 'DIG' contacts outside the FT tiers need
+ * it. The engine fills a blank one from `FieldDayLog::current_submode`, which tracks the FT
+ * tier alone — so an RTTY or PSK Field Day contact logged without it is stamped "FT8": the
+ * wrong ADIF mode, Cabrillo "DG" where ARRL wants "RY", and a mode Winter Field Day bans
+ * outright on a QSO that was perfectly legal. Omit it for CW and PH, whose class IS their
+ * on-air mode. */
+export async function fdLogManual(
+  call: string,
+  klass: string,
+  section: string,
+  mode: 'CW' | 'PH' | 'DIG',
+  submode?: string,
+): Promise<AppSnapshot> {
+  return invoke<AppSnapshot>('fd_log_manual', {
+    call,
+    class: klass,
+    section,
+    mode,
+    submode: submode ?? null,
+  })
+}
+
+/** Listen ~2 s for Nexus club-event beacons on the LAN ("Find club events").
+ * Empty = nothing announcing (or the Wi-Fi eats broadcast — manual entry stays). */
+export async function fdDiscoverEvents(): Promise<FdEventBeacon[]> {
+  return invoke<FdEventBeacon[]>('fd_discover_events', {})
+}
+
+/** Export the merged CLUB log from the host (deduped earliest-wins).
+ * Rejects when this instance is not hosting. */
+export async function fdClubExport(format: 'cabrillo' | 'adif'): Promise<string> {
+  return invoke<string>('fd_club_export', { format })
+}
+
+/** The spectator scoreboard's bound state, for the Settings row: running?,
+ * the URL a TV on the LAN should open, the last bind error. */
+export interface FdScoreboardStatus {
+  running: boolean
+  url: string | null
+  error: string | null
+}
+
+export async function fdScoreboardStatus(): Promise<FdScoreboardStatus> {
+  return invoke<FdScoreboardStatus>('fd_scoreboard_status', {})
+}
+
+/** Callsign + grid only — the TV page's one station fact. Served ONLY by the LAN
+ *  RPC (the desktop never needs it); built by hand server-side so the TV page never
+ *  touches get_settings. */
+export async function getTvStation(): Promise<{ call: string; grid: string }> {
+  return invoke('tv_station')
+}
+
+/** The Connect LAN page's bound state, for its Settings row. */
+export interface ConnectWebStatus {
+  running: boolean
+  port: number
+  /** The address to type into the TV; empty while it is not serving. */
+  url: string
+  error: string | null
+}
+
+export async function connectWebStatus(): Promise<ConnectWebStatus> {
+  return invoke<ConnectWebStatus>('connect_web_status', {})
+}
+
+/** Test the N3FJP TCP API ("N3FJP's Field Day Contest Log v6.6") — run at the
+ * club site before the event. */
+export async function n3fjpTestConnection(): Promise<string> {
+  return invoke<string>('n3fjp_test_connection', {})
+}
+
+/** One-click hunt: remember the activator + park so the next QSO logged with
+ * that call auto-tags SIG/SIG_INFO (the hunter-side ADIF credit). */
+export async function setHuntTarget(
+  call: string,
+  program: string,
+  reference: string,
+): Promise<AppSnapshot> {
+  return invoke<AppSnapshot>('set_hunt_target', { call, program, reference })
+}
+
+export async function clearHuntTarget(): Promise<AppSnapshot> {
+  return invoke<AppSnapshot>('clear_hunt_target', {})
+}
+
+/** WSJT-X "Decode" / F6: re-run the decoder over the last period's audio with
+ * the current settings; only newly-found lines appear. */
+export async function redecode(): Promise<AppSnapshot> {
+  return invoke<AppSnapshot>('redecode', {})
+}
+
+/** Start a CQ run; `dir` = a directed token ("DX"/"NA"/"POTA"/…) or null for a
+ * plain CQ (clears a sticky directed token). */
+export async function startCq(dir: string | null): Promise<AppSnapshot> {
+  return invoke<AppSnapshot>('start_cq', { dir })
+}
+
+/** Call CQ from Tempo (chat-first): sends one structured `CQ <call> <grid>` frame and
+ * arms TX, staying in chat. Rejects if the callsign/grid aren't set. `dir` = optional
+ * directed token, or null for a plain CQ. */
+export async function callCq(dir: string | null): Promise<AppSnapshot> {
+  return invoke<AppSnapshot>('call_cq', { dir })
+}
+
+/** Toggle the chat CQ RUN — keep calling every idle TX slot until answered/stopped. */
+export async function setChatCq(on: boolean): Promise<AppSnapshot> {
+  return invoke<AppSnapshot>('set_chat_cq', { on })
+}
+
+/** Resume a paused CQ run immediately (skip the idle auto-resume wait). */
+export async function resumeChatCq(): Promise<AppSnapshot> {
+  return invoke<AppSnapshot>('resume_chat_cq')
+}
+
+/** Confirm-and-log a QSO held by the prompt-to-log popup (the possibly-edited
+ * record). Returns the fresh snapshot. */
+export async function confirmPendingLog(record: LoggedQso): Promise<AppSnapshot> {
+  return invoke<AppSnapshot>('confirm_pending_log', { record })
+}
+
+/** Discard a QSO held by the prompt-to-log popup without logging it. */
+export async function discardPendingLog(): Promise<AppSnapshot> {
+  return invoke<AppSnapshot>('discard_pending_log', {})
+}
+
+/** Open (or focus) a standalone OS window for one panel — multi-monitor tear-off. */
+export async function openPanelWindow(panel: string): Promise<void> {
+  await invoke('open_panel_window', { panel })
+}
+
+/** Snap the current band-map pop-out window to the left/right screen edge as a full-height
+ *  vertical strip (or 'none' to un-dock). The dock + geometry persist across launches. */
+export async function dockBandmapWindow(side: 'left' | 'right' | 'none'): Promise<void> {
+  await invoke('dock_bandmap_window', { side })
+}
+
+/** Switch the Operate mode: 'dx' (FT8/FT4) or 'msg' (Tempo two-way calling).
+ * Atomically sets the mode's tier + mode. Returns the fresh snapshot. */
+export async function setArea(area: 'dx' | 'msg'): Promise<AppSnapshot> {
+  return invoke<AppSnapshot>('set_area', { area })
+}
+
+/** Operator "Resend": re-arm the current QSO message (re-transmit a stalled or
+ * uncopied step). No-op outside a QSO. Returns the fresh snapshot. */
+export async function qsoResend(): Promise<AppSnapshot> {
+  return invoke<AppSnapshot>('qso_resend', {})
+}
+
+/** Operator in-QSO free text (WSJT-X Tx5): override the next transmission with
+ * `text`, directed to the current DX when known. Returns the fresh snapshot. */
+export async function qsoFreetext(text: string): Promise<AppSnapshot> {
+  return invoke<AppSnapshot>('qso_freetext', { text })
+}
+
+/** Operator "Log QSO": log the active QSO's contact now. `logged` is the engine's verdict
+ *  (#100) — false when nothing was loggable (already logged / no QSO / no report yet), and
+ *  the UI must not claim success then. Snapshot is fresh either way. */
+export async function logCurrentQso(): Promise<{ logged: boolean; snapshot: AppSnapshot }> {
+  return invoke<{ logged: boolean; snapshot: AppSnapshot }>('log_current_qso', {})
+}
+
+/** Append a contact to the ADIF logbook. Returns the fresh snapshot. */
+export async function logQso(record: LoggedQso): Promise<AppSnapshot> {
+  return invoke<AppSnapshot>('log_qso', { record })
+}
+
+/** Read the general ADIF logbook. */
+export async function getLog(): Promise<LoggedQso[]> {
+  return invoke<LoggedQso[]>('get_log')
+}
+
+/** The cty.dat-resolved DXCC entity for a callsign, or null — the award
+ * identity the "new one" badge keys on (never the QRZ country string). */
+export async function resolveEntity(call: string): Promise<string | null> {
+  return invoke<string | null>('resolve_entity', { call })
+}
+
+/** Edit logbook entry `index` (a correction). `index` is the position in the
+ *  `getLog()` array. Confirmation/credit/upload state is preserved server-side. */
+export async function editQso(index: number, record: LoggedQso): Promise<AppSnapshot> {
+  return invoke<AppSnapshot>('edit_qso', { index, record })
+}
+
+/** Mark logbook entry `index` as QSL-sent (operator-declared): a card/request was
+ *  sent `via` "B"(ureau) / "D"(irect) / "E"(lectronic), dated now. A request is NOT
+ *  a confirmation — this never flips `confirmed`/`awardConfirmed`.
+ *
+ *  `via: null` CLEARS the mark instead (#180): the operator mis-clicked and nothing was
+ *  ever sent. Sending is once-only, so without a clear the three send entries vanish with
+ *  nothing to put the row back. Mirrors `markQslCard(index, false)` on the inbound side. */
+export async function markQslSent(
+  index: number,
+  via: 'B' | 'D' | 'E' | null,
+): Promise<AppSnapshot> {
+  return invoke<AppSnapshot>('mark_qsl_sent', { index, via })
+}
+
+/** Record whether a PAPER QSL card arrived for entry `index` (#152). The operator is the only
+ *  authority — LoTW/eQSL/QRZ report their own confirmations, but nothing knows a card landed.
+ *  Award-eligible, so this moves the awards view. Clearable, for a mis-tick. */
+export async function markQslCard(index: number, received: boolean): Promise<AppSnapshot> {
+  return invoke<AppSnapshot>('mark_qsl_card', { index, received })
+}
+
+/** Delete logbook entry `index` (the position in the `getLog()` array). */
+export async function deleteQso(index: number): Promise<AppSnapshot> {
+  return invoke<AppSnapshot>('delete_qso', { index })
+}
+
+/** Purge the ENTIRE logbook — delete every contact and truncate the ADIF file.
+ * Irreversible; the UI gates this behind a typed confirmation. Returns the number
+ * of contacts removed. */
+export async function purgeLog(): Promise<number> {
+  return invoke<number>('purge_log')
+}
+
+/** DXCC-first award progress computed from the logbook (cty.dat-resolved). */
+export async function getAwards(): Promise<AwardSummary> {
+  return invoke<AwardSummary>('get_awards')
+}
+
+/** Geographic log stats — continent / CQ-zone / DX-vs-domestic (cty.dat-resolved per call). */
+export async function getLogStats(): Promise<GeoLogStats> {
+  return invoke<GeoLogStats>('get_log_stats')
+}
+
+/** The Journey snapshot — the in-app, beginner-first achievement layer (firsts,
+ * sub-award ladders, collections, feats, personal bests, XP/level, streak). */
+export async function getJourney(): Promise<JourneySummary> {
+  return invoke<JourneySummary>('get_journey')
+}
+
+export async function getConfirmationDiagnostics(): Promise<DiagnosticsReport> {
+  return invoke<DiagnosticsReport>('get_confirmation_diagnostics')
+}
+
+/** Import an external ADIF logbook (deduped merge → real "needs" + B4). */
+export async function importAdif(text: string): Promise<ImportStats> {
+  return invoke<ImportStats>('import_adif', { text })
+}
+
+/** Reconcile a LoTW (or any ADIF) confirmation report INTO the log: upgrade
+ * confirmation + credit on already-logged QSOs, return the diff + orphans. */
+export async function syncLotwReport(text: string): Promise<LotwSyncResult> {
+  return invoke<LotwSyncResult>('sync_lotw_report', { text })
+}
+
+/** Store the LoTW website password in the OS keychain (write-only; an empty
+ *  string clears it). */
+export async function setLotwPassword(password: string): Promise<void> {
+  await invoke<void>('set_lotw_password', { password })
+}
+
+/** Remove the stored LoTW password from the OS keychain (idempotent). */
+export async function clearLotwPassword(): Promise<void> {
+  await invoke<void>('clear_lotw_password')
+}
+
+/** Sync your LoTW state into the log: pull new confirmations AND mark which of your
+ *  uploads LoTW now holds on file (own-echo → Pending becomes Accepted). Uses the
+ *  stored username + keychain password. */
+export async function downloadLotwReport(): Promise<LotwSyncResult> {
+  return invoke<LotwSyncResult>('download_lotw_report')
+}
+
+/** Sign + upload QSOs to LoTW via the operator's installed TQSL. `indices` =
+ *  specific log rows, or omit for the default unsent-unconfirmed batch. */
+export async function uploadLotwReport(indices?: number[]): Promise<UploadReport> {
+  return invoke<UploadReport>('upload_lotw_report', { indices: indices ?? null })
+}
+
+/** Mark every currently-unsent QSO as already on LoTW (for an imported legacy log uploaded
+ *  through another tool). Returns how many were marked. */
+export async function markLotwUploaded(): Promise<number> {
+  return invoke<number>('mark_lotw_uploaded')
+}
+
+/** Store the eQSL password in the OS keychain (write-only; empty clears it). */
+export async function setEqslPassword(password: string): Promise<void> {
+  await invoke<void>('set_eqsl_password', { password })
+}
+
+/** Remove the stored eQSL password from the OS keychain (idempotent). */
+export async function clearEqslPassword(): Promise<void> {
+  await invoke<void>('clear_eqsl_password')
+}
+
+/** Download new eQSL confirmations and reconcile them into the log (uses the
+ *  stored username + keychain password). */
+export async function downloadEqslReport(): Promise<LotwSyncResult> {
+  return invoke<LotwSyncResult>('download_eqsl_report')
+}
+
+/** Two-way QRZ sync: FETCH the online QRZ logbook and merge it into the local log —
+ *  pulls new QSOs (logged elsewhere) plus confirmations (uses the stored Logbook API key). */
+export async function syncQrz(): Promise<LotwSyncResult> {
+  return invoke<LotwSyncResult>('sync_qrz')
+}
+
+/** Store the QRZ password in the OS keychain (write-only; empty clears it). */
+export async function setQrzPassword(password: string): Promise<void> {
+  await invoke<void>('set_qrz_password', { password })
+}
+
+/** Remove the stored QRZ password from the OS keychain (idempotent). */
+export async function clearQrzPassword(): Promise<void> {
+  await invoke<void>('clear_qrz_password')
+}
+
+/** Store the HamQTH password in the OS keychain (write-only; empty clears it).
+ *  HamQTH is the free fallback used when QRZ isn't configured or has no match. */
+export async function setHamqthPassword(password: string): Promise<void> {
+  await invoke<void>('set_hamqth_password', { password })
+}
+
+/** Remove the stored HamQTH password from the OS keychain (idempotent). */
+export async function clearHamqthPassword(): Promise<void> {
+  await invoke<void>('clear_hamqth_password')
+}
+
+/** Look up a callsign on QRZ.com (uses the stored username + keychain password;
+ *  session key cached server-side in memory). */
+export async function qrzLookup(callsign: string): Promise<QrzLookup> {
+  return invoke<QrzLookup>('qrz_lookup', { callsign })
+}
+
+/** Store the QRZ Logbook API key in the OS keychain (write-only; empty clears). */
+export async function setQrzLogbookKey(key: string): Promise<void> {
+  await invoke<void>('set_qrz_logbook_key', { key })
+}
+
+/** Remove the stored QRZ Logbook API key from the OS keychain (idempotent). */
+export async function clearQrzLogbookKey(): Promise<void> {
+  await invoke<void>('clear_qrz_logbook_key')
+}
+
+/** Validate the QRZ Logbook API key with a real STATUS round-trip (no insert).
+ * Resolves to a human summary ("KD9TAW (My Logbook) — 1234 QSOs…") or rejects
+ * with the failure reason. */
+export async function qrzTestConnection(): Promise<string> {
+  return invoke<string>('qrz_test_connection', {})
+}
+
+/** Push one logged QSO to the operator's QRZ logbook. */
+export async function qrzPushQso(record: LoggedQso): Promise<QrzPushResult> {
+  return invoke<QrzPushResult>('qrz_push_qso', { record })
+}
+
+/** Store the ClubLog Application Password in the OS keychain (write-only; empty
+ *  clears). */
+export async function setClublogPassword(password: string): Promise<void> {
+  await invoke<void>('set_clublog_password', { password })
+}
+
+/** Remove the stored ClubLog app-password from the OS keychain (idempotent). */
+export async function clearClublogPassword(): Promise<void> {
+  await invoke<void>('clear_clublog_password')
+}
+
+/** Push one logged QSO to ClubLog (realtime). */
+export async function clublogPushQso(record: LoggedQso): Promise<ClubLogPushResult> {
+  return invoke<ClubLogPushResult>('clublog_push_qso', { record })
+}
+
+/** Upload one logged QSO to eQSL.cc (ImportADIF). */
+export async function eqslPushQso(record: LoggedQso): Promise<UploadReport> {
+  return invoke<UploadReport>('eqsl_push_qso', { record })
+}
+
+/** Store the HRDLog.net upload code in the OS keychain (write-only; empty clears). */
+export async function setHrdlogCode(code: string): Promise<void> {
+  await invoke<void>('set_hrdlog_code', { code })
+}
+
+/** Save the World Radio League API key. Validates against the live service and
+ *  resolves the destination logbook BEFORE saving — rejects with a plain message on
+ *  a bad key. Write-only: the key is never read back. */
+export async function setWrlKey(key: string): Promise<void> {
+  await invoke<void>('set_wrl_key', { key })
+}
+
+export async function clearWrlKey(): Promise<void> {
+  await invoke<void>('clear_wrl_key')
+}
+
+/** Push one logged QSO to World Radio League. */
+export async function wrlPushQso(q: LoggedQso): Promise<{ result: string; message?: string }> {
+  return invoke('wrl_push_qso', { record: q })
+}
+
+/** Remove the stored HRDLog.net upload code from the OS keychain (idempotent). */
+export async function clearHrdlogCode(): Promise<void> {
+  await invoke<void>('clear_hrdlog_code')
+}
+
+/** Push one logged QSO to HRDLog.net (NewEntry.aspx). Not an ARRL confirmation
+ *  source — this never earns DXCC/WAS credit. */
+export async function hrdlogPushQso(
+  record: LoggedQso,
+): Promise<import('./types').HrdLogPushResult> {
+  return invoke<import('./types').HrdLogPushResult>('hrdlog_push_qso', { record })
+}
+
+/** Store the Cloudlog/Wavelog instance API key in the OS keychain (write-only; empty clears). */
+export async function setCloudlogKey(key: string): Promise<void> {
+  await invoke<void>('set_cloudlog_key', { key })
+}
+
+/** Remove the stored Cloudlog/Wavelog API key from the OS keychain (idempotent). */
+export async function clearCloudlogKey(): Promise<void> {
+  await invoke<void>('clear_cloudlog_key')
+}
+
+/** Need-aware spotting: the stations heard now, ranked by award value. */
+export async function getNeedAlerts(): Promise<NeedAlert[]> {
+  return invoke<NeedAlert[]>('get_need_alerts')
+}
+
+/** Raw spot firehose for the Spots panel — every recent spot (all modes/sources),
+ * newest first, NOT needs-gated. The panel filters client-side. */
+export async function getAllSpots(): Promise<import('./types').SpotRow[]> {
+  return invoke<import('./types').SpotRow[]>('get_all_spots')
+}
+
+/** Check the release feed (hamradiotools.io, SourceForge as fallback) for a newer Nexus
+ * release (Phase 1 update check). Rejects offline / on a
+ * fetch error — callers treat that as a silent no-op. */
+export async function checkForUpdate(): Promise<import('./types').UpdateInfo> {
+  return invoke<import('./types').UpdateInfo>('check_for_update')
+}
+
+/** Open the SourceForge download page in the operator's default browser. */
+export async function openDownloadPage(): Promise<void> {
+  return invoke('open_download_page')
+}
+
+/** Liveness of the background live feeds (cluster/RBN + PSK Reporter MQTT) for the
+ *  Now-Bar connector pills. */
+export async function getFeedHealth(): Promise<FeedHealth> {
+  return invoke<FeedHealth>('get_feed_health')
+}
+
+/** Export the general logbook as ADIF or CSV text. Optional `from`/`to` are UTC
+ *  "YYYY-MM-DD" dates bounding the QSO time inclusively (#98); empty/absent = all. */
+export async function exportGeneralLog(
+  format: 'adif' | 'csv',
+  from?: string,
+  to?: string,
+): Promise<string> {
+  return invoke<string>('export_general_log', { format, from: from || null, to: to || null })
+}
+
+/** The absolute path where the ALL.TXT decode log is written (to show in Settings). */
+export async function allTxtLocation(): Promise<string> {
+  return invoke<string>('all_txt_location')
+}
+
+/** Where `nexus-diag.log` lives — the file we ask an operator to send when something goes
+ * wrong. Always written, no toggle. */
+export async function diagLogLocation(): Promise<string> {
+  return invoke<string>('diag_log_location')
+}
+
+/** Reveal `nexus-diag.log` in the file manager (falls back to opening its folder). */
+export async function revealDiagLog(): Promise<void> {
+  return invoke<void>('reveal_diag_log')
+}
+
+/** The absolute folder where per-QSO recordings land (to show in Settings). Per-PROFILE: a second
+ * radio records under its own config dir, which is the whole of why "it is not writing the file"
+ * gets reported when nothing has failed. */
+export async function recordingsLocation(): Promise<string> {
+  return invoke<string>('recordings_location')
+}
+
+/** The app version string (e.g. "0.15.8") from tauri.conf.json — shown under the wordmark. */
+export async function appVersion(): Promise<string> {
+  return invoke<string>('app_version')
+}
+
+/** Why installing a downloaded update is refused right now, or null when it is allowed.
+ * Asked at the moment of the press, never cached — the radio can go busy between a poll and a
+ * click, and installing restarts the app. */
+export async function updateInstallBlock(): Promise<string | null> {
+  return invoke<string | null>('update_install_block')
+}
+
+/** Flush the conversations, the Field Day log, the open propagation episodes and the window
+ * geometry to disk before a self-update hands off to the installer. Called immediately BEFORE
+ * the plugin's `install()`, because on Windows that call ends the process outright
+ * (`ShellExecuteW` then `exit(0)`) and the ordinary quit cleanup never runs. A no-op on
+ * macOS/Linux, where `restartApp()` takes the normal exit path. */
+export async function prepareUpdateInstall(): Promise<void> {
+  return invoke<void>('prepare_update_install')
+}
+
+/** Restart Nexus after a self-update install — through the backend's ordinary quit cleanup
+ * (TX unkey, journal flushes, window geometry), never a hard kill. The updater plugin's
+ * `install()` restarts nothing on macOS/Linux, so this call is what makes "Nexus will
+ * restart…" true there; on Windows the installer already exited the process before
+ * `install()` resolves, so this is never reached. */
+export async function restartApp(): Promise<void> {
+  return invoke<void>('restart_app')
+}
+
+/** A newer BETA build the opt-in channel found, or null when up to date / offline. */
+export interface BetaUpdateInfo {
+  version: string
+  notes: string | null
+}
+
+/** Check the opt-in BETA channel for a newer build. Resolves the newest release (pre-releases
+ * included) from the GitHub API, points the updater at its manifest, and stashes it for
+ * `installBetaUpdate()` if it's newer than the running build. Returns null when up to date, and
+ * throws on a fetch error (the caller treats that silently, like the stable check). Call only when
+ * the operator has turned beta updates on. */
+export async function checkBetaUpdate(): Promise<BetaUpdateInfo | null> {
+  return invoke<BetaUpdateInfo | null>('check_beta_update')
+}
+
+/** Download and install the beta build the last `checkBetaUpdate()` stashed. Call the SAME guards
+ * the stable install uses first — `updateInstallBlock()` then `prepareUpdateInstall()` — and, on
+ * macOS/Linux, `restartApp()` after it resolves (on Windows the installer exits the process here).
+ * No progress is reported; the banner shows an indeterminate installing state. */
+export async function installBetaUpdate(): Promise<void> {
+  return invoke<void>('install_beta_update')
+}
+
+/** One selectable radio in the launch picker. */
+export interface RadioLaunchOption {
+  id: number
+  name: string
+  /** Already open in another window → the picker greys it out. */
+  inUse: boolean
+}
+/** Whether to show the "which radio?" launch picker, and the radios to offer. */
+export interface RadioLaunchInfo {
+  showPicker: boolean
+  radios: RadioLaunchOption[]
+}
+/** Ask the backend whether this window should show the radio picker (simultaneous-radios on,
+ *  ≥2 radios, launched without a profile). Single-radio stations get showPicker=false. */
+export async function radioLaunchInfo(): Promise<RadioLaunchInfo> {
+  return invoke<RadioLaunchInfo>('radio_launch_info')
+}
+/** Operator picked a radio: the backend relaunches this window bound to that radio and exits. */
+export async function chooseRadio(radioId: number): Promise<void> {
+  await invoke('choose_radio', { radioId })
+}
+
+/** Picker escape: turn simultaneous-radios off (in the base config the picker reads) and proceed
+ *  as the single band-following window — the pre-picker behavior. */
+export async function useSingleRadio(): Promise<void> {
+  await invoke('use_single_radio')
+}
+
+/** Reveal ALL.TXT (or its folder) in the OS file manager. */
+/** Stamp POTA/SOTA park refs from a pota.app export onto matching logged QSOs. */
+export interface PotaStampResult {
+  stamped: number
+  already: number
+  unmatched: number
+}
+export async function importPotaLog(text: string): Promise<PotaStampResult> {
+  return invoke<PotaStampResult>('import_pota_log', { text })
+}
+
+/** Open a station's QRZ.com profile in the system browser (roster/logbook affordance). */
+export async function openQrzPage(call: string): Promise<void> {
+  await invoke('open_qrz_page', { call })
+}
+
+/** Open a DXpedition's own webpage in the system browser, falling back to the
+ * callsign's QRZ page when the calendar source published no site. The backend
+ * re-validates the URL's scheme — it is third-party data. */
+export async function openDxpedPage(call: string, url?: string | null): Promise<void> {
+  await invoke('open_dxped_page', { call, url: url ?? null })
+}
+
+export async function revealAllTxt(): Promise<void> {
+  await invoke('reveal_all_txt')
+}
+
+export async function revealRecordings(): Promise<void> {
+  await invoke('reveal_recordings')
+}
+
+/** Delete one received SSTV image — the file AND its gallery entry, in one action so the two
+ * cannot drift. Irreversible: the caller confirms first. */
+export async function sstvDeleteImage(path: string): Promise<void> {
+  await invoke('sstv_delete_image', { path })
+}
+
+/** Toggle Skip Tx1 (WSJT-X parity) — a session-only flag, resets each launch. */
+export async function setSkipTx1(enabled: boolean): Promise<void> {
+  await invoke('set_skip_tx1', { enabled })
+}
+
+/** Write text to the operator's Downloads folder; returns the full saved path. Reliable in a
+ *  WebView2 window where a browser `<a download>` blob may silently fail. */
+export async function saveTextToDownloads(filename: string, text: string): Promise<string> {
+  return invoke<string>('save_text_to_downloads', { filename, text })
+}
+
+/** Binary sibling of saveTextToDownloads for the share-card PNG (base64-encoded bytes) —
+ *  on macOS wry cancels `<a download>` navigations outright, so a blob anchor saves nothing. */
+export async function savePngToDownloads(filename: string, base64: string): Promise<string> {
+  return invoke<string>('save_png_to_downloads', { filename, base64 })
+}
+
+/** Open an external http(s) link in the system browser. Backing for the app-wide
+ *  `target="_blank"` anchor interceptor (externalLinks.ts) — raw `_blank` anchors are dead
+ *  in the Tauri webview (the opener plugin's injected handler is ACL-denied). */
+export async function openExternalUrl(url: string): Promise<void> {
+  await invoke('open_external_url', { url })
+}
+
+/** Fire an OS notification through the Rust notification plugin — WKWebView has no web
+ *  Notification API, so this is the only path that exists on macOS. Rejects when the OS
+ *  refuses; the caller decides what a miss means (Pounce: nothing — sound is primary). */
+export async function osNotify(title: string, body: string): Promise<void> {
+  await invoke('os_notify', { title, body })
+}
+
+/**
+ * Switch the top-level operating mode (and operator role). Returns the fresh
+ * snapshot so callers can render the new mode immediately.
+ */
+export async function setMode(mode: ModeRequest): Promise<AppSnapshot> {
+  return invoke<AppSnapshot>('set_mode', { mode })
+}
+
+/**
+ * Switch the link tier (TempoFast fast / TempoDeep robust). Returns the fresh snapshot so
+ * the UI reflects the authoritative `link.tier` rather than local state.
+ */
+export async function setTier(tier: Tier): Promise<AppSnapshot> {
+  return invoke<AppSnapshot>('set_tier', { tier })
+}
+
+/** Switch the RX signal source: 'native' (decode local audio) or 'companion'
+ * (ride an upstream WSJT-X/JTDX/MSHV decode stream over UDP). */
+export async function setSource(kind: SourceKind): Promise<AppSnapshot> {
+  return invoke<AppSnapshot>('set_source', { kind })
+}
+
+/** Fetch the band-plan channel presets (grouped HF / VHF / UHF). */
+export async function getBandPlan(): Promise<BandChannel[]> {
+  return invoke<BandChannel[]>('get_band_plan')
+}
+
+/**
+ * Tune the rig: set the dial frequency (MHz), band label, and phone mode.
+ * Returns the fresh snapshot so the readout reflects the authoritative state.
+ */
+export async function setFrequency(
+  dialMhz: number,
+  band: string,
+  mode: string,
+): Promise<AppSnapshot> {
+  return invoke<AppSnapshot>('set_frequency', { dialMhz, band, mode })
+}
+
+/** An SSTV strip pick / dial commit: claims the Phone section (SSTV rides Phone) and QSYs
+ * atomically, so the previous section's mode policy can't keep commanding the rig at the new
+ * dial (picking 20 m SSTV from RTTY used to land DATA-L at 14.230). */
+export async function sstvTune(
+  dialMhz: number,
+  band: string,
+  mode: string,
+): Promise<AppSnapshot> {
+  return invoke<AppSnapshot>('sstv_tune', { dialMhz, band, mode })
+}
+
+/** Park the dial on one of the APP's OWN fixed channels (the ISS SSTV auto-arm's 145.800 FM).
+ * Identical to setFrequency on the radio; it differs only in what the per-(band, mode) dial
+ * memory makes of it — an app-driven auto-tune is not the operator's dial in that mode, so it
+ * is never remembered, and the dial it displaces is banked. Restoring the operator's OWN saved
+ * dial afterwards uses setFrequency, because that one IS theirs. */
+export async function tuneChannel(
+  dialMhz: number,
+  band: string,
+  mode: string,
+): Promise<AppSnapshot> {
+  return invoke<AppSnapshot>('tune_channel', { dialMhz, band, mode })
+}
+
+/** Band pick by NAME — the CW/Phone cockpit band dropdowns. The engine lands on the last
+ * dial you used on that band in that mode THIS SESSION, else the same licensed default the
+ * dropdown always used. Every explicit-frequency path keeps calling setFrequency: a typed
+ * MHz, a spot's frequency or a band-plan channel stays authoritative, with no memory
+ * overlay. `mode` = the cockpit's mode (race-safe on entry, like getLicensedBandPlan);
+ * omit for the engine's current operating mode. */
+export async function pickBand(band: string, mode?: string): Promise<AppSnapshot> {
+  return invoke<AppSnapshot>('pick_band', { band, mode: mode ?? null })
+}
+
+/** Set the per-section operating mode (the rig-mode policy): "digital" obeys the rig,
+ * "phone" forces USB/LSB by band, "cw" forces CW. `followFreq` = true when the operator
+ * clicks an actual operating-section tab — then the rig QSYs to that mode's home frequency
+ * on the current band (phone segment / CW segment / FT8 watering hole). Pass false for
+ * incidental nav and the Needed click (which sets the spot's exact frequency itself). */
+export async function setOperatingMode(
+  mode: 'digital' | 'phone' | 'cw' | 'rtty' | 'keyboard',
+  followFreq: boolean,
+): Promise<AppSnapshot> {
+  return invoke<AppSnapshot>('set_operating_mode', { mode, followFreq })
+}
+
+/** Work a spotted station (the Needed click): set the operating mode AND QSY to the spot's
+ * exact frequency atomically — one round-trip, so the rig can't end up in the new mode at the
+ * old dial and the UI never sees a half-applied state. */
+export async function workSpot(
+  mode: 'digital' | 'phone' | 'cw' | 'rtty',
+  freqMhz: number,
+  band: string,
+  call?: string,
+  tier?: 'FT8' | 'FT4',
+): Promise<AppSnapshot> {
+  // `call` lets the backend look up the spot's pile-up split ("UP 2") and
+  // configure rig split automatically — the N1MM behavior. `tier` is the digital
+  // spot's protocol: passing it here makes the tier switch and the QSY ONE atomic
+  // backend call — as two calls, the radio loop could command the tier's default
+  // dial to the rig in the gap before the spot's exact frequency ("hitting a
+  // default first, then switching" — operator report, 2026-08-09).
+  return invoke<AppSnapshot>('work_spot', {
+    mode,
+    freqMhz,
+    band,
+    call: call ?? null,
+    tier: tier ?? null,
+  })
+}
+
+/** Set (`txMhz`) or clear (`null`) manual rig split — the TX dial when working split
+ * (e.g. "up 5"). `null` returns to simplex. The radio loop applies it to the rig. */
+export async function setSplit(txMhz: number | null): Promise<AppSnapshot> {
+  return invoke<AppSnapshot>('set_split', { txMhz })
+}
+
+/** Set ('USB'|'LSB'|'FM') or clear (null = AUTO) the transient Phone mode override. The radio
+ * loop applies it next cycle; a band change reverts to the band-auto sideband. */
+export async function setSidebandOverride(mode: 'USB' | 'LSB' | 'FM' | 'AM' | null): Promise<AppSnapshot> {
+  return invoke<AppSnapshot>('set_sideband_override', { mode })
+}
+
+/** Set the rig RX filter / passband width (Hz); the radio loop applies it via set_mode. */
+export async function setFilterWidth(hz: number): Promise<AppSnapshot> {
+  return invoke<AppSnapshot>('set_filter_width', { hz })
+}
+
+/** Set the native Icom scope SPAN — the rig's real panadapter ± half-width in Hz. */
+export async function setScopeSpan(hz: number): Promise<AppSnapshot> {
+  return invoke<AppSnapshot>('set_scope_span', { hz })
+}
+/** Set the native Icom scope REFERENCE level in tenths of a dB (−200..+200). */
+export async function setScopeRef(tenthsDb: number): Promise<AppSnapshot> {
+  return invoke<AppSnapshot>('set_scope_ref', { tenthsDb })
+}
+/** Set the FlexRadio native-panadapter BANDWIDTH (span) in Hz. */
+export async function setFlexPanSpan(hz: number): Promise<AppSnapshot> {
+  return invoke<AppSnapshot>('set_flex_pan_span', { hz })
+}
+/** Set the FlexRadio panadapter REFERENCE level (dBm); null = auto. */
+export async function setFlexPanRef(refDbm: number | null): Promise<AppSnapshot> {
+  return invoke<AppSnapshot>('set_flex_pan_ref', { refDbm })
+}
+/** Set the native Icom scope center/fixed mode (true = fixed band-edge view). */
+export async function setScopeFixed(fixed: boolean): Promise<AppSnapshot> {
+  return invoke<AppSnapshot>('set_scope_fixed', { fixed })
+}
+
+/** Set the RIT (receive incremental tuning) offset in Hz — 0 turns RIT off. */
+export async function setRit(hz: number): Promise<AppSnapshot> {
+  return invoke<AppSnapshot>('set_rit', { hz })
+}
+/** Set the XIT (transmit incremental tuning) offset in Hz — 0 turns XIT off. */
+export async function setXit(hz: number): Promise<AppSnapshot> {
+  return invoke<AppSnapshot>('set_xit', { hz })
+}
+/** Select the active VFO ("A" / "B"). */
+export async function setVfo(vfo: string): Promise<AppSnapshot> {
+  return invoke<AppSnapshot>('set_vfo', { vfo })
+}
+/** Swap the active VFO (A↔B). */
+export async function swapVfo(): Promise<AppSnapshot> {
+  return invoke<AppSnapshot>('swap_vfo')
+}
+
+/** Toggle a rig DSP function ('nb'|'nr'|'notch'|'comp'|'vox') on/off; the radio loop applies it.
+ * The returned snapshot reflects the request optimistically (the loop's read-back reconciles). */
+export async function setRigFunc(
+  // 'notch' is the AUTOMATIC notch (ANF); 'manualNotch' is the one you place (MN). Two
+  // different rig functions — see engine.rs func_index, where they are indices 2 and 5.
+  func: 'nb' | 'nr' | 'notch' | 'comp' | 'vox' | 'manualNotch',
+  on: boolean,
+): Promise<AppSnapshot> {
+  return invoke<AppSnapshot>('set_rig_func', { func, on })
+}
+
+/** Queue CW to transmit (CAT keyer). `text` is an F-key macro template or literal
+ * type-ahead — the engine expands the tokens and the rig keys it. */
+export async function sendCw(text: string): Promise<AppSnapshot> {
+  return invoke<AppSnapshot>('send_cw', { text })
+}
+
+/** Record the worked station's QRZ name + state for the {HISNAME}/{HISSTATE} CW-macro tokens,
+ *  keyed to `call` (pass an empty call to clear). Fire-and-forget. */
+export async function setCwPeerInfo(call: string, name: string, peerState: string): Promise<void> {
+  await invoke('set_cw_peer_info', { call, name, peerState })
+}
+
+/** Set the CW keyer speed in WPM (5–50). */
+/** Set CW sending speed. `commit` persists it to settings — pass false for the continuous
+ * paths (slider drag, decoder auto speed-match) and true once the operator settles, so a
+ * drag can't fsync the settings file ~45 times. */
+export async function setCwWpm(wpm: number, commit = false): Promise<AppSnapshot> {
+  return invoke<AppSnapshot>('set_cw_wpm', { wpm, commit })
+}
+
+/** Set FT8/FT4 decode depth (1=Fast, 2=Normal, 3=Deep) live from the Operate cockpit; persists. */
+export async function setDecodeDepth(depth: number): Promise<AppSnapshot> {
+  return invoke<AppSnapshot>('set_decode_depth', { depth })
+}
+
+/** Abort CW in progress (Esc) — stops the rig keyer + clears the queue. */
+export async function stopCw(): Promise<AppSnapshot> {
+  return invoke<AppSnapshot>('stop_cw')
+}
+
+/** Choose the CW keyer back-end ("cat" = rig send_morse / "soundcard" = keyed tone)
+ * and tone pitch in Hz (<=0 keeps the current pitch). */
+export async function setCwKeyer(
+  backend: 'cat' | 'soundcard' | 'winkeyer' | 'serial',
+  pitch = 0,
+): Promise<AppSnapshot> {
+  return invoke<AppSnapshot>('set_cw_keyer', { backend, pitch })
+}
+
+/** Manual PTT for live phone — key (true) / unkey (false) the rig. */
+export async function setPtt(on: boolean): Promise<AppSnapshot> {
+  return invoke<AppSnapshot>('set_ptt', { on })
+}
+
+/** Set RF output power as a 0.0–1.0 fraction. */
+export async function setRfPower(power: number): Promise<AppSnapshot> {
+  return invoke<AppSnapshot>('set_rf_power', { power })
+}
+
+/** Set mic gain as a 0.0–1.0 fraction. */
+export async function setMicGain(gain: number): Promise<AppSnapshot> {
+  return invoke<AppSnapshot>('set_mic_gain', { gain })
+}
+/** Set the noise-reduction level as a 0.0–1.0 fraction. */
+export async function setNrLevel(level: number): Promise<AppSnapshot> {
+  return invoke<AppSnapshot>('set_nr_level', { level })
+}
+/** Set the speech-processor depth as a 0.0–1.0 fraction (#95). */
+export async function setCompLevel(level: number): Promise<AppSnapshot> {
+  return invoke<AppSnapshot>('set_comp_level', { level })
+}
+
+/** Set the MANUAL-notch frequency in HZ (#95). The engine clamps it to the audio passband. */
+export async function setNotchFreq(hz: number): Promise<AppSnapshot> {
+  return invoke<AppSnapshot>('set_notch_freq', { hz })
+}
+
+/** Set the AGC speed — `Engine::AGC_SPEEDS`, in the order the cockpits show them. */
+export async function setAgc(speed: 'auto' | 'fast' | 'mid' | 'slow' | 'off'): Promise<AppSnapshot> {
+  return invoke<AppSnapshot>('set_agc', { speed })
+}
+
+// --- phone voice keyer ---
+/** Play the recorded WAV bound to a voice-keyer slot (PTT + audio via the radio loop). */
+export async function playVoiceMessage(slot: number): Promise<AppSnapshot> {
+  return invoke<AppSnapshot>('play_voice_message', { slot })
+}
+/** Abort voice playback in progress (Esc). */
+export async function stopVoice(): Promise<AppSnapshot> {
+  return invoke<AppSnapshot>('stop_voice')
+}
+/** Begin recording a voice message from the input device. */
+export async function startVoiceRecording(): Promise<AppSnapshot> {
+  return invoke<AppSnapshot>('start_voice_recording')
+}
+/** Cancel an in-progress recording, discarding the captured audio (e.g. on unmount). */
+export async function cancelVoiceRecording(): Promise<AppSnapshot> {
+  return invoke<AppSnapshot>('cancel_voice_recording')
+}
+/** Stop recording, save the slot's WAV, and return the updated message list. */
+export async function stopVoiceRecording(slot: number, label: string): Promise<VoiceMessage[]> {
+  return invoke<VoiceMessage[]>('stop_voice_recording', { slot, label })
+}
+/** Import a `.wav` (raw bytes) into a slot, normalized to 12 kHz mono. */
+export async function importVoiceMessage(
+  slot: number,
+  label: string,
+  bytes: number[],
+): Promise<VoiceMessage[]> {
+  return invoke<VoiceMessage[]>('import_voice_message', { slot, label, bytes })
+}
+/** Rename a voice-keyer slot's label. */
+export async function setVoiceLabel(slot: number, label: string): Promise<VoiceMessage[]> {
+  return invoke<VoiceMessage[]>('set_voice_label', { slot, label })
+}
+/** Clear the recording bound to a slot (keeps the label). */
+export async function clearVoiceMessage(slot: number): Promise<VoiceMessage[]> {
+  return invoke<VoiceMessage[]>('clear_voice_message', { slot })
+}
+/** The configured voice-keyer message slots. */
+export async function getVoiceMessages(): Promise<VoiceMessage[]> {
+  return invoke<VoiceMessage[]>('get_voice_messages')
+}
+
+// --- license class + licensed band plan ---
+/** Set the operator's amateur license class (technician/general/extra/open). */
+export async function setLicenseClass(licenseClass: string): Promise<AppSnapshot> {
+  return invoke<AppSnapshot>('set_license_class', { class: licenseClass })
+}
+/** Bands the operator may use in `mode` ('phone' | 'cw' | 'digital'), parked at the licensed
+ * segment start. Mode is passed explicitly (not read from the engine) to avoid a mount race. */
+export async function getLicensedBandPlan(mode: string): Promise<BandChannel[]> {
+  return invoke<BandChannel[]>('get_licensed_band_plan', { mode })
+}
+
+/** Every current DXCC entity name (sorted) — the full table behind the country-hide
+ *  picker's "Other country…" search (F4MQS). */
+export async function getDxccEntityNames(): Promise<string[]> {
+  return invoke<string[]>('dxcc_entity_names')
+}
+
+/** Every entity's cty.dat representative location as `[name, lat, lon]` — the azimuth
+ *  fallback for a station that never sent a grid. Keyed by the same `country`/`entity`
+ *  string a decode/spot row carries. WAE/CQ-only entities are included: `resolve()`
+ *  returns those as a country too. */
+export async function getDxccEntityLocations(): Promise<[string, number, number][]> {
+  return invoke<[string, number, number][]>('dxcc_entity_locations')
+}
+
+// --- QSO recording (audio bridge) ---
+/** Start streaming the live RX audio to a timestamped WAV on disk. */
+export async function startQsoRecording(): Promise<AppSnapshot> {
+  return invoke<AppSnapshot>('start_qso_recording')
+}
+/** Stop the in-progress QSO recording (finalizes the WAV). */
+export async function stopQsoRecording(): Promise<AppSnapshot> {
+  return invoke<AppSnapshot>('stop_qso_recording')
+}
+
+/** Enumerate available audio input + output devices. */
+export async function getAudioDevices(): Promise<AudioDevices> {
+  return invoke<AudioDevices>('get_audio_devices')
+}
+
+/** What the OS can say about this display's physical density — the input to the first-launch
+ *  UI-scale seed. `physicalDpi` is null wherever the platform already sizes CSS pixels
+ *  correctly (Windows, macOS) or the panel reports no physical size; that is a "change
+ *  nothing" answer, not a failure. See `display_metrics` in src-tauri and `dpiSeedCap`. */
+export interface DisplayMetrics {
+  physicalDpi: number | null
+  scaleFactor: number
+}
+
+export async function getDisplayMetrics(): Promise<DisplayMetrics> {
+  return invoke<DisplayMetrics>('display_metrics')
+}
+
+/**
+ * Enable / disable transmit (the Monitor toggle). Enabling also clears a tripped
+ * TX watchdog. Returns the fresh snapshot.
+ */
+export async function setTxEnabled(enabled: boolean): Promise<AppSnapshot> {
+  return invoke<AppSnapshot>('set_tx_enabled', { enabled })
+}
+
+/** Set the TX audio drive level (0.0–1.0) — the "Pwr" slider. Returns the snapshot. */
+export async function setTxLevel(level: number): Promise<AppSnapshot> {
+  return invoke<AppSnapshot>('set_tx_level', { level })
+}
+
+/** Set the RX capture gain (≥1.0 multiplier on received audio before decode). Returns the snapshot. */
+export async function setRxGain(gain: number): Promise<AppSnapshot> {
+  return invoke<AppSnapshot>('set_rx_gain', { gain })
+}
+
+/** Switch the active radio (dual-radio). The rig loop swaps rigs on the next tick (carrier
+ * dropped first); Mode/TX-queues are untouched. Returns the fresh snapshot. */
+export async function setActiveRadio(id: number): Promise<AppSnapshot> {
+  return invoke<AppSnapshot>('set_active_radio', { id })
+}
+
+/** Peg-lock the active radio (dual-radio): band selection won't auto-switch. Returns the snapshot. */
+export async function setPegLock(on: boolean): Promise<AppSnapshot> {
+  return invoke<AppSnapshot>('set_peg_lock', { on })
+}
+
+/** Add a radio to the roster (dual-radio). Distinct daemon ports auto-assigned; active unchanged. */
+export async function addRadio(): Promise<AppSnapshot> {
+  return invoke<AppSnapshot>('add_radio')
+}
+
+/** Remove a radio from the roster (no-op on the active or last radio). Returns the snapshot. */
+export async function removeRadio(id: number): Promise<AppSnapshot> {
+  return invoke<AppSnapshot>('remove_radio', { id })
+}
+
+/** Rename a radio profile (its switcher label). Returns the snapshot. */
+export async function renameRadio(id: number, name: string): Promise<AppSnapshot> {
+  return invoke<AppSnapshot>('rename_radio', { id, name })
+}
+
+/** Set a radio's band-coverage set (empty = covers everything) for auto-routing. Returns snapshot. */
+export async function setRadioBands(id: number, bands: string[]): Promise<AppSnapshot> {
+  return invoke<AppSnapshot>('set_radio_bands', { id, bands })
+}
+
+/** Replace the band+mode routing rules (list order IS the first-match-wins precedence). A live verb,
+ * not part of the settings form — like the roster, so a stale-form Save can't revert it. */
+export async function setRoutingRules(rules: RoutingRule[]): Promise<AppSnapshot> {
+  return invoke<AppSnapshot>('set_routing_rules', { rules })
+}
+
+/** Set (or clear, with `null`) the fallback radio for band+modes no rule and no coverage claims. */
+export async function setDefaultRadio(id: number | null): Promise<AppSnapshot> {
+  return invoke<AppSnapshot>('set_default_radio', { id })
+}
+
+/** Where a (band, mode class) WOULD route right now — the rule editor's "test" affordance.
+ * Read-only: it never moves a rig. */
+export async function routePreview(
+  band: string,
+  mode: RouteMode,
+): Promise<{ radio: number; name: string }> {
+  return invoke<{ radio: number; name: string }>('route_preview', { band, mode })
+}
+
+/** The editable CAT/audio/PTT/rotator/native subset of a radio profile — the per-radio Settings
+ * page edits ONE radio with this, without making it active. Field names match the flat rig form. */
+export interface RadioProfilePatch {
+  pttMethod: string
+  rigModel: number
+  rigModelName: string
+  serialPort: string
+  /** Dedicated RTS/DTR PTT port for THIS radio; empty = key on the CAT port. An SO2R box
+   * (U2R/MK2R) gives each radio its own keying port, so this must travel per-radio — it was
+   * flat-only until 2026-07-25 and PTT did not follow a radio switch. */
+  pttSerialPort: string
+  baud: number
+  rigConn: string
+  rigAddr: string
+  /** Which OmniRig slot this radio drives when rigConn === "omnirig" (1 = RIG 1, 2 = RIG 2).
+   * On the patch because the per-radio Edit flow saves through it — a per-radio field missing
+   * here is silently dropped on Save (the 2026-08-17 Flex-three data loss, exactly). */
+  omnirigSlot: number
+  rigctldPort: number
+  icomNativeCat: boolean
+  dataModesPlainSsb: boolean
+  audioIn: string
+  audioOut: string
+  txLevel: number
+  rxGain: number
+  rotatorModel: number
+  rotatorPort: string
+  rotatorBaud: number
+  rotatorHost: string
+  rotctldPort: number
+  nativeScope: string
+  /** Which Icom DATA submode THIS radio uses. Rust carries a `#[serde(default = "one")]`, so
+   * omitting it here did not fail the save — it silently RESET the operator's choice to DATA1
+   * on every edit of the rig form. A default on the backend hides drift instead of catching it,
+   * which is why the guard below now reads this interface directly. */
+  icomDataMode: number
+  /** THIS radio's amplifier, per-radio because the amp is wired to a radio, not to the station.
+   * Absent here these had no serde default, so the patch did not silently drop them — it failed
+   * to deserialize at all and took the whole Save with it. */
+  ampModel: string
+  ampPort: string
+  ampFollowBand: boolean
+  /** THIS radio's FlexRadio LAN IP (SmartSDR API, port 4992) for the native panadapter/DAX
+   * workers. Per-radio since 2026-08-18: it was flat-only, so the per-radio Edit flow — which
+   * saves through THIS patch — silently dropped it, and two Flexes could not both be configured
+   * (2026-08-17 Flex audit). */
+  flexRadioIp: string
+  /** This radio's native-panadapter opt-in (per-radio, as above). */
+  flexNativePan: boolean
+  /** This radio's native-DAX-audio opt-in (per-radio, as above). */
+  flexNativeAudio: boolean
+}
+
+/** Edit one radio's CAT/audio/PTT/rotator/native config IN PLACE without changing the active radio
+ * (no live rig swap / dropped carrier). Returns the updated snapshot. */
+export async function updateRadioProfile(
+  id: number,
+  patch: RadioProfilePatch,
+): Promise<AppSnapshot> {
+  return invoke<AppSnapshot>('update_radio_profile', { id, patch })
+}
+
+/** Key / unkey a tune carrier. Returns the fresh snapshot. */
+export async function setTune(on: boolean): Promise<AppSnapshot> {
+  return invoke<AppSnapshot>('set_tune', { on })
+}
+
+/** Run the radio's OWN built-in antenna tuner. Rejects with the reason when the rig has no ATU or
+ * a TX gate is down (TX off, outside privileges, transmitter busy) — it keys the transmitter. */
+export async function atuTune(): Promise<AppSnapshot> {
+  return invoke<AppSnapshot>('atu_tune')
+}
+
+/** Emergency stop: halt any transmit immediately. Returns the fresh snapshot. */
+export async function haltTx(): Promise<AppSnapshot> {
+  return invoke<AppSnapshot>('halt_tx')
+}
+
+/**
+ * Test the rig/CAT connection (WSJT-X-style). The radio loop (re)opens + probes
+ * the rig from the current settings; this returns whether it connected and a
+ * detail line (read frequency, or a specific error). Save settings first.
+ */
+export async function testCat(): Promise<CatTestResult> {
+  return invoke<CatTestResult>('test_cat')
+}
+
+/** Auto-test which serial port drives the rig: probes each USB port read-only and
+ * returns the working (port, baud, model) to auto-select, or found=false. */
+export async function probeCatPorts(radioId?: number): Promise<CatProbeResult> {
+  return invoke<CatProbeResult>('probe_cat_ports', { radioId })
+}
+
+/** Point the antenna rotator at an absolute azimuth (degrees) via rotctld. */
+export async function pointRotator(azDeg: number): Promise<void> {
+  return invoke('point_rotator', { azDeg })
+}
+
+/** Point the rotator at a callsign's DXCC entity; resolves to the bearing it pointed to. */
+export async function pointRotatorAtCall(call: string): Promise<number> {
+  return invoke<number>('point_rotator_at_call', { call })
+}
+
+/** Current rotator azimuth (degrees), or null if rotctld is unset/unreachable. */
+/** Scan ~3s for FlexRadio LAN discovery broadcasts (the Find-my-Flex button). */
+export async function discoverFlex(): Promise<{ model: string; nickname: string; ip: string }[]> {
+  return invoke('discover_flex')
+}
+
+/** Stop the rotator immediately (rotctld S). */
+export async function stopRotator(): Promise<void> {
+  return invoke('stop_rotator')
+}
+
+export async function readRotator(): Promise<number | null> {
+  return invoke<number | null>('read_rotator')
+}
+
+/** Single-signal CW decode of the recent RX audio (live readout: text + estimated WPM).
+ * `sensitivity` (0..1, 0.5 = default gates) scales the decoder's presence + SNR gates. */
+export async function cwDecode(sensitivity: number): Promise<CwDecodeResult> {
+  return invoke<CwDecodeResult>('cw_decode', { sensitivity })
+}
+
+/** Toggle the AI CW decoder (beta). Persisted; returns the fresh snapshot. */
+export async function setAiCw(on: boolean): Promise<AppSnapshot> {
+  return invoke<AppSnapshot>('set_ai_cw', { on })
+}
+
+/** Declare (or end) an UNASSISTED contest entry — one switch that suppresses every
+ *  QSO-finding assistance source (AI CW decoder, cluster/RBN, PSK Reporter needs) and
+ *  journals the change. The operator's own settings are overridden, never overwritten. */
+export async function setUnassistedMode(on: boolean): Promise<AppSnapshot> {
+  return invoke<AppSnapshot>('set_unassisted_mode', { on })
+}
+
+/** The assistance journal, newest first — what was running, and when. */
+export async function getAssistanceJournal(): Promise<import('./types').AssistanceEvent[]> {
+  return invoke('get_assistance_journal')
+}
+
+/** Clear the streaming CW decoder's accumulated transcript. */
+export async function cwClear(): Promise<void> {
+  return invoke('cw_clear')
+}
+
+/** Expand a CW macro to the exact text it will send, without sending (reply preview). */
+export async function previewCw(text: string): Promise<string> {
+  return invoke<string>('preview_cw', { text })
+}
+
+/** Wideband CW skim of the recent RX audio: every distinct keyed signal across the band. */
+export async function cwSkim(): Promise<SkimHit[]> {
+  return invoke<SkimHit[]>('cw_skim')
+}
+
+/** One decoded APRS packet for the cockpit list (from `get_aprs_heard`). */
+export interface AprsHeard {
+  source: string
+  dest: string
+  path: string[]
+  lat: number | null
+  lon: number | null
+  symbolTable: string
+  symbolCode: string
+  /** "position" | "mice" | "message" | "status" | "other". */
+  kind: string
+  text: string
+  speedKnots: number | null
+  courseDeg: number | null
+  /** For a `message` kind: who it was addressed to (base call). */
+  addressee: string | null
+  /** For a `message` kind: the sender's line number, if any. */
+  msgId: string | null
+  atUnix: number
+  /** WHERE this packet came from. `rf` = this station's own receiver decoded it; `inet` = the
+   * APRS-IS feed reported it; `both` = the same packet arrived each way. Never inferred — an RF
+   * sighting proves the antenna hears the station, an internet one proves nothing about range. */
+  sourceKind: AprsSource
+  /** The packet as a TNC2 monitor line, for the raw readout. */
+  raw: string
+}
+
+/** Where an APRS packet reached us from. See `AprsHeard.sourceKind`. */
+export type AprsSource = 'rf' | 'inet' | 'both'
+
+/** One STATION, accumulated from every packet it has sent (from `get_aprs_stations`).
+ *
+ * Distinct from `AprsHeard`, which is one PACKET. The map and the station list read stations; the
+ * packet pane and the message list read packets. Conflating them is what made the map flash — the
+ * packet log is capped by count with no age expiry, so a busy internet feed evicted stations that
+ * were still active, and they blinked off until their next beacon. */
+export interface AprsStation {
+  /** Callsign-SSID — the station identity and the store key. */
+  call: string
+  /** Last known position. Sticky: a later packet without one does not erase it. */
+  lat: number | null
+  lon: number | null
+  symbolTable: string
+  symbolCode: string
+  kind: string
+  text: string
+  speedKnots: number | null
+  courseDeg: number | null
+  path: string[]
+  raw: string
+  /** Most recent packet from this station, either source. Drives the age column and the fade. */
+  lastHeardUnix: number
+  /** When this receiver last decoded it off the air, if ever. */
+  lastRfUnix: number | null
+  /** When it last arrived via APRS-IS, if ever. */
+  lastInetUnix: number | null
+  /** Derived from the two above, so it cannot drift from the evidence. */
+  sourceKind: AprsSource
+  packets: number
+  firstHeardUnix: number
+  /** Weather readings, when this station sends them. Sticky like the position. */
+  wx: AprsWx | null
+}
+
+/** APRS weather readings — the common core of the WX format (APRS 1.0.1 ch. 12). Every field is
+ * optional: real stations omit what they have no sensor for, and the wire's placeholder for
+ * "no reading" must never be shown as a measurement of zero. */
+export interface AprsWx {
+  windDirDeg: number | null
+  windMph: number | null
+  gustMph: number | null
+  tempF: number | null
+  /** Hundredths of an inch. */
+  rain1hIn100: number | null
+  rain24hIn100: number | null
+  rainMidnightIn100: number | null
+  humidityPct: number | null
+  /** Tenths of a hectopascal — 10156 is 1015.6 hPa. */
+  pressureTenthHpa: number | null
+}
+
+/** The station roster plus the aging thresholds that produced it, so the UI's fade can never
+ * disagree with the backend's retention. */
+export interface AprsStationsView {
+  stations: AprsStation[]
+  /** Minutes of silence after which a station is dropped. */
+  ttlMin: number
+  /** Minutes of silence after which it starts to fade (derived from ttlMin). */
+  fadeAfterMin: number
+}
+
+/** Poll the APRS station roster — what the map and station list draw. */
+export async function getAprsStations(): Promise<AprsStationsView> {
+  return invoke<AprsStationsView>('get_aprs_stations')
+}
+
+/** Arm/disarm the APRS RX decoder (session-only; RX decode). Returns the current heard list. */
+export async function aprsArm(on: boolean): Promise<AprsHeard[]> {
+  return invoke<AprsHeard[]>('aprs_arm', { on })
+}
+
+/** The decoded-APRS list, newest last (poll while the APRS cockpit is visible). */
+export async function getAprsHeard(): Promise<AprsHeard[]> {
+  return invoke<AprsHeard[]>('get_aprs_heard')
+}
+
+/** What the APRS decoder is hearing (from `get_aprs_health`) — lets an empty map say WHY it is
+ * empty instead of looking identical whether the app is deaf, mistuned, or the band is quiet. */
+export interface AprsHealth {
+  /** Armed-ness AND how it was armed. `auto` (armed by entering the view) is RECEIVE-ONLY and
+   * never auto-acks; only `explicit` (the operator armed it themselves) can, and even then only
+   * with TX enabled. One field so "is it running" and "may it ack" cannot drift apart. */
+  arm: 'off' | 'auto' | 'explicit'
+  /** Peak |sample| of the last drain that carried audio (empty drains do not clobber it). */
+  audioPeak: number
+  /** When audio last ARRIVED at the tap, at any level. Distinct from the level on purpose: a
+   * squelched codec streams digital zeros, so this stays fresh while `audioPeak` is 0. */
+  lastAudioUnix: number | null
+  /** Drains reported since arming, carrying audio or not — lets "never heard anything" be told
+   * apart from "have not looked yet", so arming does not flash a capture alarm. */
+  drains: number
+  /** HDLC frames recovered since arming, BEFORE the AX.25 FCS check. */
+  framesSeen: number
+  /** Of those, how many passed the FCS. Seen climbing while this does not = heard, but not cleanly. */
+  framesDecoded: number
+  lastDecodeUnix: number | null
+  /** When a frame candidate was last recovered. The counters are cumulative since arming and the
+   * level is live, so without this the UI cannot tell "failing right now" from "two turned up
+   * six minutes ago". */
+  lastFrameSeenUnix: number | null
+  /** Peak of the drain that carried the most recent frame candidate — the BURST-TIME level.
+   * `audioPeak` between packets is the gap/hiss level, which is what misled the field report. */
+  framePeak: number
+  /** Largest burst-time peak this session. */
+  maxFramePeak: number
+  /** Near-full-scale samples in the drain that carried the last frame candidate. */
+  frameClippedSamples: number
+  /** Name of the radio the decoder is listening to (the ACTIVE radio — the tap follows it). */
+  radioName: string
+  /** Enabled radios explicitly covering the band in use. >1 means the activation had a choice, and
+   * the operator cannot tell from the radio which way it went. */
+  bandRadioCount: number
+}
+
+/** Poll the APRS decoder's health beside the heard list. */
+export async function getAprsHealth(): Promise<AprsHealth> {
+  return invoke<AprsHealth>('get_aprs_health')
+}
+
+/** What the APRS-IS internet feed is doing (from `get_aprs_is_status`) — the counterpart to
+ * `AprsHealth` for the other inlet. The two fail independently, and that is the point: internet
+ * stations arriving while the RF chip stays silent proves the fault is in the radio chain. */
+export interface AprsIsStatus {
+  /** The operator has the feed switched on. Independent of the RF decoder's arm state. */
+  enabled: boolean
+  /** A session is up and the server answered the login. */
+  connected: boolean
+  /** The login was accepted as VERIFIED — required to upload. A read-only feed (`pass -1`) is
+   * unverified by design and works perfectly. */
+  verified: boolean
+  /** Packet lines received this session. */
+  packets: number
+  /** When the last line arrived — tells "connected but quiet" from "connected". */
+  lastPacketUnix: number | null
+  /** The operator has the receive-only iGate on. */
+  uplinkEnabled: boolean
+  /** Packets contributed to APRS-IS this session. */
+  uploaded: number
+  /** RF-heard packets the iGate rules refused (mostly the loop guard doing its job). */
+  gateRejected: number
+  /** The most recent refusal reason, for the tooltip. */
+  lastReject: string | null
+}
+
+/** Poll the APRS-IS feed's status beside the decoder health. */
+export async function getAprsIsStatus(): Promise<AprsIsStatus> {
+  return invoke<AprsIsStatus>('get_aprs_is_status')
+}
+
+/** Arm the decoder because the operator ENTERED the APRS view — receive-only, never ack-capable.
+ * Only upgrades from off, and refuses once the operator has explicitly stopped it this session
+ * (the engine owns that policy). Returns whether this call armed it. */
+export async function aprsAutoArm(): Promise<boolean> {
+  return invoke<boolean>('aprs_auto_arm')
+}
+
+/** Queue an APRS position beacon — an explicit operator send (the engine validates TX-enable /
+ * privileges / no other over and rejects with the reason). Symbols are single chars. */
+export async function aprsSendBeacon(
+  lat: number,
+  lon: number,
+  symbolTable: string,
+  symbolCode: string,
+  comment: string,
+  path: string[],
+): Promise<void> {
+  return invoke<void>('aprs_send_beacon', {
+    lat,
+    lon,
+    symbolTable,
+    symbolCode,
+    comment,
+    path,
+  })
+}
+
+/** Queue an APRS text message to `addressee` — an explicit operator send (the engine validates
+ * TX-enable / privileges / no other over and rejects with the reason). Capped at 67 chars. */
+export async function aprsSendMessage(addressee: string, text: string): Promise<void> {
+  return invoke<void>('aprs_send_message', { addressee, text })
+}
+
+/** Tune the rig for APRS: QSY to `dialMhz` on 2 m FM simplex, auto-routing to the 2 m-capable radio
+ * (dual-radio hand-off). Unlike a plain frequency dropdown this establishes the FM context APRS
+ * needs — a 2 m packet demodulated as USB/DATA never decodes. Returns the updated snapshot. */
+export async function aprsTune(dialMhz: number): Promise<AppSnapshot> {
+  return invoke<AppSnapshot>('aprs_tune', { dialMhz })
+}
+
+/** Tune to an FM repeater in ONE atomic step: its output frequency on FM carrying the machine's
+ * exact shift / offset (Hz, 0 = band convention) / CTCSS tone (0 = none), auto-routed to the radio
+ * mapped for that band on FM. Replaces the old write-settings-then-QSY pair, which routed on the
+ * mode class of the section being left and briefly left the rig on the new dial with the previous
+ * machine's tone. Tuning only — nothing here arms TX. */
+export async function repeaterTune(
+  outputMhz: number,
+  shift: 'simplex' | 'plus' | 'minus',
+  offsetHz: number,
+  toneHz: number,
+): Promise<AppSnapshot> {
+  return invoke<AppSnapshot>('repeater_tune', { outputMhz, shift, offsetHz, toneHz })
+}
+
+/** Arm/disarm the RTTY RX decoder (session-only; RX decode, never TX). */
+export async function rttyArm(on: boolean): Promise<RttyState> {
+  return invoke<RttyState>('rtty_arm', { on })
+}
+
+/** Arm the decoder because the operator ENTERED the RTTY view (the PSK/APRS/SSTV auto-arm
+ *  doctrine). Receive-only by construction; the ENGINE owns the policy — it only upgrades
+ *  from off, honours the session decline memory and honours the Settings opt-out
+ *  (`rttyRxAutoArm`). Deliberately not reimplemented in the UI: four cockpits ask this same
+ *  question and there must be one answer.
+ *
+ *  ⚠️ THE BACKEND HALF IS NOT LANDED YET. `rtty_auto_arm` is a wave-2 engine.rs + lib.rs
+ *  contract; until it exists this rejects at runtime and the caller's `.catch` swallows it,
+ *  leaving RTTY exactly as it is today (armed by hand). A green typecheck is NOT evidence
+ *  this works. */
+export async function rttyAutoArm(): Promise<RttyState> {
+  return invoke<RttyState>('rtty_auto_arm')
+}
+
+/** Live RTTY state (poll while the RTTY cockpit is visible). */
+export async function getRttyState(): Promise<RttyState> {
+  return invoke<RttyState>('get_rtty_state')
+}
+
+/** Queue RTTY text to transmit — an explicit operator send (the engine validates
+ * TX-enable / privileges / RTTY-section ownership and rejects with the reason). */
+export async function rttySend(text: string): Promise<RttyState> {
+  return invoke<RttyState>('rtty_send', { text })
+}
+
+/** Continuous TX on/off (the MMTTY "TX" latch): stay keyed and type into a live
+ * transmission instead of one keyed over per Enter. ON runs the same gate a send
+ * runs; OFF lets what was already typed finish keying, then unkeys — it is a mode
+ * toggle, not the emergency stop (Stop TX and the TX-enable latch are). */
+export async function rttySetLatched(on: boolean): Promise<RttyState> {
+  return invoke<RttyState>('rtty_set_latched', { on })
+}
+
+/** Feed typed characters into the live latched transmission. One insertion at a
+ * time — RTTY has no un-send, so what reaches here has already gone on the air. */
+export async function rttyType(text: string): Promise<RttyState> {
+  return invoke<RttyState>('rtty_type', { text })
+}
+
+/** Stop RTTY now: abort the over in progress, drop the queue, unkey. */
+export async function rttyStop(): Promise<RttyState> {
+  return invoke<RttyState>('rtty_stop')
+}
+
+/** Clear the decoded-RTTY transcript (display only). */
+export async function rttyClear(): Promise<RttyState> {
+  return invoke<RttyState>('rtty_clear')
+}
+
+/** Drop + rebuild the RTTY demodulator (fresh AFC acquire — the wrong-neighbor
+ * freeze recovery). RX only. */
+export async function rttyAfcReset(): Promise<RttyState> {
+  return invoke<RttyState>('rtty_afc_reset')
+}
+
+/** Net the RTTY decoder onto a new audio center (Hz) — a waterfall click. Rebuilds
+ * the demodulator around the new mark/space pair. RX only. */
+export async function rttyNet(hz: number): Promise<RttyState> {
+  return invoke<RttyState>('rtty_net', { hz })
+}
+
+/** Turn the RTTY auto-sequencer on/off (on builds the sequencer from your identity +
+ * active exchange, off aborts any live session and stops TX). NEVER transmits — a
+ * session only ever starts from an explicit CQ/Answer (the human-initiate gate). */
+export async function rttySetAuto(on: boolean): Promise<RttyState> {
+  return invoke<RttyState>('rtty_set_auto', { on })
+}
+
+/** Start an auto CQ run (a human-initiate gate; rejected with the reason if a TX
+ * gate is down). */
+export async function rttyAutoCq(): Promise<RttyState> {
+  return invoke<RttyState>('rtty_auto_cq')
+}
+
+/** Answer a surfaced CQ — search & pounce (a human-initiate gate). */
+export async function rttyAutoAnswer(call: string): Promise<RttyState> {
+  return invoke<RttyState>('rtty_auto_answer', { call })
+}
+
+/** Kill the live auto session: abort the sequencer, drop the queue, unkey. */
+export async function rttyAutoAbort(): Promise<RttyState> {
+  return invoke<RttyState>('rtty_auto_abort')
+}
+
+/** Arm/disarm the PSK31 RX decoder (session-only; RX decode — arming never
+ * keys, TX starts only from an explicit send). Stopping it is remembered for
+ * the session, so the view-entry auto-arm cannot restart it behind the
+ * operator. */
+export async function pskArm(on: boolean): Promise<PskState> {
+  return invoke<PskState>('psk_arm', { on })
+}
+
+/** Arm the decoder because the operator ENTERED the PSK view (the APRS/SSTV
+ * auto-arm doctrine). Receive-only by construction; the engine owns the policy
+ * (only upgrades from off, honours the session decline + the Settings opt-out). */
+export async function pskAutoArm(): Promise<PskState> {
+  return invoke<PskState>('psk_auto_arm')
+}
+
+/** Live PSK state (poll while the PSK cockpit is visible). */
+export async function getPskState(): Promise<PskState> {
+  return invoke<PskState>('get_psk_state')
+}
+
+/** Clear the decoded-PSK transcript (display only). */
+export async function pskClear(): Promise<PskState> {
+  return invoke<PskState>('psk_clear')
+}
+
+/** Drop + rebuild the PSK demodulator (a fresh slew-limited AFC pull from the
+ * netted center). RX only. */
+export async function pskAfcReset(): Promise<PskState> {
+  return invoke<PskState>('psk_afc_reset')
+}
+
+/** Net the PSK decoder onto a new audio center (Hz) — a waterfall click, the
+ * single-signal click-to-tune. Moves the DECODER, never the rig. RX only. */
+export async function pskNet(hz: number): Promise<PskState> {
+  return invoke<PskState>('psk_net', { hz })
+}
+
+/** Select the PSK sub-mode ('psk31' | 'qpsk31') + the QPSK sideband-reverse
+ * polarity — the cockpit's selector and Reverse toggle. The engine refuses a
+ * switch while any PSK transmission is active (returns why); a change
+ * re-acquires the RX demodulator on the new mode. */
+export async function pskSetMode(mode: string, reverse: boolean): Promise<PskState> {
+  return invoke<PskState>('psk_set_mode', { mode, reverse })
+}
+
+/** Queue PSK31 text to transmit — an explicit operator send, the only way PSK
+ * TX starts. The engine re-validates every gate (TX-enable, privileges, the
+ * Keyboard section) and returns why a send was refused. While continuous TX is
+ * latched a send types into the live stream (the RTTY macro semantic). */
+export async function pskSend(text: string): Promise<PskState> {
+  return invoke<PskState>('psk_send', { text })
+}
+
+/** Continuous TX on/off — the PSK cockpit's TX button (the MMTTY-style latch).
+ * ON runs the same gate a send runs; OFF lets what was typed finish keying.
+ * NOT the emergency stop: Stop TX / Esc / the TX-enable latch cut instantly. */
+export async function pskSetLatched(on: boolean): Promise<PskState> {
+  return invoke<PskState>('psk_set_latched', { on })
+}
+
+/** Feed typed characters into the live latched transmission (one insertion at
+ * a time — PSK has no un-send). Refused unless continuous TX is latched. */
+export async function pskType(text: string): Promise<PskState> {
+  return invoke<PskState>('psk_type', { text })
+}
+
+/** Stop PSK now: abort the over in progress, drop the queue, unkey. */
+export async function pskStop(): Promise<PskState> {
+  return invoke<PskState>('psk_stop')
+}
+
+/** Arm/disarm the SSTV RX decoder by an EXPLICIT operator act (session-only; RX
+ * decode, never TX). Stopping it here is remembered for the session — opening the
+ * view again will not restart it behind the operator. */
+export async function sstvArm(on: boolean): Promise<SstvState> {
+  return invoke<SstvState>('sstv_arm', { on })
+}
+
+/** Start the SSTV receiver because the operator OPENED the SSTV view.
+ *
+ * ⭐ Without this, the ordinary way to use SSTV — open the view, tune 14.230, wait
+ * for a picture — decoded nothing, because arming was manual, default-off and lost
+ * on every restart. RX only: this cannot key anything. Only ever an upgrade from
+ * off, and refused after an explicit Stop (the policy lives in the engine so it
+ * survives a remount). */
+export async function sstvAutoArm(): Promise<SstvState> {
+  return invoke<SstvState>('sstv_auto_arm')
+}
+
+/** Stop the SSTV receiver as part of an AUTOMATIC sequence — the ISS pass unwind at
+ * LOS, which disarms what it armed.
+ *
+ * ⚠️ NEVER `sstvArm(false)` for that: an explicit Stop is remembered for the session,
+ * so an automatic one would leave every later entry to the SSTV view refusing to
+ * start the receiver — the decoding bug again, one ISS pass later. */
+export async function sstvAutoDisarm(): Promise<SstvState> {
+  return invoke<SstvState>('sstv_auto_disarm')
+}
+
+/** Live SSTV RX state: in-flight progress + preview + the saved-image gallery
+ * (poll while the SSTV view is visible). */
+export async function getSstvState(): Promise<SstvState> {
+  return invoke<SstvState>('get_sstv_state')
+}
+
+/** Transmit an SSTV image: the webview cover-crops the picture to the mode's exact
+ * dimensions and passes raw row-major RGB (base64). `mode` is the stable slug
+ * ("pd120", "scottie1", "scottiedx", "martin1", …). Resolves to the fresh state
+ * (sending=true); rejects — with the reason — on a dimension mismatch or any TX gate
+ * being down. Human-initiated only: nothing keys until this is called. */
+export async function sstvSend(
+  rgbB64: string,
+  width: number,
+  height: number,
+  mode: string,
+  /** #50: the operator affirms THIS picture already shows their callsign (a pre-made QSO
+   *  card), so the ID plate is skipped rather than drawn over it. Per-image, never sticky. */
+  idInImage?: boolean,
+): Promise<SstvState> {
+  return invoke<SstvState>('sstv_send', {
+    mode,
+    width,
+    height,
+    rgbBase64: rgbB64,
+    idInImage: idInImage ?? false,
+  })
+}
+
+/** Stop the SSTV transmission now: abort the image in progress, drop the queued job,
+ * and unkey. */
+export async function sstvStop(): Promise<SstvState> {
+  return invoke<SstvState>('sstv_stop')
+}
+
+/** Set the TX period: true = even/"1st" slots, false = odd/"2nd". */
+export async function setTxCycleAuto(auto: boolean): Promise<AppSnapshot> {
+  return invoke<AppSnapshot>('set_tx_cycle_auto', { auto })
+}
+
+export async function setBeacon(on: boolean): Promise<AppSnapshot> {
+  return invoke<AppSnapshot>('set_beacon', { on })
+}
+
+export async function setTxEven(even: boolean): Promise<AppSnapshot> {
+  return invoke<AppSnapshot>('set_tx_even', { even })
+}
+
+/** Set the receive audio offset (Hz) — the green marker. TX follows unless Hold Tx. */
+export async function setRxOffset(hz: number): Promise<AppSnapshot> {
+  return invoke<AppSnapshot>('set_rx_offset', { hz })
+}
+
+/** Set the transmit audio offset (Hz) — the red marker. */
+export async function setTxOffset(hz: number): Promise<AppSnapshot> {
+  return invoke<AppSnapshot>('set_tx_offset', { hz })
+}
+
+/** Hold the TX offset fixed when RX changes ("Hold Tx Freq"). */
+export async function setHoldTxFreq(on: boolean): Promise<AppSnapshot> {
+  return invoke<AppSnapshot>('set_hold_tx_freq', { on })
+}
+
+/** Replace the blocked-callsigns list — the ONE write path (Alt-double-click gesture and
+ * the Settings editor). Narrow write: never routes through the heavyweight settings save,
+ * so it is safe mid-QSO. The auto-responder honors the list on the next slot. */
+export async function setBlockedCalls(calls: string[]): Promise<AppSnapshot> {
+  return invoke<AppSnapshot>('set_blocked_calls', { calls })
+}
+
+/** Set (or clear, with '') who is at the key — the ONE write path for the seat-swap chip,
+ * the Field Day panel's Operator field and the pop-out scoreboard. Narrow write: never the
+ * heavyweight settings save, which clears the TX queue and re-derives the TX cycle from the
+ * struct the caller happened to be holding (#54). A seat swap is a mid-QSO act by
+ * definition. (Since #100 that save no longer resets the operating mode — the other two
+ * effects are reason enough.) The engine trims + uppercases. */
+export async function setFdOperator(call: string): Promise<AppSnapshot> {
+  return invoke<AppSnapshot>('set_fd_operator', { call })
+}
+
+/** Load persisted operator + radio settings. */
+export async function getSettings(): Promise<Settings> {
+  return invoke<Settings>('get_settings')
+}
+
+/** Persist operator + radio settings; returns the updated snapshot. */
+export async function setSettings(settings: Settings): Promise<AppSnapshot> {
+  return invoke<AppSnapshot>('set_settings', { settings })
+}
+
+/** THE writer of the satellite uplink consent pair (VFO mapping + per-radio
+ * confirmation) — the pass rail's confirm/select and Settings ▸ Radio's
+ * mapping select both go through it. The pair is backend-owned live state
+ * (`set_settings` payloads cannot carry it), so a stale form snapshot can
+ * never resurrect a pruned consent. `radioId` = the RadioProfile.id the UI's
+ * copy named (the DTO's uplinkRadioId); omitted, the backend records the
+ * radio that is ACTIVE at write time — never a form snapshot's. `map`
+ * omitted = confirm the mapping IN FORCE, resolved by the backend at write
+ * time under the same rule: the rail's confirm for a mapping already in
+ * force sends none, because its DTO copy is poll-time state (round 4). An
+ * explicit pick (select, derived offer) always sends its map. */
+export async function confirmSatUplink(
+  map?: NonNullable<Settings['satVfoMap']>,
+  radioId?: number,
+): Promise<AppSnapshot> {
+  return invoke<AppSnapshot>('confirm_sat_uplink', { map, radioId })
+}
+
+/** Enumerate available serial / COM ports for rig control. */
+export async function getSerialPorts(): Promise<string[]> {
+  return invoke<string[]>('get_serial_ports')
+}
+
+export interface SerialPortInfo {
+  name: string
+  /** USB product string, e.g. "USB-Enhanced-SERIAL-B CH342" ("" for non-USB ports). */
+  label: string
+  /**
+   * Which interface of a multi-interface bridge this is. A CP2105 is DUAL and only interface 0
+   * carries CAT on the rigs this targets; interface 1 answers nothing and looks exactly like a
+   * dead radio. `undefined`/`null` means UNKNOWN (one interface, or no topology source) — never
+   * read it as 0.
+   */
+  interfaceIndex?: number | null
+  /**
+   * How many serial interfaces this USB device exposes in total.
+   *
+   * ⚠️ `interfaceIndex` is not usable without this. Plenty of single-interface devices number
+   * their one interface something other than 0 — an LG monitor's control port enumerates as
+   * interface 2 — so "index > 0" alone would tell an operator their only port is the wrong one.
+   * The advice only means something when there IS another port to have picked.
+   */
+  siblingPorts?: number | null
+  /**
+   * A sound card on the same physical USB device — i.e. inside the same radio. `null` for a plain
+   * serial adapter, which is correct, and `undefined` wherever topology is unavailable; both mean
+   * "nothing proven", so nothing may be refused on it.
+   *
+   * ⚠️ Weaker than `siblingPorts`: a rig's CAT bridge and its codec are separate USB devices
+   * behind the rig's own internal hub, so they can only be related by their PARENT — and two
+   * unrelated things in one external hub share a parent too. Warning-only for that reason.
+   */
+  pairedAudio?: string | null
+}
+
+/** Serial ports with a descriptive USB-product label (to tell dual-serial rigs apart). */
+export async function getSerialPortsDetailed(): Promise<SerialPortInfo[]> {
+  return invoke<SerialPortInfo[]>('get_serial_ports_detailed')
+}
+
+/** Post your own DX spot to the connected human cluster (rejects if none connected). */
+export async function postSpot(freqMhz: number, call: string, comment: string): Promise<void> {
+  return invoke('post_spot', { freqMhz, call, comment })
+}
+
+/** Upcoming contests from the WA7BNM calendar (rejects if the feed is unreachable). */
+export async function getContests(): Promise<import('./types').ContestEvent[]> {
+  return invoke<import('./types').ContestEvent[]>('get_contests')
+}
+
+/** Enumerate the CURATED (verified) Hamlib rig models as [modelNumber, name] pairs. */
+export async function getRigModels(): Promise<[number, string][]> {
+  return invoke<[number, string][]>('get_rig_models')
+}
+
+/** Enumerate the FULL Hamlib catalog (verified + extended) — for the Settings
+ *  "show all models" toggle and resolving a typed-in model number's name. */
+export async function getAllRigModels(): Promise<[number, string][]> {
+  return invoke<[number, string][]>('get_all_rig_models')
+}
+
+/** Models that need NO serial port — Dummy/NET/FLRig and the software-CAT profiles.
+ *  The rule lives in Rust (`rigmodels::portless_rig_models`) and is fetched rather than
+ *  duplicated here: its membership has changed before, and a stale copy would block saves that
+ *  are in fact correct. An empty array means the rule could not be read. */
+export async function getPortlessRigModels(): Promise<number[]> {
+  return invoke<number[]>('get_portless_rig_models')
+}
+
+/** Models whose CAT CW keyer is UNPROVEN and cannot report its own failure (today: the Yaesu
+ *  FTX-1). Drives a caution on the CW settings page — never a block, the keyer stays selectable.
+ *  The rule lives in Rust (`rigmodels::cat_cw_unproven_rig_models`) and is fetched rather than
+ *  duplicated here: membership changes as backends are fixed upstream, and a stale copy would
+ *  keep warning about a radio that had started working. An empty array means the rule could not
+ *  be read, and the caution is simply not shown. */
+export async function getCatCwUnprovenRigModels(): Promise<number[]> {
+  return invoke<number[]>('get_cat_cw_unproven_rig_models')
+}
+
+/** One keystroke to a configured SPE amplifier. The set is closed at the Rust boundary; an
+ *  unrecognised name is refused there rather than reaching an opcode.
+ *
+ *  Resolves false when the queue is full — surface that rather than swallowing it, because a
+ *  keystroke the operator watched themselves make and that vanished reads as a broken control.
+ *
+ *  The transmit interlock lives in the poll thread, not here: it holds a status frame from a
+ *  moment earlier and this layer has no reading of its own. Disabling the buttons while keyed
+ *  is a courtesy to the operator, never the thing that protects the amplifier. */
+export async function ampCommand(which: 'bandDown' | 'bandUp' | 'operate'): Promise<boolean> {
+  return invoke<boolean>('amp_command', { which })
+}
+
+/** Zero-config: scan connected USB radios → suggested model + port + paired audio. */
+export async function detectRigs(): Promise<DetectedRig[]> {
+  return invoke<DetectedRig[]>('detect_rigs')
+}
+
+/** Activators on the air now for the program ("POTA" | "SOTA") — the hunter feed. */
+export async function getOtaSpots(program: string): Promise<OtaSpot[]> {
+  return invoke<OtaSpot[]>('get_ota_spots', { program })
+}
+
+/** The NOAA planetary-K outlook (three days ahead). Cached 15 min server-side; an
+ *  EMPTY series means we have never had one, which the panel must say rather than
+ *  draw as a quiet sky. */
+export async function getKpForecast(): Promise<KpForecast> {
+  return invoke<KpForecast>('get_kp_forecast')
+}
+
+/** Activators placed for the Connect map's parks layer. Served from a shared cache
+ *  with its own TTL, so polling this does not add load to the POTA feed — POTA only,
+ *  because a SOTA spot carries no position to plot. */
+export async function getOtaMapSpots(): Promise<OtaMapSpot[]> {
+  return invoke<OtaMapSpot[]>('get_ota_map_spots')
+}
+
+/** Begin an activation (validates + normalizes the reference); returns the state. */
+export async function setActivation(program: string, reference: string): Promise<Activation> {
+  return invoke<Activation>('set_activation', { program, reference })
+}
+
+/** End the current activation. */
+export async function clearActivation(): Promise<Activation> {
+  return invoke<Activation>('clear_activation')
+}
+
+/** Read the current activation state. */
+export async function getActivation(): Promise<Activation> {
+  return invoke<Activation>('get_activation')
+}
+
+/** A park directory entry from the local searchable list. */
+export interface Park {
+  reference: string
+  name: string
+  grid: string
+  location: string
+  /** Coordinates — only the live lookup carries these. */
+  latitude?: number | null
+  longitude?: number | null
+}
+/** Search the local (offline) POTA park directory by reference prefix or name substring. */
+export async function searchParks(query: string, limit?: number): Promise<Park[]> {
+  return invoke<Park[]>('search_parks', { query, limit })
+}
+/** Exact local lookup by reference (offline, instant). null = malformed ref or not in the list. */
+export async function lookupPark(reference: string): Promise<Park | null> {
+  return invoke<Park | null>('lookup_park', { reference })
+}
+/** Live lookup of one park's details (name/grid/location + coordinates) from the POTA directory. */
+export async function lookupParkLive(reference: string): Promise<Park> {
+  return invoke<Park>('lookup_park_live', { reference })
+}
+/** How many parks are loaded locally (0 = not downloaded/imported yet). */
+export async function parksCount(): Promise<number> {
+  return invoke<number>('parks_count')
+}
+/** How many parks the operator imported from their Hunted Parks.CSV (0 = none). */
+export async function huntedParksCount(): Promise<number> {
+  return invoke<number>('hunted_parks_count')
+}
+/** Import a park directory from CSV text the operator downloaded. Returns the park count. */
+export async function importParksCsv(csv: string): Promise<number> {
+  return invoke<number>('import_parks_csv', { csv })
+}
+/** Download + cache the current POTA all-parks list for offline search. Returns the park count. */
+export async function downloadParks(): Promise<number> {
+  return invoke<number>('download_parks')
+}
+/** Import the operator's POTA "Hunted Parks.CSV" so those parks count as worked (drives the NEW
+ * PARK badge, including CW hunts the log can't know). Returns the imported park count. */
+export async function importHuntedParksCsv(csv: string): Promise<number> {
+  return invoke<number>('import_hunted_parks_csv', { csv })
+}
+
+/**
+ * Arm or disarm the native CI-V bus diagnostic log. When enabled, returns the path
+ * of the log file (in Downloads) that captures the raw CI-V traffic; when disabled,
+ * returns an empty string. A support tool for hardware-only faults like the IC-9700
+ * PTT flicker — off by default, not persisted.
+ */
+export async function civDiagnosticLog(enable: boolean): Promise<string> {
+  return invoke<string>('civ_diagnostic_log', { enable })
+}
+
+/**
+ * The active CI-V diagnostic-log path, or '' when logging is off. The Settings toggle
+ * queries this on mount so it reflects the real backend state — logging keeps running while
+ * you leave Settings to transmit, so the switch must not appear to reset (re-arming would
+ * truncate the capture).
+ */
+export async function civDiagnosticStatus(): Promise<string> {
+  return invoke<string>('civ_diagnostic_status', {})
+}
+
+/**
+ * Export the contest/contact log in the given format. Returns the serialized
+ * text (the caller saves it via a browser download). Rejects if there is no
+ * log to export (e.g. not in Field Day mode).
+ */
+export async function exportLog(format: 'cabrillo' | 'adif'): Promise<string> {
+  return invoke<string>('export_log', { format })
+}
+
+/**
+ * Subscribe to live snapshot updates. Returns an unsubscribe function. Polls the
+ * core a few times a second (a real build can swap this for a Tauri event
+ * listener; polling keeps the contract dependency-free).
+ */
+export function subscribeSnapshot(fn: (snap: AppSnapshot) => void): () => void {
+  let alive = true
+  // 300 ms: the dial-lag fix's real lever is the backend's fast ~180 ms dial read-back (was 750 ms),
+  // so a knob turn now tracks in well under a second even at this UI cadence, and wheel-tuning
+  // updates the readout instantly via the flushed set_frequency snapshot. Kept at 300 ms (not
+  // faster) because get_snapshot still does an O(roster×log) worked-before scan under the engine
+  // mutex — Wave 1 optimizes that scan, after which this can safely drop to ~150 ms.
+  const id = window.setInterval(() => {
+    if (!alive) return
+    invoke<AppSnapshot>('get_snapshot').then(fn).catch(() => {})
+  }, 300)
+  return () => {
+    alive = false
+    window.clearInterval(id)
+  }
+}
+
+/** Fetch the next waterfall row (a real Spectrum from the core). */
+export async function getSpectrumRow(_transmitting: boolean): Promise<Spectrum> {
+  return invoke<Spectrum>('get_spectrum_row')
+}
+
+/**
+ * Fetch one RIG SCOPE row, spread across the window the scope is actually drawing.
+ *
+ * Same 512 bins as `getSpectrumRow`, same bytes on the wire — but over `loHz..hiHz` instead of
+ * the full 0-4000 Hz capture, so the CW cockpit's 800 Hz pitch-centered view gets 1.5625 Hz
+ * bins rather than 7.8125. The span request rides this call; there is nothing to set up and
+ * nothing to tear down. Ask for a span the backend cannot honour (a native RF panadapter is live, or the numbers
+ * are not a sane audio window) and it returns exactly what `getSpectrumRow` would have — so a
+ * caller never has to branch on which row it got, only read the `loHz`/`hiHz` it came back with.
+ */
+export async function getScopeRow(
+  _transmitting: boolean,
+  loHz: number,
+  hiHz: number,
+  window?: ScopeWindow,
+): Promise<Spectrum> {
+  return invoke<Spectrum>('get_scope_row', { loHz, hiHz, window })
+}
+
+/**
+ * Analysis window length for the rig scope — a genuine time-versus-frequency trade, and the one
+ * scope control with no right answer for everybody.
+ *
+ *   fast     1024 —  85 ms — 46.9 Hz lobe — 25 WPM keying is VISIBLE
+ *   balanced 2048 — 171 ms — 23.4 Hz lobe — the shipped default; dits are never resolved
+ *   sharp    4096 — 341 ms — 11.7 Hz lobe — half the width, double the smear
+ *
+ * ⚠️ Mirrors `tempo_core::spectrum::WindowN` — the tags are the wire contract and an unknown one
+ * is treated as `balanced` by the backend, so an out-of-step UI degrades to today's picture
+ * rather than to a blank scope.
+ */
+export type ScopeWindow = 'fast' | 'balanced' | 'sharp'
+
+/** Set the MSK144 T/R period (5/10/15/30 s) — the cockpit's narrow write. Deliberately not a
+ * full settings save, which clears the TX queue and re-derives the TX cycle (#54; the mode
+ * reset it also used to do was narrowed to Field Day by #100). */
+export async function setMsk144Period(secs: number): Promise<AppSnapshot> {
+  return invoke<AppSnapshot>('set_msk144_period', { secs })
+}
+
+/** One Fast Graph power sample: raw 20 ms RMS, monotonic seq for delta polling. */
+export interface FastPowerSample {
+  seq: number
+  unixMs: number
+  rms: number
+}
+
+/** Fast-mode (MSK144) power trace since `sinceSeq` — the Fast Graph's poll. Meter bus only,
+ * no engine mutex, so pings keep rendering while the engine is busy decoding. */
+export async function getFastPower(sinceSeq: number): Promise<FastPowerSample[]> {
+  return invoke<FastPowerSample[]>('get_fast_power', { sinceSeq })
+}
+
+/** Fetch the live meters (RX audio level + CAT S-meter). Lock-free backend-side (no engine
+ * mutex), so it is safe to poll fast and a CAT stall cannot freeze it — one shared ~100 ms
+ * poll feeds every meter widget instead of riding the 300 ms snapshot (see `LiveMeters`). */
+export async function getMeters(): Promise<MeterReadout> {
+  return invoke<MeterReadout>('get_meters')
+}
+
+// ---------------------------------------------------------------------------
+// Coordinated QSY ("move together") — a separate, opt-in feature. No-ops when
+// disabled; everything announced in the clear (NOT private / NOT encrypted).
+// ---------------------------------------------------------------------------
+
+/** Enable / disable coordinated QSY (captures home + partner / returns home). */
+export async function qsySetEnabled(on: boolean): Promise<AppSnapshot> {
+  return invoke<AppSnapshot>('qsy_set_enabled', { on })
+}
+
+/** Set the QSY channel set (band-plan tokens) + announce cadence (overs/hop). */
+export async function qsyConfigure(channels: string[], cadence: number): Promise<AppSnapshot> {
+  return invoke<AppSnapshot>('qsy_configure', { channels, cadence })
+}
+
+/** Manual override: announce a move on the next over (initiator). */
+export async function qsyMoveNow(): Promise<AppSnapshot> {
+  return invoke<AppSnapshot>('qsy_move_now')
+}
+
+/** Manual override: hold the current channel (pause) or resume hopping. */
+export async function qsyPause(on: boolean): Promise<AppSnapshot> {
+  return invoke<AppSnapshot>('qsy_pause', { on })
+}
+
+/** Manual override: stop and return to the home channel. */
+export async function qsyStop(): Promise<AppSnapshot> {
+  return invoke<AppSnapshot>('qsy_stop')
+}
+
+// ── Program section (radio programming) ──────────────────────────────────────
+
+/** Search repeaters within a radius (km) of a point. Source (RepeaterBook with
+ * a stored token on US ground, else hearham) is resolved backend-side. */
+export async function repeaterSearch(
+  lat: number,
+  lon: number,
+  radiusKm: number,
+): Promise<RepeaterSearchResult> {
+  return invoke<RepeaterSearchResult>('repeater_search', { lat, lon, radiusKm })
+}
+
+/** City-name → candidates via OSM Nominatim (explicit Search click only). */
+export async function geocodeCity(query: string): Promise<GeoCandidate[]> {
+  return invoke<GeoCandidate[]>('geocode_city', { query })
+}
+
+/** Store (or clear, with '') the operator's RepeaterBook rbuapp_… token. */
+export async function setRepeaterbookToken(token: string): Promise<void> {
+  return invoke<void>('set_repeaterbook_token', { token })
+}
+
+/** All saved programming projects (radioprog.json beside settings.json). */
+export async function radioprogListProjects(): Promise<RadioProgProject[]> {
+  return invoke<RadioProgProject[]>('radioprog_list_projects')
+}
+
+/** Create/update one programming project (upsert by id). */
+export async function radioprogSaveProject(project: RadioProgProject): Promise<void> {
+  return invoke<void>('radioprog_save_project', { project })
+}
+
+/** Delete one programming project. */
+export async function radioprogDeleteProject(id: string): Promise<void> {
+  return invoke<void>('radioprog_delete_project', { id })
+}
+
+/** Render channels to an export format ('chirp' | 'csv'); returns the file text. */
+export async function exportChannels(
+  channels: ProgChannel[],
+  format: 'chirp' | 'csv',
+  nameCap: number,
+  attribution: string,
+): Promise<string> {
+  return invoke<string>('export_channels', { channels, format, nameCap, attribution })
+}
+
+/** Load the durable UI-state store (`ui-state.json`, beside settings.json). See
+ *  `features/durableStore.ts` for why some browser-storage keys are mirrored there. */
+export async function uiStateLoad(): Promise<Record<string, string>> {
+  return invoke<Record<string, string>>('ui_state_load')
+}
+
+/** Replace the durable UI-state store. Returns whether the write landed — the caller keeps
+ *  `localStorage` as a live fallback rather than trusting a save that did not happen. */
+export async function uiStateSave(state: Record<string, string>): Promise<boolean> {
+  return invoke<boolean>('ui_state_save', { state })
+}
+
+/** Distinct operators present in the log (#25). Empty for a single-op station — the Logbook
+ *  uses that to decide whether a per-operator export is worth offering at all. */
+export async function logOperators(): Promise<string[]> {
+  return invoke<string[]>('log_operators')
+}
+
+/** ADIF for ONE operator's contacts (#25). POTA and Field Day both require each operator to
+ *  submit their own log. */
+export async function exportLogForOperator(operator: string): Promise<string> {
+  return invoke<string>('export_log_for_operator', { operator })
+}
+
+/** Everything that makes this station THIS station, as one JSON file (#28) — settings plus the
+ *  durable UI state. Carries NO secrets: passwords and API keys live in the OS keychain, and the
+ *  ClubLog key is redacted because ClubLog auto-revokes one that becomes public. */
+export async function exportSettingsBundle(): Promise<string> {
+  return invoke<string>('export_settings_bundle')
+}
+
+/**
+ * Reset the configuration to factory defaults.
+ *
+ * Keeps the logbook (it lives outside the settings) and keeps stored credentials (they live in
+ * the OS keychain — `clear*` verbs forget those, deliberately separately). Applies through the
+ * same path a restore uses, so a running app reconfigures rather than writing the old config back.
+ */
+export async function resetSettings(): Promise<AppSnapshot> {
+  return invoke<AppSnapshot>('reset_settings')
+}
+
+/** Restore a bundle written by `exportSettingsBundle`. Refuses anything that is not one, by
+ *  name and schema — a partial restore is worse than a refusal. */
+export async function importSettingsBundle(text: string): Promise<AppSnapshot> {
+  return invoke<AppSnapshot>('import_settings_bundle', { text })
+}

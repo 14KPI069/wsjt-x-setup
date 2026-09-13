@@ -1,0 +1,296 @@
+// ⚠️ THIS FILE IS ON THE MIGRATED LIST (i18n/hardcoded-strings.test.ts). Every operator-visible
+// string comes from the catalog; a hardcoded one fails CI. What does NOT: the callsigns and
+// message previews in the recents list (data), and the presence CODE a dot's tooltip falls back
+// to ('active' / 'idle' / 'stale') — that is a state value off the wire, not a phrase, and it is
+// migrated with the presence vocabulary rather than spelled out here.
+
+import { useMemo, useState } from 'react'
+import type { Conversation as Conv, NeedAlert, NeedTag, Station, Tier } from '../types'
+import { StationCard } from './StationCard'
+import { tagsForSurface } from '../features/needs'
+import { matchAnyTerm } from '../searchQuery'
+import { t, type MessageKey } from '../i18n'
+
+type Presence = Station['presence'] | 'offline'
+
+type Filter = 'all' | 'heard-now' | 'beaconing' | 'needed'
+
+interface Props {
+  stations: Station[]
+  myGrid: string
+  currentSlot: number
+  activePeer: string | null
+  unreadByPeer: Record<string, number>
+  /** Top need tier per heard callsign (uppercased), for award-aware colouring. */
+  needByCall: Map<string, NeedTag>
+  /** ALL need forms per call (uppercased) — lets the roster show every reason a
+   * station is worth working (like the decode feed), not just the top tier. */
+  needAlertsByCall?: Map<string, NeedAlert[]>
+  /** The band and operating mode THIS roster is showing. The maps above are keyed by
+   * callsign alone and span every band and mode, so without these a need the operator
+   * cannot close here still paints a pill — a CW "new mode" on a 30m FT8 roster
+   * (operator report 2026-07-29). Omit both to keep the ungated behaviour. */
+  band?: string
+  feedMode?: string
+  onSelect: (call: string) => void
+  /** Work a station — the cockpit's shared positional signature, forwarded straight from the
+   * card so nothing in between can drop the grid or the offset it carries (#183). */
+  onCall: (
+    call: string,
+    grid?: string,
+    message?: string,
+    snr?: number,
+    freqHz?: number,
+    tier?: Tier | null,
+  ) => void
+  /** Open conversation threads (incl. the "*" band feed) — drives the recents list
+   * so a thread stays reachable after its peer drops off the live roster. */
+  conversations: Conv[]
+  /** Archive (hide) a conversation thread from the recents list. */
+  onArchive: (peer: string) => void
+  /** Whether the "*" band feed is the current selection. */
+  bandActive: boolean
+  /** Unread CQs/broadcasts on the "*" band feed (0 = none / currently viewing). */
+  bandUnread: number
+  /** Select the "*" band feed (Call CQ + open broadcasts). */
+  onSelectBand: () => void
+  /** FT-mode roster flush (operator 2026-07-24): drop a station once it hasn't been
+   * decoded for this many T/R cycles — the same 3-cycle rule as the Call Roster, so
+   * the list shows who's on the band NOW. Unset (the Tempo chat roster) keeps the
+   * long presence retention that store-and-forward delivery depends on. */
+  dropAfterCycles?: number
+}
+
+/** The filter `id`s are persisted-shaped tokens; only the labels are prose. */
+const FILTERS: { id: Filter; labelKey: MessageKey }[] = [
+  { id: 'all', labelKey: 'roster.filter.all' },
+  { id: 'heard-now', labelKey: 'roster.filter.heardNow' },
+  { id: 'beaconing', labelKey: 'roster.filter.beaconing' },
+  { id: 'needed', labelKey: 'roster.filter.needed' },
+]
+
+export function StationList({
+  stations,
+  myGrid,
+  currentSlot,
+  activePeer,
+  unreadByPeer,
+  needByCall,
+  needAlertsByCall,
+  onSelect,
+  onCall,
+  conversations,
+  onArchive,
+  bandActive,
+  bandUnread,
+  onSelectBand,
+  dropAfterCycles,
+  band,
+  feedMode,
+}: Props) {
+  const [filter, setFilter] = useState<Filter>('all')
+  // The search box. Deliberately NOT persisted: a filter chip is a way of working and
+  // survives the session, but a search is a thing you are doing right now, and finding
+  // yesterday's `PA*` still narrowing a 478-station list on the next band is a bug report
+  // waiting to happen. Esc clears it, which is also the way out for anyone who typed into
+  // it by accident and cannot see why the band went quiet.
+  const [query, setQuery] = useState('')
+
+  // The full set of need tags per call — union of every alert's tags, deduped, falling
+  // back to the single top tier when the alerts map isn't provided. This is what lets
+  // the roster show the SAME pills the decode feed does (operator report: pills appeared
+  // in Band Activity / Rx Frequency but not the roster) — and, since the decode feed
+  // gates by band + mode class, the roster must gate identically or it shows pills the
+  // feed correctly withholds. `tagsForSurface` is that shared gate.
+  const needAll = (call: string, top: NeedTag | null): NeedTag[] => {
+    const alerts = needAlertsByCall?.get(call.toUpperCase())
+    if (alerts && alerts.length > 0) {
+      const seen = new Set<NeedTag>()
+      for (const a of alerts) {
+        const tags = band != null && feedMode != null ? tagsForSurface(a, band, feedMode) : a.tags
+        for (const t of tags) seen.add(t)
+      }
+      // An alert that applies to no tag HERE means nothing is needed on this surface —
+      // don't fall back to the ungated top tier, that's the bug this gate exists for.
+      return [...seen]
+    }
+    return top ? [top] : []
+  }
+
+  // Live presence per heard call, so a recents row shows whether that station is
+  // still on the band (or has gone offline since you last chatted).
+  const presenceByCall = useMemo(() => {
+    const m = new Map<string, Station['presence']>()
+    for (const s of stations) m.set(s.call.toUpperCase(), s.presence)
+    return m
+  }, [stations])
+
+  // Recent conversation threads (excluding the "*" band feed, which has its own
+  // pinned row), newest activity first — the "who have I been talking to" list.
+  const recents = useMemo(() => {
+    return conversations
+      .filter((c) => c.peer !== '*' && c.messages.length > 0)
+      .map((c) => {
+        const last = c.messages[c.messages.length - 1]
+        const presence: Presence = presenceByCall.get(c.peer.toUpperCase()) ?? 'offline'
+        return { peer: c.peer, preview: last.text, lastSlot: last.slot, presence }
+      })
+      .sort((a, b) => b.lastSlot - a.lastSlot)
+  }, [conversations, presenceByCall])
+
+  const filtered = useMemo(() => {
+    let list = stations
+    // The search runs FIRST and against the callsign alone — this list is a column of
+    // calls, and matching the country or the grid behind them would make `ON4*` quietly
+    // return Ontario-nothing and Belgium-everything. `PA* ON4*` is two prefixes the
+    // operator wants, so the terms are alternatives (searchQuery.ts owns that ruling).
+    const matches = matchAnyTerm(query)
+    if (matches) list = list.filter((s) => matches(s.call))
+    // Decode-cycle flush (FT cockpit only): count MISSED DECODE CYCLES, not wall time.
+    if (dropAfterCycles != null) {
+      list = list.filter((s) => currentSlot - s.lastHeardSlot <= dropAfterCycles)
+    }
+    if (filter === 'heard-now') list = list.filter((s) => s.presence === 'active')
+    else if (filter === 'beaconing') list = list.filter((s) => s.heardCount >= 3)
+    // "Needed" means needed HERE — a station whose only need is on another band or in
+    // another mode class isn't workable off this filter, so gate it the same way the
+    // pills are gated (otherwise the filter and the pills disagree on the same row).
+    else if (filter === 'needed')
+      list = list.filter(
+        (s) => needAll(s.call, needByCall.get(s.call.toUpperCase()) ?? null).length > 0,
+      )
+    // sort: presence (active first), then strongest SNR
+    const order: Record<string, number> = { active: 0, idle: 1, stale: 2 }
+    return [...list].sort(
+      (a, b) => order[a.presence] - order[b.presence] || b.snr - a.snr,
+    )
+  }, [stations, filter, query, needByCall, needAlertsByCall, band, feedMode, currentSlot, dropAfterCycles])
+
+  return (
+    <aside className="station-list panel">
+      <div className="panel-header">
+        <h2>{t('roster.title')}</h2>
+        {/* The badge counts what is ON SCREEN, with the total beside it when a filter or a
+            search is holding something back (the Spots panel's idiom). It used to show the
+            total unconditionally, which read as "478 stations" over a list of three. */}
+        <span className="count-badge">{filtered.length}</span>
+        {filtered.length !== stations.length && (
+          <span className="count-badge count-badge-total">
+            {t('roster.countFiltered', { count: stations.length })}
+          </span>
+        )}
+      </div>
+      <button
+        type="button"
+        className={`band-row${bandActive ? ' active' : ''}`}
+        onClick={onSelectBand}
+        title={t('roster.band.title')}
+      >
+        <span className="band-row-star" aria-hidden="true">
+          ★
+        </span>
+        {t('roster.band.label')}
+        {!bandActive && bandUnread > 0 && <span className="unread-badge">{bandUnread}</span>}
+      </button>
+      {recents.length > 0 && (
+        <div className="recent-chats" aria-label={t('roster.recents.aria')}>
+          <div className="recent-head">{t('roster.recents.head')}</div>
+          {recents.map((r) => (
+            <div
+              key={r.peer}
+              className={`recent-row${r.peer === activePeer ? ' active' : ''}`}
+            >
+              <button
+                type="button"
+                className="recent-open"
+                onClick={() => onSelect(r.peer)}
+                title={t('roster.recents.open', { call: r.peer })}
+              >
+                <span
+                  className={`presence-dot ${r.presence}`}
+                  aria-hidden="true"
+                  title={r.presence === 'offline' ? t('roster.recents.offline') : r.presence}
+                />
+                <span className="recent-call">{r.peer}</span>
+                <span className="recent-preview">{r.preview}</span>
+                {r.peer !== activePeer && (unreadByPeer[r.peer] ?? 0) > 0 && (
+                  <span className="unread-badge">{unreadByPeer[r.peer]}</span>
+                )}
+              </button>
+              <button
+                type="button"
+                className="recent-archive"
+                onClick={() => onArchive(r.peer)}
+                title={t('roster.recents.archive.title')}
+                aria-label={t('roster.recents.archive.aria', { call: r.peer })}
+              >
+                ✕
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+      {recents.length > 0 && <div className="roster-head">{t('roster.onBandNow')}</div>}
+      {/* The chips and the search share one row, which is where the operator asked for it.
+          The `role="tablist"` moved onto the chip group rather than the row: a tablist may
+          only contain tabs, and a textbox inside one is read out wrong by every screen
+          reader. The row keeps `.filter-row` so its padding and rule are the shipped ones. */}
+      <div className="filter-row station-filter-row">
+        <div className="station-filter-tabs" role="tablist" aria-label={t('roster.filter.aria')}>
+          {FILTERS.map((f) => (
+            <button
+              key={f.id}
+              type="button"
+              role="tab"
+              aria-selected={filter === f.id}
+              className={`filter-chip${filter === f.id ? ' active' : ''}`}
+              onClick={() => setFilter(f.id)}
+            >
+              {t(f.labelKey)}
+            </button>
+          ))}
+        </div>
+        <span className="station-search">
+          <input
+            type="search"
+            value={query}
+            placeholder={t('roster.search.placeholder')}
+            onChange={(e) => setQuery(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === 'Escape') setQuery('')
+            }}
+            aria-label={t('roster.search.label')}
+            title={t('roster.search.title')}
+          />
+          {query && (
+            <button
+              type="button"
+              className="station-search-clear"
+              onClick={() => setQuery('')}
+              title={t('roster.search.clear')}
+            >
+              ✕
+            </button>
+          )}
+        </span>
+      </div>
+      <div className="station-scroll">
+        {filtered.length === 0 && <p className="empty">{t('roster.empty')}</p>}
+        {filtered.map((s) => (
+          <StationCard
+            key={s.call}
+            station={s}
+            myGrid={myGrid}
+            currentSlot={currentSlot}
+            selected={s.call === activePeer}
+            unread={unreadByPeer[s.call] ?? 0}
+            need={needByCall.get(s.call.toUpperCase()) ?? null}
+            needAll={needAll(s.call, needByCall.get(s.call.toUpperCase()) ?? null)}
+            onSelect={onSelect}
+            onCall={onCall}
+          />
+        ))}
+      </div>
+    </aside>
+  )
+}

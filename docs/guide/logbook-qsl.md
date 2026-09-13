@@ -1,0 +1,139 @@
+# Logbook & QSL
+
+The logbook is Nexus's system of record: a persistent ADIF 3.1.4 store with full
+round-trip fidelity. It holds callsign, grid, entity, state, band, frequency,
+mode, the string RSTs each mode actually uses (FT8's "−12" and CW's "599" are
+both first-class), name/QTH, notes, POTA/SOTA references, and a per-QSO upload
+state for every online service — so "what has actually been uploaded where"
+survives restarts.
+
+<!-- TODO: capture screenshot — the logbook table with the QSL column and confirmation marks -->
+
+## The tour
+
+Each row is one QSO. The columns you'll use most:
+
+- **Call, band, mode, date/time, RST** — the contact itself.
+- **Entity / DXCC** — resolved from cty.dat, first-class in the table.
+- **QSL** — *which source* confirmed the contact:
+  - **L** — LoTW,
+  - **C** — a paper card,
+  - **E** — eQSL.
+
+  Hover for the eligibility tooltip. **eQSL is clearly labelled non-award**: an
+  E confirmation counts as a confirmation but not toward DXCC/WAS (ARRL doesn't
+  accept eQSL). This matters — see [Awards & Journey](awards-journey.md).
+
+**Search** matches callsigns *and grids*. The **"needs confirmation"** chip
+beside the search box filters to contacts without an award-eligible (LoTW/paper)
+confirmation — a QSL you've *requested* but not received still counts as
+unconfirmed and stays in that list.
+
+<!-- TODO: capture screenshot — the QSL column tooltip explaining L / C / E eligibility -->
+
+## Core workflows
+
+### Add or edit a QSO by hand
+
+Press **Log QSO** for the manual entry form. It seeds the draft from **what you
+were actually running**: log a contact from the [Phone cockpit](phone.md) and the
+draft says SSB, from [CW](cw.md) it says CW — no more accidental "FT8" voice
+contacts. Edit any field inline; the store round-trips to ADIF, so an export
+re-imports without loss.
+
+When the open form stands taller than the pane holding it — 1024×768 at a large
+UI zoom is where you meet this — the pane scrolls and the **Log** button that
+commits the contact is one drag away. It is a scrollbar rather than more room:
+nothing moves at any window size where the form already fits.
+
+### Upload to LoTW
+
+1. Set your **LoTW Station Location** (and optionally the TQSL path) in
+   [Settings ▸ Logging & Connectors](settings-reference.md#confirmations).
+   Nexus signs through *your installed TQSL* against that named Station Location
+   — no certificate or password is stored by Nexus.
+2. Click **Upload to LoTW** in the logbook. The button shows the count of
+   un-uploaded QSOs; it signs and uploads the unsent batch. If you would rather
+   not remember, turn on **Upload to LoTW automatically** in the same Settings
+   group and Nexus runs that batch every few hours. It stops and waits for you if
+   a batch is ever refused, and it is unavailable while *Sign from ADIF location*
+   is on — that mode signs everything from wherever you are now, so it needs you
+   to pick the moment.
+3. Pull confirmations back with **Download confirmations** (Settings ▸ Logging &
+   Connectors ▸ LoTW). That button only goes one way, *down*; the upload is step 2
+   above. The first pull covers your whole history; later ones are incremental.
+   Pulling also
+   marks which of *your* uploads LoTW holds on file, so a pending contact reads
+   "waiting on the other op," not "never uploaded."
+
+   Purging the logbook resets that incremental position, so the next sync after a
+   purge pulls your whole history again rather than only what LoTW has matched
+   since you last synced.
+
+   You can also feed Nexus a report you downloaded from the LoTW website by hand —
+   either **Sync confirmations** (which only ever updates contacts you already
+   have) or **Import ADIF** works. Import adds any contacts the file has that you
+   lack *and* applies the confirmations and award credits to the ones you already
+   hold; its toast reports the two separately, so "0 imported, 24,163 existing QSOs
+   updated" is the normal and correct result for a confirmation download.
+
+### Push a single QSO to QRZ / ClubLog / HRDLog / WRL
+
+Auto-upload (configured per service in
+[Settings ▸ Logging & Connectors](settings-reference.md#confirmations)) pushes
+each QSO as you log it. When one fails — a service was down, a key was
+wrong — the logbook gives you a **per-row re-push** for **QRZ**, **ClubLog**,
+**HRDLog.net**, and **World Radio League** so you can retry that one contact
+after fixing the cause. A "duplicate" result is the benign "already there"
+answer, not an error.
+
+### World Radio League
+
+Paste your WRL API key in Settings ▸ Logging & Connectors and it is verified
+against your WRL account the moment you save it — your destination logbook is
+found automatically. From then on every contact flows to WRL as you log it (the
+auto-push switch is beside the key), and each logbook row carries a WRL button
+for anything logged earlier. Bringing an existing log across? **Export for WRL**
+writes an ADIF shaped for WRL's own bulk importer — the right road for thousands
+of historical contacts, which would otherwise trickle through a rate-limited
+API one at a time.
+
+### Mark a QSL sent
+
+When you send a card or request, record it on the contact with **Mark QSL sent**,
+choosing the method — **bureau**, **direct**, or **electronic**. The row then
+shows a quiet "QSL sent … via …" note. Marking a request sent does **not**
+confirm the contact — it stays in the "needs confirmation" list until the reply
+comes back.
+
+### Understand why a contact isn't confirmed
+
+A per-QSO **diagnostics** view explains why award credit hasn't landed yet — no
+upload sent, waiting on the partner, a date mismatch — with one-click fixes where
+they exist. Reconciliation tolerates ±1 day of midnight skew and matches by
+mode-class, so an FT4-vs-FT8 labelling difference doesn't orphan a confirmation.
+
+## How uploads flow
+
+Uploads happen in the **backend log funnel**: when a QSO is logged, the
+configured connectors push it. You don't push from the logbook UI for the
+auto-upload path — the per-row buttons are for *recovery* when an automatic push
+failed. Credentials live only in the **OS keychain**; the Connections panel reads
+back presence ("credential stored"), never the secret itself.
+
+## Honest limits
+
+- **eQSL never counts toward LoTW-grade awards** — it's a separate confirmation
+  tier, enforced everywhere credit is computed.
+- **HRDLog.net and World Radio League are logging/awards sites, not ARRL
+  confirmation sources** — an upload there never earns DXCC/WAS credit.
+- **Nexus doesn't store your TQSL certificate or LoTW signing password** — LoTW
+  signing is delegated to your installed TQSL.
+
+## Related guides
+
+- [Awards & Journey](awards-journey.md)
+- [Stats](stats.md) — these same records counted by band, mode, year and entity
+- [Settings reference — Confirmations](settings-reference.md#confirmations)
+- [Operate — FT8/FT4 digital](operate-digital.md)
+- [Contesting & POTA/SOTA](contesting-pota.md)

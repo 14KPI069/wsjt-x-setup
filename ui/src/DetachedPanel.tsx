@@ -1,0 +1,777 @@
+// Standalone-window renderer: when the app is loaded at `?panel=<name>` (a torn-off
+// window created by open_panel_window), render JUST that panel — chrome-less, with its
+// own polling — against the same shared engine the main window uses. Multi-monitor
+// tear-off: pop Connect / DXpeditions / the Operate cockpit / the Needed board onto
+// separate displays so the operator stops toggling. Each detached window is its own
+// independent client of the one shared Rust engine (snapshot at 300 ms; the Waterfall
+// self-fetches its spectrum), and its action callbacks drive the same engine, so state
+// stays consistent across every window.
+//
+// ⚠️ THIS FILE IS ON THE MIGRATED LIST (i18n/hardcoded-strings.test.ts). It is a router: the
+// panels it mounts own their own prose. What is here is the states the router itself can be
+// in — connecting, Field Day off, club sync off, and a panel name it does not know — plus the
+// conversation-delete guard, which it deliberately raises in the SAME words as the main
+// window (the two mirrors drifting apart is what put the guard here). The club-sync-off copy
+// is the router's because it is about a panel that ISN'T mounted: it names the Settings route
+// that would fill the board, and the board component never renders in that state.
+import { useEffect, useMemo, useState, type CSSProperties, type ReactNode } from 'react'
+import { t } from './i18n'
+import { confirmDialog, ConfirmHost } from './confirm'
+import type {
+  AppSnapshot,
+  BandChannel,
+  Conversation as Conv,
+  ModeRequest,
+  NeedAlert,
+  PropagationSnapshot,
+  Settings,
+  SourceKind,
+  SpotRow,
+  Tier,
+} from './types'
+import {
+  getBandPlan,
+  getNeedAlerts,
+  getPropagation,
+  getSettings,
+  getAllSpots,
+  getLog,
+  selectPeer,
+  archiveConversation,
+  setFrequency,
+  workSpot,
+  subscribeSnapshot,
+  callStation,
+  setTier,
+  setSource,
+  setTxLevel,
+  setMode,
+  setTxEven,
+  setTxCycleAuto,
+  qsoResend,
+  qsoFreetext,
+  logCurrentQso,
+  overrideNextTx,
+  haltTx,
+  setRxOffset,
+  setTxOffset,
+  pointRotatorAtCall,
+  setTxEnabled,
+  setTune,
+  setHoldTxFreq,
+  dockBandmapWindow,
+  setSettings as persistSettings,
+  setFdOperator,
+  setSidebandOverride,
+} from './api'
+import { markRecalled, memoriesStore, planRecall, type Memory } from './features/memories'
+import { bandLabelForMhz } from './band'
+import { MemoriesView } from './components/MemoriesView'
+import { NeededPanel } from './components/NeededPanel'
+import { PotaSotaView } from './components/PotaSotaView'
+import { BandMap } from './components/BandMap'
+import { ConnectView } from './components/ConnectView'
+import { DxpeditionsView } from './components/DxpeditionsView'
+import { SatellitesView } from './components/SatellitesView'
+import { Toasts } from './components/Toasts'
+import { OperateCockpit } from './components/OperateCockpit'
+import { FdClubSection, FieldDayScoreboard, FdBandOccupancy } from './components/FieldDayView'
+import { Waterfall } from './components/Waterfall'
+import { FT_PALETTE_SCOPE } from './waterfallPalette'
+import { StationList } from './components/StationList'
+import { visibleNeeds, modeClassOf, workTarget, alertsByCall, activityTypeByCall, topNeedByCall } from './features/needs'
+import { OPERATE_PANELS, usePanelLayout } from './features/panelState'
+import { surfaceGet, surfaceSet } from './features/windowScope'
+import { readEnabledModes } from './useFeatures'
+import { useTheme } from './useTheme'
+import { useFieldMode } from './useFieldMode'
+import { useScale } from './useScale'
+import { useViewport } from './useViewport'
+import { useDensity } from './useDensity'
+import { useMotion } from './useMotion'
+
+type SpotTarget = { call: string; band: string; mode: string | null; freqMhz: number | null }
+type OperateLayout = 'classic' | 'roster'
+
+// The club board's SYNC-OFF panel. Inline off the shared tokens (the FieldDayView
+// idiom) rather than a styles.css section: four elements in one branch. Set larger
+// than body copy for the same reason the board itself is — this window is read from
+// the operating position, and the route is something the operator retypes elsewhere.
+const FDCLUB_OFF_WRAP: CSSProperties = {
+  display: 'flex',
+  flexDirection: 'column',
+  gap: 12,
+  margin: 'auto',
+  maxWidth: 620,
+  padding: '0 32px',
+}
+const FDCLUB_OFF_HEAD: CSSProperties = {
+  margin: 0,
+  fontSize: 22,
+  fontWeight: 700,
+  color: 'var(--text)',
+}
+const FDCLUB_OFF_BODY: CSSProperties = {
+  margin: 0,
+  fontSize: 16,
+  lineHeight: 1.5,
+  color: 'var(--text-dim)',
+}
+const FDCLUB_OFF_ROUTE: CSSProperties = {
+  margin: 0,
+  padding: '12px 14px',
+  borderRadius: 'var(--radius)',
+  border: '1px solid var(--border)',
+  background: 'var(--bg-elev-2)',
+  fontSize: 16,
+  lineHeight: 1.5,
+  color: 'var(--text)',
+}
+const FDCLUB_OFF_WAIT: CSSProperties = {
+  margin: 0,
+  fontSize: 14,
+  color: 'var(--text-faint)',
+}
+
+// PER-SURFACE, like App's 'nexus.operateLayout'. NB these are two differently-spelled keys
+// for one concept and already disagreed before this change — deliberately left as-is here,
+// because merging them would alter what the main window reads off disk.
+function loadOperateLayout(): OperateLayout {
+  // Roster is the default; only an explicit 'classic' choice keeps Classic.
+  return surfaceGet('nexus.operate.layout') === 'classic' ? 'classic' : 'roster'
+}
+
+/** A torn-off window is a SEPARATE JS REALM, not another branch of the main window's tree, so
+ *  it needs its own confirm host: `confirmDialog` resolves through a module-level global, and in
+ *  this document that global is `null` until something mounts one here. Without it the guarded
+ *  action fails closed — it logs and answers "no" — which is how the ✕ on a conversation in this
+ *  panel did nothing at all.
+ *
+ *  Mounted ONCE around the whole panel rather than beside each branch, because the body below
+ *  returns from fifteen of them. Per-branch would reproduce the very bug this fixes: a host
+ *  present in one tree and absent in another, failing silently in whichever branch someone
+ *  forgets. The dialog portals (`RD.Portal`), so where this sits in the tree has no bearing on
+ *  layout — only on whether it exists at all.
+ *
+ *  ⚠️ `<Toasts/>` CANNOT BE HOISTED TO SIT BESIDE IT, AND THAT IS NOT AN OVERSIGHT. `zoom` lives
+ *  on `.app` (styles.css) and the toast viewport sizes itself against `--vh-eff`, so a host
+ *  outside the branch's `.app` renders at the wrong scale in a window the operator has zoomed.
+ *  It has to be INSIDE that tree — which is why no branch writes its own
+ *  `<div className="app detached">` any more and every one returns [`DetachedShell`], which
+ *  carries the host. A new branch then gets one by construction and cannot omit it.
+ *
+ *  It WAS per-branch, and the Memories pop-out — one of the seven that never mounted one —
+ *  turned that into data loss: its bulk delete asks "Delete 40 memories?", promises in the
+ *  confirm body that "the toast that follows can undo it", deletes, and then the Undo it just
+ *  promised does not exist, because `pushToast` resolves through a module-level bus and that
+ *  document rendered nothing to receive it. */
+export function DetachedPanel({ panel }: { panel: string }) {
+  return (
+    <>
+      <DetachedPanelBody panel={panel} />
+      <ConfirmHost />
+    </>
+  )
+}
+
+/** The root of every pop-out branch: the zoomed `.app` tree plus this window's toast host.
+ *  Use this, never a bare `<div className="app detached">` — see the warning above. */
+function DetachedShell({ className, children }: { className?: string; children?: ReactNode }) {
+  return (
+    <div className={className ? `app detached ${className}` : 'app detached'}>
+      {children}
+      <Toasts />
+    </div>
+  )
+}
+
+function DetachedPanelBody({ panel }: { panel: string }) {
+  const [theme] = useTheme()
+  // Pop-outs follow field mode: a separate document re-applies the attribute itself, the
+  // same way it mirrors the theme — outdoors is a fact about the station, not a window.
+  const [fieldMode] = useFieldMode()
+  // A torn-off window is its OWN document — it must publish the same layout/responsive
+  // state the main app does, or the CSS falls back to the broken narrow/stacked layout
+  // (vertical rails go horizontal, the map collapses to zero height). Mirror App.tsx.
+  const { scale } = useScale(fieldMode)
+  useViewport(scale)
+  useDensity()
+  useMotion()
+  const [snap, setSnap] = useState<AppSnapshot | null>(null)
+  const [settings, setSettings] = useState<Settings | null>(null)
+  // Waterfall pop-out ⇄ dock: while this torn-off waterfall window lives, the main cockpit hides
+  // its docked copy so the decode lists + roster get the room. On close (or unmount) we clear the
+  // flag; the main window's `storage` listener then re-docks automatically. The main cockpit also
+  // has an always-visible manual "re-dock" as the fallback if this never fires.
+  useEffect(() => {
+    if (panel !== 'waterfall') return
+    const KEY = 'nexus.waterfall.detached'
+    localStorage.setItem(KEY, '1')
+    const clear = () => localStorage.setItem(KEY, '0')
+    window.addEventListener('beforeunload', clear)
+    return () => {
+      clear()
+      window.removeEventListener('beforeunload', clear)
+    }
+  }, [panel])
+  const [prop, setProp] = useState<PropagationSnapshot | null>(null)
+  const [needAlerts, setNeedAlerts] = useState<NeedAlert[]>([])
+  const [bandPlan, setBandPlan] = useState<BandChannel[]>([])
+  const [operateLayout, setOperateLayout] = useState<OperateLayout>(loadOperateLayout)
+  // This window is its OWN surface (instance `w1` by default), so its ⊞ Panels choices
+  // are independent of the docked cockpit's — that is the whole point of keying the
+  // record per surface instead of one app-global flag.
+  const operatePanels = usePanelLayout(OPERATE_PANELS)
+  // Band-map pop-out only: the live spot feed + which calls are in the log (worked).
+  const isBandMap = panel === 'bandmapPhone' || panel === 'bandmapCw'
+  const [allSpots, setAllSpots] = useState<SpotRow[]>([])
+  const [workedCalls, setWorkedCalls] = useState<Set<string>>(() => new Set())
+  // Selection mirrors the shared engine (snap.activePeer), so a station picked in the main
+  // window — or in this one — highlights consistently across every window.
+  const selected = snap?.activePeer ?? null
+
+  // Live snapshot (decodes, stations, radio) — same 300 ms cadence as the main window.
+  useEffect(() => subscribeSnapshot(setSnap), [])
+
+  // Refetch the band plan when the tier changes — FT8/FT4 use different dial frequencies
+  // (14.074 vs 14.080), so a detached Operate window's QSY targets must follow the mode.
+  useEffect(() => {
+    let live = true
+    getBandPlan().then((b) => live && setBandPlan(b)).catch(() => {})
+    return () => {
+      live = false
+    }
+  }, [snap?.link.tier])
+
+  // Propagation + needs + band plan + settings: this window polls the shared engine.
+  useEffect(() => {
+    let live = true
+    const loadProp = () => getPropagation().then((p) => live && setProp(p)).catch(() => {})
+    const loadNeeds = () => getNeedAlerts().then((a) => live && setNeedAlerts(a)).catch(() => {})
+    // Settings aren't in the snapshot, so poll them too — otherwise a preferRrr / QSO-macro
+    // change in the main window never reaches the detached cockpit.
+    const loadSettings = () => getSettings().then((s) => live && setSettings(s)).catch(() => {})
+    loadProp()
+    loadNeeds()
+    loadSettings()
+    getBandPlan().then((b) => live && setBandPlan(b)).catch(() => {})
+    const idP = setInterval(loadProp, 10_000)
+    const idN = setInterval(loadNeeds, 15_000)
+    const idS = setInterval(loadSettings, 15_000)
+    return () => {
+      live = false
+      clearInterval(idP)
+      clearInterval(idN)
+      clearInterval(idS)
+    }
+  }, [])
+
+  // Band-map pop-out: poll the live spot feed + refresh the worked-set (log calls) alongside it.
+  useEffect(() => {
+    if (!isBandMap) return
+    let live = true
+    const load = () => {
+      getAllSpots().then((s) => live && setAllSpots(s)).catch(() => {})
+      getLog()
+        .then((log) => live && setWorkedCalls(new Set(log.map((q) => q.call.toUpperCase()))))
+        .catch(() => {})
+    }
+    load()
+    const id = setInterval(load, 15_000)
+    return () => {
+      live = false
+      clearInterval(id)
+    }
+  }, [isBandMap])
+
+  // Drive a command then mirror the returned snapshot immediately (the 300 ms poll would
+  // catch it anyway, but this keeps the cockpit snappy).
+  const apply = (p: Promise<AppSnapshot>) => {
+    void p.then((s) => s && setSnap(s)).catch(() => {})
+  }
+
+  // `freqMhz` is the spot's exact frequency (source of truth — DXpeditions run off the
+  // standard dial); fall back to the band's dial only when the spot has no frequency.
+  const qsyBand = (band: string, freqMhz?: number) => {
+    const ch = bandPlan.find((c) => c.band === band)
+    if (ch) apply(setFrequency(freqMhz ?? ch.dialMhz, ch.band, ch.mode))
+  }
+  const onSelect = (call: string | null) => {
+    // Drives the shared engine; `selected` then reflects it via the snapshot.
+    // `null` is a real command — it clears the engine's active peer (deselect on
+    // empty-map click / ✕ / re-click a dot); swallowing it left selection stuck.
+    void selectPeer(call).catch(() => {})
+  }
+  // Mirrors App.tsx's handleArchive — the detached window had a silent no-op here, so the
+  // ✕ did nothing at all in this panel.
+  const onArchive = async (peer: string) => {
+    if (
+      !(await confirmDialog({
+        title: t('shell.conversation.delete.title', { peer }),
+        body: t('shell.conversation.delete.body'),
+        confirmLabel: t('shell.conversation.delete.action'),
+        danger: true,
+      }))
+    )
+      return
+    apply(archiveConversation(peer))
+  }
+  const onWorkSpot = (t: SpotTarget) => {
+    const mode = modeClassOf(t.mode).toLowerCase() as 'cw' | 'phone' | 'digital'
+    if (t.freqMhz != null) apply(workSpot(mode, t.freqMhz, t.band, t.call))
+    else qsyBand(t.band)
+  }
+  // Work a decoded/roster station from the cockpit (guards the self-QSO false toast).
+  const onCall = (call: string, grid?: string, message?: string, snr?: number, freq?: number) => {
+    const me = (snap?.mycall ?? '').trim().toUpperCase().split('/')[0]
+    if (me && call.trim().toUpperCase().split('/')[0] === me) return
+    apply(callStation(call, grid, message, snr, freq))
+  }
+  const onTune = (hz: number, target: 'tx' | 'rx' | 'both') => {
+    if (target === 'rx') apply(setRxOffset(hz))
+    else if (target === 'tx') apply(setTxOffset(hz))
+    else apply(setTxOffset(hz).then(() => setRxOffset(hz)))
+  }
+  const changeLayout = (m: OperateLayout) => {
+    setOperateLayout(m)
+    surfaceSet('nexus.operate.layout', m)
+  }
+
+  // The per-type alert band scopes, exactly as App builds them — a torn-off surface must
+  // not disagree with the docked one about which need icons this band earns.
+  const needScopes = useMemo(
+    () => ({
+      dxcc: settings?.alertDxccBands,
+      grid: settings?.alertGridBands,
+      rareGrid: settings?.alertRareGridBands,
+    }),
+    [settings?.alertDxccBands, settings?.alertGridBands, settings?.alertRareGridBands],
+  )
+  // Connect's map colours stations by need the SAME way the docked map does — gated by the
+  // operator's enabled modes (the Needed board has its own per-mode toggles separately) and
+  // by the band scopes, which govern the icons as well as the alerts.
+  const gatedAlerts = useMemo(
+    () => visibleNeeds(needAlerts, readEnabledModes(), needScopes),
+    [needAlerts, needScopes],
+  )
+  // The SHARED chain, same as App.tsx — the hand-rolled loop this replaces was
+  // the pre-fix last-tag-wins map (backend orders alerts priority-DESCENDING,
+  // so "last" was reliably the WEAKEST need): a new entity on the band in
+  // front of you painted in the dim confirmation colour, but only on the
+  // pop-out, so the two windows disagreed about the same callsign.
+  const grouped = useMemo(() => alertsByCall(gatedAlerts), [gatedAlerts])
+  const needByCall = useMemo(() => topNeedByCall(grouped), [grouped])
+  const typeByCall = useMemo(() => activityTypeByCall(gatedAlerts), [gatedAlerts])
+  const needAlertsByCall = grouped
+
+  if (isBandMap) {
+    if (!snap) return <DetachedShell />
+    const spotMode: 'CW' | 'Phone' = panel === 'bandmapCw' ? 'CW' : 'Phone'
+    return (
+      <DetachedShell>
+        <BandMap
+          band={snap.radio.band}
+          dialMhz={snap.radio.dialMhz}
+          txAllowed={snap.radio.txAllowed}
+          // Phone-segment shade is meaningless on the CW map (matches the inline CW strip).
+          phoneSegLo={spotMode === 'Phone' ? snap.radio.phoneSegLo : null}
+          phoneSegHi={spotMode === 'Phone' ? snap.radio.phoneSegHi : null}
+          spots={allSpots}
+          spotMode={spotMode}
+          needByCall={needByCall}
+          typeByCall={typeByCall}
+          workedCalls={workedCalls}
+          onDock={(side) => void dockBandmapWindow(side)}
+          // Tuning from the map (#39). The map is a frequency scale, so it can act as one.
+          sideband={snap.radio.sideband || 'USB'}
+          tuneEnabled={
+            snap.radio.catOk === true && !snap.radio.txBusyReason && !snap.radio.transmitting
+          }
+          onSnap={setSnap}
+          onWorkSpot={(s) =>
+            onWorkSpot({ call: s.call, band: s.band, mode: s.mode, freqMhz: s.freqMhz })
+          }
+        />
+      </DetachedShell>
+    )
+  }
+
+  if (panel === 'waterfall') {
+    // The FT8/digital waterfall, torn off — it self-fetches its spectrum; clicks tune
+    // the shared engine's RX/TX offsets exactly like the in-cockpit strip. `app` is
+    // load-bearing: zoom lives on `.app` (styles.css), and this was the ONE branch
+    // missing it — the window ignored the operator's UI scale while its Toasts measured
+    // a --vh-eff computed for a zoom that never applied.
+    return (
+      <DetachedShell className="detached-waterfall">
+        <Waterfall
+          transmitting={snap?.radio.transmitting ?? false}
+          rxOffsetHz={snap?.radio.rxOffsetHz ?? 1500}
+          txOffsetHz={snap?.radio.txOffsetHz ?? 1500}
+          theme={theme}
+          onTune={(hz, target) => {
+            if (target === 'rx' || target === 'both') void setRxOffset(hz)
+            if (target === 'tx' || target === 'both') void setTxOffset(hz)
+          }}
+          active
+          paletteScope={FT_PALETTE_SCOPE}
+          txBlanks // the torn-off FT waterfall — same surface, same 13 s over.
+        />
+      </DetachedShell>
+    )
+  }
+
+  if (panel === 'needed') {
+    return (
+      <DetachedShell>
+        <NeededPanel
+          // Full un-gated list — the board's own mode toggles decide what shows.
+          alerts={needAlerts}
+          bandPlan={bandPlan}
+          selectedCall={selected}
+          myGrid={snap?.mygrid ?? ''}
+          onQsy={(a) => qsyBand(a.band, a.freqMhz ?? undefined)}
+          onSelect={onSelect}
+          // Full work path from the pop-out too: the atomic workSpot switches the
+          // rig's MODE + exact frequency (a bare QSY left CW clicks in DATA-U),
+          // and its snapshot nav-hint (workTick) makes the MAIN window follow to
+          // the matching cockpit — this window can't navigate it directly.
+          onWork={(a) => {
+            const t = workTarget(a, bandPlan)
+            if (!t) {
+              qsyBand(a.band, a.freqMhz ?? undefined)
+              return
+            }
+            // The board lists ALL modes, but the CW/Phone cockpits are opt-in features.
+            // If the target cockpit is disabled, the MAIN window's nav-hint effect refuses
+            // to follow (same gate as handleWorkNeeded) — so a workSpot would silently
+            // switch the rig into a hidden mode with no UI. Just QSY to the spot instead.
+            const modes = readEnabledModes()
+            if ((t.view === 'cw' && !modes.cw) || (t.view === 'phone' && !modes.phone)) {
+              qsyBand(a.band, a.freqMhz ?? undefined)
+              return
+            }
+            const opMode = t.view === 'operate' ? 'digital' : t.view
+            // A digital spot's FT8/FT4 protocol rides the same atomic call (the engine
+            // no-ops on a same-tier request) — the pop-out used to not switch the tier at
+            // all, leaving an FT4 click decoding FT8, and doing it as a second call would
+            // recreate the main window's default-dial-first double retune.
+            const m = a.mode?.toUpperCase()
+            const spotTier = opMode === 'digital' && (m === 'FT4' || m === 'FT8') ? m : undefined
+            apply(workSpot(opMode, t.freqMhz, t.band, t.call, spotTier))
+          }}
+        />
+      </DetachedShell>
+    )
+  }
+
+  if (panel === 'memories') {
+    // Memories, torn off. The bank lives in localStorage and the store already syncs
+    // across windows via the 'storage' event, so edits here appear in the main window
+    // live (and vice versa). Recall mirrors App's recallMemory minus navigation: the
+    // atomic workSpot tunes the shared engine, and the MAIN window follows to the
+    // right cockpit via the same snapshot nav-hint the Needed pop-out uses.
+    const recall = (m: Memory) => {
+      const plan = planRecall(m)
+      const target = plan.view
+      const opMode: 'digital' | 'phone' | 'cw' = target === 'operate' ? 'digital' : target
+      const modes = readEnabledModes()
+      if ((target === 'cw' && !modes.cw) || (target === 'phone' && !modes.phone)) {
+        return // cockpit disabled — the main window's Settings gate applies
+      }
+      const mode = m.mode.toUpperCase()
+      const band = bandLabelForMhz(plan.freqMhz)
+      void (async () => {
+        const patch = plan.settingsPatch
+        if (patch) {
+          const cur = await getSettings()
+          const isFm = patch.rptrShift !== undefined
+          if (isFm || patch.phoneMode !== cur.phoneMode) {
+            await persistSettings({ ...cur, ...patch })
+          }
+        }
+        const s2 = await workSpot(opMode, plan.freqMhz, band)
+        if (!s2) return
+        apply(Promise.resolve(s2))
+        if (target === 'phone' && (mode === 'USB' || mode === 'LSB')) {
+          await setSidebandOverride(mode as 'USB' | 'LSB')
+        }
+        memoriesStore.update((b) => markRecalled(b, m.id, Math.floor(Date.now() / 1000)))
+      })()
+    }
+    return (
+      <DetachedShell>
+        <MemoriesView
+          dialMhz={snap?.radio.dialMhz ?? 0}
+          dialMode={snap?.radio.rigMode || snap?.radio.sideband || 'USB'}
+          myGrid={snap?.mygrid ?? ''}
+          onRecall={recall}
+        />
+      </DetachedShell>
+    )
+  }
+
+  if (panel === 'connect') {
+    return (
+      <DetachedShell>
+        <ConnectView
+          myGrid={snap?.mygrid ?? ''}
+          theme={theme}
+          stations={snap?.stations ?? []}
+          prop={prop}
+          selectedCall={selected}
+          onSelectCall={onSelect}
+          needByCall={needByCall}
+          onWorkSpot={onWorkSpot}
+          needAlerts={gatedAlerts}
+          amp={snap?.radio.amp ?? null}
+          onPoint={
+            // Same rotator gate as App (model-launched rotctld OR external host);
+            // silent fire-and-forget — detached windows have no toast host.
+            (settings?.rotatorModel ?? 0) > 0 || settings?.rotatorHost?.trim()
+              ? (call) => void pointRotatorAtCall(call).catch(() => {})
+              : undefined
+          }
+        />
+      </DetachedShell>
+    )
+  }
+
+  if (panel === 'dxped') {
+    return (
+      <DetachedShell>
+        <DxpeditionsView snap={prop} onWorkSpot={onWorkSpot} onShowOnMap={onSelect} />
+      </DetachedShell>
+    )
+  }
+
+  if (panel === 'pota') {
+    // The POTA/SOTA hunter, torn off — the pop-out its PER-SURFACE filter records
+    // were built for: a POTA board beside a SOTA board, each window keeping its own
+    // program/filter/sort. The board needs snap.hunt for its banner, so wait for the
+    // first snapshot like the Operate arm. Its own toasts (hunt set/cleared, refresh
+    // errors) are silent here — fire-and-forget with no toast host is the detached
+    // pattern (see the Connect arm's onPoint).
+    if (!snap) {
+      return (
+        <DetachedShell>
+          <div className="app loading">
+            <span>{t('detached.connecting')}</span>
+          </div>
+        </DetachedShell>
+      )
+    }
+    return (
+      <DetachedShell>
+        <PotaSotaView
+          snap={snap}
+          onSnap={setSnap}
+          detached
+          // The board has already called setHuntTarget itself (and handed us the
+          // fresh snapshot via onSnap); this half is the QSY + rig-mode switch —
+          // the same atomic workSpot the Needed arm uses, with its same guard: a
+          // spot whose cockpit is a DISABLED feature only QSYs, because the main
+          // window's nav-hint effect would refuse to follow a hidden mode.
+          onHunt={(a) => {
+            const modes = readEnabledModes()
+            const view = a.modeClass === 'CW' ? 'cw' : a.modeClass === 'Phone' ? 'phone' : 'operate'
+            if ((view === 'cw' && !modes.cw) || (view === 'phone' && !modes.phone)) {
+              qsyBand(a.band, a.freqMhz)
+              return
+            }
+            const opMode = view === 'operate' ? 'digital' : view
+            apply(workSpot(opMode, a.freqMhz, a.band, a.call))
+          }}
+        />
+      </DetachedShell>
+    )
+  }
+
+  if (panel === 'sats') {
+    return (
+      <DetachedShell>
+        <SatellitesView snap={snap} />
+      </DetachedShell>
+    )
+  }
+
+  if (panel === 'fieldday') {
+    const fd = snap?.fieldDay ?? null
+    return (
+      <DetachedShell>
+        {fd ? (
+          <FieldDayScoreboard
+            fieldDay={fd}
+            settings={settings}
+            detached
+            onSaveOperator={(call) => {
+              if (!settings) return
+              const op = call.trim().toUpperCase()
+              setSettings({ ...settings, fdOperator: op }) // optimistic local mirror (useState)
+              // Narrow write, not the whole-struct save: a seat swap is mid-QSO by
+              // definition and the heavyweight path would end it (#54).
+              apply(setFdOperator(op)) // persist + mirror the returned snapshot
+            }}
+          />
+        ) : (
+          <div className="app loading">
+            <span>{t('detached.fieldDay.inactive')}</span>
+          </div>
+        )}
+        {/* WHO IS ON WHICH BAND, in the window the operator already tears off beside the
+            operator box — the place they asked for it. One row per band, so an empty row
+            is the answer to "where can I move?". Only while a club event is running; a
+            single-station Field Day has no bands to compete for. */}
+        {fd?.club ? <FdBandOccupancy club={fd.club} big /> : null}
+      </DetachedShell>
+    )
+  }
+
+  if (panel === 'fdclub') {
+    // The CLUB BAND BOARD, torn off — who is on what band across every
+    // position on site, parked on a second monitor so the crew can keep up
+    // (the `fieldday` pop-out beside it is the scoreboard, a different
+    // surface). Read-only: no export buttons, because their success toast has
+    // no host in a detached window, and no operator box — this board is about
+    // the other tents, not this one.
+    //
+    // THREE states, not two, and the split is the findability fix. The rail
+    // opens this window whenever Field Day is on, so most operators arrive here
+    // BEFORE club sync exists; an empty board would be the same dead end that
+    // hid the feature. Waiting for the first snapshot is its own state because
+    // it is true for the first 300 ms of every launch, and "no snapshot yet" is
+    // not the claim "sync is off".
+    if (!snap) {
+      return (
+        <DetachedShell>
+          <div className="app loading">
+            <span>{t('detached.connecting')}</span>
+          </div>
+        </DetachedShell>
+      )
+    }
+    const club = snap.fieldDay?.club ?? null
+    // ⚠️ "NO CLUB DATA" IS NOT "SYNC IS OFF", and conflating them made this window lie to
+    // the one operator it exists for. The whole `fieldDay` block is built only inside the
+    // engine's Field Day mode, so it is absent the moment the operator steps into any other
+    // section — one click on the rail does it — regardless of hosting. The host would open
+    // the board on a second monitor, click away to check something, and watch a live board
+    // become the words "Club sync is off" plus instructions to switch on the hosting that
+    // was never switched off. Ask the SETTINGS whether sync is configured, which is true
+    // wherever the operator happens to be standing.
+    const syncConfigured =
+      settings?.fdHostEnable === true || (settings?.fdJoinAddr ?? '').trim() !== ''
+    return (
+      <DetachedShell>
+        {club ? (
+          <FdClubSection club={club} detached />
+        ) : syncConfigured ? (
+          // Configured, but this window cannot see the club right now — the operator is
+          // simply somewhere else in the app. Say that, and say nothing about settings.
+          <div style={FDCLUB_OFF_WRAP}>
+            <h2 style={FDCLUB_OFF_HEAD}>{t('detached.fdClub.away.head')}</h2>
+            <p style={FDCLUB_OFF_BODY}>{t('detached.fdClub.away.body')}</p>
+          </div>
+        ) : (
+          // Named in the words printed on the Settings tab, because this window
+          // cannot deep-link into the main window's panel — a detached window is a
+          // separate JS realm with no route into it, so the route has to be
+          // readable and followed by hand.
+          <div style={FDCLUB_OFF_WRAP}>
+            <h2 style={FDCLUB_OFF_HEAD}>{t('detached.fdClub.off.head')}</h2>
+            <p style={FDCLUB_OFF_BODY}>{t('detached.fdClub.off.body')}</p>
+            <p style={FDCLUB_OFF_ROUTE}>{t('detached.fdClub.off.route')}</p>
+            <p style={FDCLUB_OFF_WAIT}>{t('detached.fdClub.off.wait')}</p>
+          </div>
+        )}
+      </DetachedShell>
+    )
+  }
+
+  if (panel === 'operate') {
+    if (!snap) {
+      return (
+        <DetachedShell>
+          <div className="app loading">
+            <span>{t('detached.connecting')}</span>
+          </div>
+        </DetachedShell>
+      )
+    }
+    // The cockpit's Call Roster — a wired StationList. Chat-overlay props (unread, archive)
+    // are simplified in the detached Operate window; the roster itself is fully live.
+    const roster = (
+      <StationList
+        stations={snap.stations}
+        myGrid={snap.mygrid}
+        currentSlot={snap.radio.slot}
+        activePeer={selected}
+        dropAfterCycles={3}
+        unreadByPeer={{}}
+        needByCall={needByCall}
+        needAlertsByCall={needAlertsByCall}
+        band={snap.radio.band}
+        feedMode={snap.link.tier}
+        onSelect={onSelect}
+        onCall={onCall}
+        conversations={snap.conversations as Conv[]}
+        onArchive={onArchive}
+        bandActive={selected === '*'}
+        bandUnread={0}
+        onSelectBand={() => onSelect('*')}
+      />
+    )
+    return (
+      <DetachedShell className="operate-detached">
+        <OperateCockpit
+          snap={snap}
+          theme={theme}
+          tier={snap.link.tier}
+          onTierChange={(t: Tier) => apply(setTier(t))}
+          bandPlan={bandPlan}
+          onSetFrequency={(dialMhz: number, band: string, mode: string) =>
+            apply(setFrequency(dialMhz, band, mode))
+          }
+          onSourceChange={(k: SourceKind) => apply(setSource(k))}
+          onTune={onTune}
+          onCall={onCall}
+          onSetTxLevel={(lvl: number) => apply(setTxLevel(lvl))}
+          onSetMode={(m: ModeRequest) => apply(setMode(m))}
+          onSetTxEven={(even: boolean) => apply(setTxEven(even))}
+          onSetTxCycleAuto={(auto: boolean) => apply(setTxCycleAuto(auto))}
+          onResend={() => apply(qsoResend())}
+          onFreetext={(text: string) => apply(qsoFreetext(text))}
+          onLog={() => apply(logCurrentQso().then((r) => r.snapshot))}
+          onOverrideTx={(call: string, grid: string | null, text: string) =>
+            apply(overrideNextTx(call, grid, text))
+          }
+          onHaltTx={() => apply(haltTx())}
+          onSetTxEnabled={(on: boolean) => apply(setTxEnabled(on))}
+          onSetTune={(on: boolean) => apply(setTune(on))}
+          onSetHoldTxFreq={(on: boolean) => apply(setHoldTxFreq(on))}
+          onSnap={setSnap}
+          preferRrr={settings?.preferRrr ?? false}
+          qsoMacros={settings?.macros.qso ?? []}
+          roster={roster}
+          needByCall={needByCall}
+          needAlertsByCall={needAlertsByCall}
+          needScopes={needScopes}
+          selectedCall={selected}
+          onSelect={onSelect}
+          layoutMode={operateLayout}
+          onLayoutMode={changeLayout}
+          panels={operatePanels}
+          active
+        />
+      </DetachedShell>
+    )
+  }
+
+  return (
+    <DetachedShell>
+      <div className="app loading">
+        <span>{t('detached.unavailable', { panel })}</span>
+      </div>
+    </DetachedShell>
+  )
+}

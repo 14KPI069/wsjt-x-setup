@@ -1,0 +1,36 @@
+[package]
+publish = false
+name = "tempo-core"
+version = "0.2.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Nexus transceiver core — slot timing, virtual-air channel, TX/RX engine over the FT1 modem"
+
+[lints]
+workspace = true
+
+[dependencies]
+tempo-fast = { path = "../tempo-fast" }
+modes = { path = "../modes" }
+wspr = { path = "../wspr" }
+# Fixed-size real FFT for the waterfall power spectrum (MIT). Zero-alloc, ~2 transitive deps —
+# an exact fit for the compile-time 4096-sample window.
+microfft = "0.6"
+# The Field Day ruleset loader (fd_rules: the bundled fd_rules.seed.json +
+# install_from for a downloaded fd-rules.json). Both crates were already in the
+# workspace lock (tempo-app, tempo-audio, propagation…), so this adds nothing
+# new to the tree — it promotes serde_json from this crate's dev-deps to real.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+# (serde_json is a real dependency above since the fd_rules data loader — the
+# WSJT-X predicate-oracle tests and the fd_rules integration tests use it too.)
+# Q65 TX helpers (tone spacing / bandwidth / over length) for the encode_wav_q65
+# parity CLI. DEV-ONLY: examples are never shipped, and tempo-core itself does not
+# depend on any modem crate. q65 depends only on tempo-fast-sys, so no cycle.
+q65 = { path = "../q65" }
+fst4 = { path = "../fst4" }
+msk144 = { path = "../msk144" }
+jt65 = { path = "../jt65" }

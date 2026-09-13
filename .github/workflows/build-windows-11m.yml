@@ -1,0 +1,80 @@
+name: Build Nexus Windows 11m
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  DEEPCW_RELEASE: deepcw-model-v1
+  MODEL_SHA: a7b3b4aa2610d3e88b8c7d4420eceee31be2d0ae595b3413264334f3ffb1eab5
+  MODEL_JSON_SHA: b4342157b90229ee7380e165f3d8036179b80d1e6ae02f2557388b7fcd558c01
+
+jobs:
+  build-windows:
+    name: Build Windows installer (NSIS)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Get source
+        uses: actions/checkout@v4
+
+      - name: Download DeepCW model required by the build
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p src-tauri/resources/deepcw
+          gh release download "$DEEPCW_RELEASE" --repo "${{ github.repository }}" \
+            --pattern 'model.onnx*' --dir src-tauri/resources/deepcw --clobber
+          echo "$MODEL_SHA  src-tauri/resources/deepcw/model.onnx" | sha256sum -c -
+          echo "$MODEL_JSON_SHA  src-tauri/resources/deepcw/model.onnx.json" | sha256sum -c -
+
+      - name: Install Windows cross-compiler and NSIS
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64 gfortran-mingw-w64-x86-64 \
+            binutils-mingw-w64-x86-64 libboost-dev cmake ninja-build build-essential \
+            nsis python3 python3-pip
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.93.1
+          targets: x86_64-pc-windows-gnu
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+
+      - name: Install Tauri CLI
+        run: cargo install tauri-cli --version '^2' --locked
+
+      - name: Build Nexus 11m Windows installer
+        run: bash scripts/build-windows-cross.sh
+
+      - name: Check installer
+        run: |
+          set -euo pipefail
+          exe=$(find src-tauri/target/x86_64-pc-windows-gnu/release/bundle/nsis -name '*-setup.exe' -print -quit)
+          test -n "$exe" || { echo 'ERREUR: aucun Setup.exe produit'; exit 1; }
+          size=$(stat -c%s "$exe")
+          echo "Setup trouvé: $exe"
+          echo "Taille: $size octets"
+          test "$size" -gt 50000000 || { echo 'ERREUR: installateur anormalement petit'; exit 1; }
+          mkdir -p artifact
+          cp "$exe" artifact/
+          cp "$exe.sig" artifact/ 2>/dev/null || true
+          sha256sum artifact/*
+
+      - name: Publish Setup.exe as downloadable artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Nexus-1.10.3-11m-Windows-Setup
+          path: artifact/*
+          if-no-files-found: error
+          retention-days: 14

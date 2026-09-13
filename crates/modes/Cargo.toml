@@ -1,0 +1,23 @@
+[package]
+publish = false
+name = "modes"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Nexus mode + signal-source abstractions: a pluggable Mode trait (FT8/FT4/FT1) and a user-selectable SignalSource (native engine vs WSJT-X over UDP)"
+
+[lints]
+workspace = true
+
+[dependencies]
+tempo-fast = { path = "../tempo-fast" }
+ft8 = { path = "../ft8" }
+ft4 = { path = "../ft4" }
+ft2 = { path = "../ft2" }
+fst4 = { path = "../fst4" }
+q65 = { path = "../q65" }
+msk144 = { path = "../msk144" }
+jt65 = { path = "../jt65" }
+wspr = { path = "../wspr" }
+tempo-net = { path = "../tempo-net" }
