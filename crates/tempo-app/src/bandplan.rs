@@ -969,18 +969,17 @@ mod tests {
             ),
             "6 m is band-wide data at every class"
         );
-        assert!(!tx_allowed(
-            LicenseClass::Extra,
-            14.300,
-            OperatingMode::CW
-        ));
+       assert!(!tx_allowed(LicenseClass::Extra, 14.300, OperatingMode::CW));
     }
 
     #[test]
     fn plan_is_nonempty_and_well_formed() {
         let plan = band_plan();
         assert!(plan.len() >= 14, "expect HF + VHF/UHF channels");
-        let b11 = plan.iter().find(|c| c.band == "11m").expect("11m DX channel present");
+       let b11 = plan
+        .iter()
+        .find(|c| c.band == "11m")
+        .expect("11m DX channel present");
         assert!((b11.dial_mhz - 27.555).abs() < 1e-9, "11m DX dial = 27.555 MHz");
         assert!(!b11.tx, "11m DX channel is receive-only");
         for c in &plan {
