@@ -29,7 +29,7 @@ pub fn g_sfi(band: Band, sfi: f32) -> f32 {
             x if x >= 80.0 => 0.6,
             _ => 0.2,
         },
-        Band::B12 | Band::B10 => match sfi {
+        Band::B12 | Band::B10 | Band::B11 => match sfi {
             x if x >= 150.0 => 1.0,
             x if x >= 100.0 => 0.6,
             x if x >= 80.0 => 0.25,
