@@ -430,7 +430,7 @@ pub fn band_for_dial(dial_mhz: f64) -> Option<&'static str> {
 }
 
 #[cfg(test)]
-mod tests {
+mod tests { 
     use super::*;
 
     #[test]
@@ -498,4 +498,5 @@ mod tests {
         !tx_allowed(LicenseClass::Extra, 14.300, OperatingMode::Cw),
         "a Extra must not key 14.300 CW"
     );
+}
 }
