@@ -8,7 +8,8 @@ export interface LatLon {
   lon: number
 }
 
-export function gridToLatLon(grid: string): LatLon | null {
+export function gridToLatLon(grid: string | undefined | null): LatLon | null {
+    if (!grid || typeof grid !== 'string') return null
   const g = grid.trim().toUpperCase()
   if (g.length < 4) return null
   const A = 'A'.charCodeAt(0)
