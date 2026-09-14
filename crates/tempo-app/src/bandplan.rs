@@ -239,7 +239,14 @@ pub fn ft2_band_plan() -> Vec<BandChannel> {
     vec![
         ch("160m", "HF", 1.843000, "USB", "160 m · FT2", n),
         ch("80m", "HF", 3.578000, "USB", "80 m · FT2", n),
-        ch("60m", "HF", 5.360000, "USB", "60 m · FT2", "Decodium FT2 calling frequency — check your own band plan"),
+        ch(
+            "60m",
+            "HF",
+            5.360000,
+            "USB",
+            "60 m · FT2",
+            "Decodium FT2 calling frequency — check your own band plan",
+        ),
         ch("40m", "HF", 7.062000, "USB", "40 m · FT2", n),
         ch("30m", "HF", 10.144000, "USB", "30 m · FT2", n),
         ch("20m", "HF", 14.084000, "USB", "20 m · FT2", n),
@@ -248,9 +255,23 @@ pub fn ft2_band_plan() -> Vec<BandChannel> {
         ch("12m", "HF", 24.923000, "USB", "12 m · FT2", n),
         ch("10m", "HF", 28.184000, "USB", "10 m · FT2", n),
         ch("6m", "VHF", 50.316000, "USB", "6 m · FT2", n),
-        ch("4m", "VHF", 70.157000, "USB", "4 m · FT2", "Decodium FT2 calling frequency — IARU Region 1 only"),
+        ch(
+            "4m",
+            "VHF",
+            70.157000,
+            "USB",
+            "4 m · FT2",
+            "Decodium FT2 calling frequency — IARU Region 1 only",
+        ),
         ch("2m", "VHF", 144.177000, "USB", "2 m · FT2", n),
-        ch("1.25m", "VHF", 222.177000, "USB", "1.25 m · FT2", "Decodium FT2 calling frequency — IARU Region 2 only"),
+        ch(
+            "1.25m",
+            "VHF",
+            222.177000,
+            "USB",
+            "1.25 m · FT2",
+            "Decodium FT2 calling frequency — IARU Region 2 only",
+        ),
         ch("70cm", "UHF", 432.177000, "USB", "70cm · FT2", n),
         ch("23cm", "UHF", 1296.177000, "USB", "23cm · FT2", n),
     ]
@@ -459,9 +480,34 @@ mod tests {
         };
         let off = 0.001;
 
-        assert!(!tx_allowed(LicenseClass::Technician, dial("40m") + off, OperatingMode::Cw));
-        assert!(tx_allowed(LicenseClass::Technician, dial("10m") + off, OperatingMode::Cw));
-        assert!(tx_allowed(LicenseClass::Technician, dial("6m") + off, OperatingMode::Cw));
-        assert!(!tx_allowed(LicenseClass::Extra, 14.300, OperatingMode::Cw));
+        assert!(
+            !tx_allowed(
+                LicenseClass::Technician,
+                dial("40m") + off,
+                OperatingMode::Cw
+            ),
+            "a Technician must not key 40 m CW"
+        );
+        assert!(
+            tx_allowed(
+                LicenseClass::Technician,
+                dial("10m") + off,
+                OperatingMode::Cw
+            ),
+            "10 m CW is inside Technician privileges"
+        );
+        assert!(
+            tx_allowed(
+                LicenseClass::Technician,
+                dial("6m") + off,
+                OperatingMode::Cw
+            ),
+            "6 m CW is inside Technician privileges"
+        );
+        assert!(!tx_allowed(
+            LicenseClass::Extra,
+            14.300,
+            OperatingMode::Cw
+        ));
     }
 }
