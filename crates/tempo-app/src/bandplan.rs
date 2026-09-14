@@ -490,17 +490,15 @@ mod tests {
             ),
             "10 m CW is inside Technician privileges"
         );
-        assert!(
-            tx_allowed(
-                LicenseClass::Technician,
-                dial("6m") + off,
-                OperatingMode::Cw
-        ),
-            "6 m CW is inside Technician privileges"
-        );
-  assert!(
-    !tx_allowed(LicenseClass::Extra, 14.300, OperatingMode::Cw),
-    "a Extra must not key 14.300 CW"
+      assert!(
+        tx_allowed(LicenseClass::Technician, dial("6m") + off, OperatingMode::Cw),
+        "6 m CW is inside Technician privileges"
+    );
+    assert!(
+        !tx_allowed(LicenseClass::Extra, 14.300, OperatingMode::Cw),
+        "a Extra must not key 14.300 CW"
+    );
+}
 );
 }
 }
