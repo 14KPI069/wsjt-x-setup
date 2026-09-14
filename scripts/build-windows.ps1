@@ -37,6 +37,6 @@ $env:CHERE_INVOKING = '1'
 
 $u = (& $bash -lc "cygpath -u '$hereFwd'").Trim()
 $forward = ($args -join ' ')
-Write-Host "Running build-windows.sh in MSYS2 UCRT64 ($msys)…" -ForegroundColor Cyan
-& $bash -lc "'$u/build-windows.sh' $forward"
+Write-Host "Running build-windows-cross.sh in MSYS2 UCRT64 ($msys)..." -ForegroundColor Cyan
+& $bash -lc "'$u/build-windows-cross.sh' $forward"
 exit $LASTEXITCODE
