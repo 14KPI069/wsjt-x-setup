@@ -98,7 +98,7 @@ pub fn band_plan() -> Vec<BandChannel> {
         // 11 m / CB DX is included for RECEIVE + cluster monitoring. 27.555 MHz is a
         // widely used international DX calling frequency but is outside the French CB
         // allocation; never present it as an amateur-band transmit authorization.
-       {
+        {
             let mut c = ch("11m", "HF", 27.5550, "USB", "11 m · Bande complète & DX 27.555", "Bande des 11 mètres / Citizen Band et fréquences DX internationales");
             c.tx = true;
             c
@@ -282,8 +282,8 @@ pub fn q65_band_plan() -> Vec<BandChannel> {
         ch("33cm", "VHF", 902.065000, "USB", "33cm · Q65", n),
         ch("23cm", "VHF", 1296.065000, "USB", "23cm · Q65", n),
         ch("13cm", "VHF", 2301.065000, "USB", "13cm · Q65", n),
-        ch("13cm-2", "VHF", 2304.065000, "USB", "13cm · Q65", n),
-        ch("13cm-3", "VHF", 2320.065000, "USB", "13cm · Q65", n),
+        ch("13cm-2", "VHF", 2304.065000, "USB", "13cm-2 · Q65", n),
+        ch("13cm-3", "VHF", 2320.065000, "USB", "13cm-3 · Q65", n),
         ch("9cm", "VHF", 3400.065000, "USB", "9cm · Q65", n),
         ch("6cm", "VHF", 5760.200000, "USB", "6cm · Q65", n),
         ch("3cm", "VHF", 10368.200000, "USB", "3cm · Q65", n),
@@ -430,7 +430,7 @@ pub fn band_for_dial(dial_mhz: f64) -> Option<&'static str> {
 }
 
 #[cfg(test)]
-mod tests { 
+mod tests {
     use super::*;
 
     #[test]
@@ -458,7 +458,7 @@ mod tests {
         let plan = band_plan();
         assert!(plan.len() >= 14);
         let b11 = plan.iter().find(|c| c.band == "11m").expect("11m present");
-       assert!(b11.tx);
+        assert!(b11.tx);
     }
 
     #[test]
@@ -490,13 +490,16 @@ mod tests {
             ),
             "10 m CW is inside Technician privileges"
         );
-      assert!(
-        tx_allowed(LicenseClass::Technician, dial("6m") + off, OperatingMode::Cw),
-        "6 m CW is inside Technician privileges"
-    );
-    assert!(
-        !tx_allowed(LicenseClass::Extra, 14.300, OperatingMode::Cw),
-        "a Extra must not key 14.300 CW"
-    );
-}
-}
+        assert!(
+            tx_allowed(
+                LicenseClass::Technician,
+                dial("6m") + off,
+                OperatingMode::Cw
+            ),
+            "6 m CW is inside Technician privileges"
+        );
+        assert!(
+            !tx_allowed(LicenseClass::Extra, 14.300, OperatingMode::Cw),
+            "a Extra must not key 14.300 CW"
+        );
+    }
