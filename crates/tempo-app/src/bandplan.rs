@@ -235,15 +235,37 @@ pub fn band_plan_for(tier: crate::dto::Tier) -> Vec<BandChannel> {
 }
 
 pub fn ft2_band_plan() -> Vec<BandChannel> {
-    let n = "Decodium FT2 calling frequency (from Decodium's default table, models/FrequencyList.cpp)";
+    let n =
+        "Decodium FT2 calling frequency (from Decodium's default table, models/FrequencyList.cpp)";
     vec![
         ch("160m", "HF", 1.843000, "USB", "160 m · FT2", n),
         ch("80m", "HF", 3.578000, "USB", "80 m · FT2", n),
-        ch("60m", "HF", 5.360000, "USB", "60 m · FT2", "Decodium FT2 calling frequency – check your own band plan"),
+        ch(
+            "60m",
+            "HF",
+            5.360000,
+            "USB",
+            "60 m · FT2",
+            "Decodium FT2 calling frequency – check your own band plan",
+        ),
         ch("40m", "HF", 7.062000, "USB", "40 m · FT2", n),
-        ch("4m", "VHF", 70.157000, "USB", "4 m · FT2", "Decodium FT2 calling frequency – IARU Region 1 only"),
+        ch(
+            "4m",
+            "VHF",
+            70.157000,
+            "USB",
+            "4 m · FT2",
+            "Decodium FT2 calling frequency – IARU Region 1 only",
+        ),
         ch("2m", "VHF", 144.177000, "USB", "2 m · FT2", n),
-        ch("1.25m", "VHF", 222.177000, "USB", "1.25 m · FT2", "Decodium FT2 calling frequency – IARU Region 2 only"),
+        ch(
+            "1.25m",
+            "VHF",
+            222.177000,
+            "USB",
+            "1.25 m · FT2",
+            "Decodium FT2 calling frequency – IARU Region 2 only",
+        ),
         ch("70cm", "UHF", 432.177000, "USB", "70cm · FT2", n),
         ch("23cm", "UHF", 1296.177000, "USB", "23cm · FT2", n),
     ]
