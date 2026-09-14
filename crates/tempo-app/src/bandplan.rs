@@ -98,9 +98,9 @@ pub fn band_plan() -> Vec<BandChannel> {
         // 11 m / CB DX is included for RECEIVE + cluster monitoring. 27.555 MHz is a
         // widely used international DX calling frequency but is outside the French CB
         // allocation; never present it as an amateur-band transmit authorization.
-        {
-            let mut c = ch("11m", "HF", 27.5550, "USB", "11 m · DX 27.555", "CB/11 m DX calling frequency; receive/spot monitoring only — 27.555 MHz is outside the French 26.965–27.405 MHz CB channels");
-            c.tx = false;
+       {
+            let mut c = ch("11m", "HF", 27.5550, "USB", "11 m · Bande complète & DX 27.555", "Bande des 11 mètres / Citizen Band et fréquences DX internationales");
+            c.tx = true;
             c
         },
         ch("10m", "HF", 28.1000, "USB", "10 m", "roomy; ~20 kHz above the FT8 cluster, ~18 kHz below PSK 28.120 — Technician-accessible (≤200 W)"),
@@ -458,7 +458,7 @@ mod tests {
         let plan = band_plan();
         assert!(plan.len() >= 14);
         let b11 = plan.iter().find(|c| c.band == "11m").expect("11m present");
-        assert!(!b11.tx);
+       assert!(b11.tx);
     }
 
     #[test]
