@@ -495,9 +495,15 @@ mod tests {
                 LicenseClass::Technician,
                 dial("6m") + off,
                 OperatingMode::Cw
-            ),
+        ),
             "6 m CW is inside Technician privileges"
         );
-      assert!(!tx_allowed(LicenseClass::Extra, 14.300, OperatingMode::Cw));
+     assert!(
+            !tx_allowed(
+                LicenseClass::Extra,
+                14.300,
+                OperatingMode::Cw
+            )
+        );
     }
 }
