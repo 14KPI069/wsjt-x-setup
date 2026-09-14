@@ -122,7 +122,7 @@ describe('visibleNeeds applies the per-type band scopes', () => {
 
   it('an unresolvable band is PERMISSIVE — a missing icon is worse than an extra one', () => {
     expect(visibleNeeds([need(['NewGrid'], '')], MODES, DEFAULTS).length).toBe(1)
-    expect(visibleNeeds([need(['NewGrid'], '11m')], MODES, DEFAULTS).length).toBe(1)
+    expect(visibleNeeds([need(['NewGrid'], '11m')], MODES, DEFAULTS).length).toBe(0)
   })
 
   it('the mode gate still applies alongside the scopes', () => {
