@@ -474,34 +474,33 @@ mod tests {
         };
         let off = 0.001;
 
-        assert!(
-            !tx_allowed(
-                LicenseClass::Technician,
-                dial("40m") + off,
-                OperatingMode::Cw
-            ),
-            "a Technician must not key 40 m CW"
-        );
-        assert!(
-            tx_allowed(
-                LicenseClass::Technician,
-                dial("10m") + off,
-                OperatingMode::Cw
-            ),
-            "10 m CW is inside Technician privileges"
-        );
-        assert!(
-            tx_allowed(
-                LicenseClass::Technician,
-                dial("6m") + off,
-                OperatingMode::Cw
-            ),
-            "6 m CW is inside Technician privileges"
-        );
+      assert!(
+        !tx_allowed(
+            LicenseClass::Technician,
+            dial("40m") + off,
+            OperatingMode::Cw
+        ),
+        "a Technician must not key 40 m CW"
+    );
+    assert!(
+        tx_allowed(
+            LicenseClass::Technician,
+            dial("10m") + off,
+            OperatingMode::Cw
+        ),
+        "10 m CW is inside Technician privileges"
+    );
+    assert!(
+        tx_allowed(
+            LicenseClass::Technician,
+            dial("6m") + off,
+            OperatingMode::Cw
+        ),
+        "6 m CW is inside Technician privileges"
+    );
     assert!(
         !tx_allowed(LicenseClass::Extra, 14.300, OperatingMode::Cw),
         "a Extra must not key 14.300 CW"
     );
 }
 }
-
