@@ -37,6 +37,8 @@ $env:CHERE_INVOKING = '1'
 
 $u = (& $bash -lc "cygpath -u '$hereFwd'").Trim()
 $forward = ($args -join ' ')
+$targetScript = Join-Path $here "build-windows-cross.sh"
+(Get-Content -Raw $targetScript) -replace "`r`n", "`n" | Set-Content -NoNewline $targetScript
 Write-Host "Running build-windows-cross.sh in MSYS2 UCRT64 ($msys)..." -ForegroundColor Cyan
 & $bash -lc "'$u/build-windows-cross.sh' $forward"
 exit $LASTEXITCODE
