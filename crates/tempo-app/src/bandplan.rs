@@ -239,14 +239,7 @@ pub fn ft2_band_plan() -> Vec<BandChannel> {
     vec![
         ch("160m", "HF", 1.843000, "USB", "160 m · FT2", n),
         ch("80m", "HF", 3.578000, "USB", "80 m · FT2", n),
-        ch(
-            "60m",
-            "HF",
-            5.360000,
-            "USB",
-            "60 m · FT2",
-            "Decodium FT2 calling frequency — check your own band plan",
-        ),
+      ch("60m", "HF", 5.360000, "USB", "60 m · FT2", "Decodium FT2 calling frequency – check your own band plan"),
         ch("40m", "HF", 7.062000, "USB", "40 m · FT2", n),
         ch("30m", "HF", 10.144000, "USB", "30 m · FT2", n),
         ch("20m", "HF", 14.084000, "USB", "20 m · FT2", n),
