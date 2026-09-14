@@ -334,7 +334,7 @@ pub fn jt65_band_plan() -> Vec<BandChannel> {
         ch("12m", "HF", 24.917000, "USB", "12 m · JT65", n),
         ch("10m", "HF", 28.076000, "USB", "10 m · JT65", n),
         ch("6m", "VHF", 50.276000, "USB", "6 m · JT65", n),
-        ch("6m-2", "VHF", 50.310000, "USB", "6 m · JT65", n),
+        ch("6m-2", "VHF", 50.310000, "USB", "6 m-2 · JT65", n),
         ch("4m", "VHF", 70.102000, "USB", "4 m · JT65", n),
         ch("2m", "VHF", 144.120000, "USB", "2 m · JT65", n),
         ch("1.25m", "VHF", 222.065000, "USB", "1.25 m · JT65", n),
@@ -503,3 +503,4 @@ mod tests {
             "a Extra must not key 14.300 CW"
         );
     }
+} 
