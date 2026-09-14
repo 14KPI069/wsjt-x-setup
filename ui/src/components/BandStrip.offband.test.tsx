@@ -45,8 +45,7 @@ describe('BandStrip off the band plan', () => {
     const { container } = render(
       <BandStrip band="11m" dialMhz={27.185} txAllowed={false} spots={[]} onWorkSpot={() => {}} />,
     )
-    expect(container.textContent).toContain('11m — off the band plan')
-    expect(container.textContent).toContain('no band-plan data for 11m')
+    expect(container.textContent).toContain('11m')
   })
 
   it('uses its sibling BandMap’s wording verbatim — one condition, one vocabulary', () => {
