@@ -980,7 +980,10 @@ mod tests {
         .iter()
         .find(|c| c.band == "11m")
         .expect("11m DX channel present");
-        assert!((b11.dial_mhz - 27.555).abs() < 1e-9, "11m DX dial = 27.555 MHz");
+       assert!(
+        (b11.dial_mhz - 27.555).abs() < 1e-9,
+        "11m DX dial = 27.555 MHz"
+    );
         assert!(!b11.tx, "11m DX channel is receive-only");
         for c in &plan {
             assert!(
