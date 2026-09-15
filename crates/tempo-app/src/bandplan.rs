@@ -1,4 +1,4 @@
-/! Tempo's proposed calling-frequency band plan.
+//! Tempo's proposed calling-frequency band plan.
 
 use serde::{Deserialize, Serialize};
 
