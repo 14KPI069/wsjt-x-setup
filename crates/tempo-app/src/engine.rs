@@ -7770,12 +7770,11 @@ impl Engine {
 
     /// Retune to a band-plan channel by its token (the QSY execution primitive),
     /// reusing the live [`Engine::set_frequency`] path the radio loop follows.
-    fn execute_qsy_token(&mut self, token: &str) {
-        if let Some(c) = crate::bandplan::band_plan()
-            .into_iter()
-            .find(|c| c.band.eq_ignore_ascii_case(token))
-        {
-            self.set_frequency(c.dial_mhz, &c.band, &c.mode);
+   fn execute_qsy_token(&mut self, token: &str) {
+        if let Some(channels) = crate::bandplan::band_plan() {
+            if let Some(c) = channels.into_iter().find(|c| c.band.eq_ignore_ascii_case(token)) {
+                self.set_frequency(c.dial_mhz, &c.band, &c.mode);
+            }
         }
     }
 
