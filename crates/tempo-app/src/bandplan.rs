@@ -61,9 +61,9 @@ pub fn band_plan_for<T>(_tier: T) -> Vec<BandChannel> {
 }
 
 pub fn channel_for_dial(dial_mhz: f64) -> Option<BandChannel> {
-    all_channels().into_iter().find(|c| {
-        (dial_mhz - c.dial_mhz).abs() <= 0.5
-    })
+    all_channels()
+        .into_iter()
+        .find(|c| (dial_mhz - c.dial_mhz).abs() <= 0.5)
 }
 
 pub fn band_for_dial(dial_mhz: f64) -> Option<&'static str> {
