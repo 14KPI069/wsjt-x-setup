@@ -44,12 +44,12 @@ pub fn rtty_band_plan() -> Vec<BandChannel> {
     all_channels()
 }
 
-pub fn ft8_band_plan() -> Vec<BandChannel> {
-    all_channels()
+pub fn ft8_band_plan() -> Vec<Vec<BandChannel>> {
+    vec![all_channels()]
 }
 
-pub fn ft4_band_plan() -> Vec<BandChannel> {
-    all_channels()
+pub fn ft4_band_plan() -> Vec<Vec<BandChannel>> {
+    vec![all_channels()]
 }
 
 pub fn band_plan() -> Option<Vec<BandChannel>> {
