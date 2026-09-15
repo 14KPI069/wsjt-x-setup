@@ -1,25 +1,16 @@
-//! Tempo's proposed calling-frequency band plan.
+/! Tempo's proposed calling-frequency band plan.
 
 use serde::{Deserialize, Serialize};
 
-/// One Tempo calling channel: a band, a recommended dial frequency, and the mode
-/// the radio should be in.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BandChannel {
-    /// Band label, e.g. "20m", "2m".
     pub band: String,
-    /// Grouping for the UI: "HF" | "VHF" | "UHF".
     pub group: String,
-    /// Recommended Tempo calling dial frequency (MHz, suppressed carrier).
     pub dial_mhz: f64,
-    /// Rig mode for this channel: "USB" (weak-signal) or "FM" (simplex data).
     pub mode: String,
-    /// Display label for the selector, e.g. "2 m · FM simplex".
     pub label: String,
-    /// Short note: what it sits near / clearance / privilege flag.
     pub note: String,
-    /// May THIS operator's licence class transmit here?
     #[serde(default = "yes")]
     pub tx: bool,
 }
@@ -57,26 +48,32 @@ pub fn band_plan() -> Option<Vec<BandChannel>> {
     Some(all_channels())
 }
 
-pub fn band_plan_for(_tier: &str) -> Vec<BandChannel> {
+pub fn band_plan_for<T>(_tier: T) -> Vec<BandChannel> {
     all_channels()
 }
 
 pub fn channel_for_dial(dial_mhz: f64) -> Option<BandChannel> {
-    let channels = all_channels();
-    channels.into_iter().find(|ch| {
-        let tolerance = 0.5; // Marge de correspondance autour de la fréquence de dial
-        (dial_mhz - ch.dial_mhz).abs() <= tolerance
+    all_channels().into_iter().find(|c| {
+        (dial_mhz - c.dial_mhz).abs() <= 0.5
     })
 }
 
-pub fn band_for_dial(dial_mhz: f64) -> Option<String> {
-    channel_for_dial(dial_mhz).map(|ch| ch.band)
+pub fn band_for_dial(dial_mhz: f64) -> Option<&'static str> {
+    match channel_for_dial(dial_mhz)?.band.as_str() {
+        "80m" => Some("80m"),
+        "40m" => Some("40m"),
+        "20m" => Some("20m"),
+        "15m" => Some("15m"),
+        "10m" => Some("10m"),
+        "11m" => Some("11m"),
+        _ => Some("20m"),
+    }
 }
 
-pub fn cw_activity_mhz(band: &str) -> Option<(f64, f64)> {
+pub fn cw_activity_mhz(band: &str) -> Option<f64> {
     match band {
-        "11m" => Some((27.550, 27.560)),
-        "20m" => Some((14.070, 14.080)),
+        "11m" => Some(27.550),
+        "20m" => Some(14.070),
         _ => None,
     }
 }
