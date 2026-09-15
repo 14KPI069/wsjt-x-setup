@@ -386,22 +386,23 @@ jobs:
       # MinGW-w64 cross toolchain: gcc/g++/gfortran for the Fortran/C/C++ modem,
       # cmake/ninja to drive the libtempo CMake project, and a host build-essential
       # (cc/make) to cross-build FFTW3f for MinGW.
-      - name: Install MinGW-w64 cross toolchain
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            gcc-mingw-w64-x86-64 \
-            g++-mingw-w64-x86-64 \
-            gfortran-mingw-w64-x86-64 \
-            libboost-dev \
-            cmake \
-            ninja-build \
-            build-essential
+   - name: Install MinGW-w64 cross toolchain
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends \
+          gcc-mingw-w64-x86-64 \
+          g++-mingw-w64-x86-64 \
+          gfortran-mingw-w64-x86-64 \
+          libboost-dev \
+          cmake \
+          ninja-build \
+          build-essential \
+          pkg-config
 
-      - name: Set up Node.js
-        uses: actions/setup-node@v7
-        with:
-          node-version: 24
+    - name: Set up Node.js
+      uses: actions/setup-node@v7
+      with:
+        node-version: 24
 
       - name: Set up Rust 1.93.1 toolchain (pinned) + windows-gnu target
         uses: dtolnay/rust-toolchain@master
