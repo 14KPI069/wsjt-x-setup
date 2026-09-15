@@ -44,6 +44,14 @@ pub fn rtty_band_plan() -> Vec<BandChannel> {
     all_channels()
 }
 
+pub fn ft8_band_plan() -> Vec<BandChannel> {
+    all_channels()
+}
+
+pub fn ft4_band_plan() -> Vec<BandChannel> {
+    all_channels()
+}
+
 pub fn band_plan() -> Option<Vec<BandChannel>> {
     Some(all_channels())
 }
@@ -66,6 +74,7 @@ pub fn band_for_dial(dial_mhz: f64) -> Option<&'static str> {
         "15m" => Some("15m"),
         "10m" => Some("10m"),
         "11m" => Some("11m"),
+        "4m" => Some("4m"),
         _ => Some("20m"),
     }
 }
@@ -74,6 +83,7 @@ pub fn cw_activity_mhz(band: &str) -> Option<f64> {
     match band {
         "11m" => Some(27.550),
         "20m" => Some(14.070),
+        "4m" => Some(70.100),
         _ => None,
     }
 }
@@ -127,6 +137,14 @@ fn all_channels() -> Vec<BandChannel> {
             "USB",
             "11m-dx",
             "International 11m call channel",
+        ),
+        ch(
+            "4m",
+            "data",
+            70.100,
+            "USB",
+            "4m-dx",
+            "International 4m call channel",
         ),
     ]
 }
